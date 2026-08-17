@@ -5,7 +5,7 @@ ESBMC's median function has a CCN of 3, but ~11% sit above 15 and the top of the
 list is hand-rolled AST dispatch (`migrate_expr`, `convert_ast_node`,
 `clang_c_convertert::get_expr`). A repo-wide absolute gate would therefore be
 permanently red and would only ever nag about jump tables nobody intends to
-refactor. This script gates on what a *pull request changes* instead.
+efactor. This script gates on what a *pull request changes* instead.
 
 Two rules, both evaluated between the merge base and the PR head:
 

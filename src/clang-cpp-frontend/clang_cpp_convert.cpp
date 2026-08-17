@@ -20,6 +20,7 @@ CC_DIAGNOSTIC_IGNORE_LLVM_CHECKS()
 #include <llvm/Support/raw_os_ostream.h>
 #include <clang-c-frontend/clang_ast_dump.h>
 CC_DIAGNOSTIC_POP()
+#include <iostream>
 
 #include <clang-cpp-frontend/clang_cpp_convert.h>
 #include <util/expr/expr_util.h>
@@ -160,16 +161,64 @@ bool clang_cpp_convertert::get_decl(const clang::Decl &decl, exprt &new_expr)
   return false;
 }
 
+bool isLambdaTemplateArgument(const clang::TemplateArgument& Arg) {
+    if (Arg.getKind() != clang::TemplateArgument::Type)
+        return false;
+
+    clang::QualType T = Arg.getAsType();
+    const clang::CXXRecordDecl* RD = T->getAsCXXRecordDecl();
+
+    return RD && RD->isLambda();
+}
+
 void clang_cpp_convertert::get_decl_name(
   const clang::NamedDecl &nd,
   std::string &name,
   std::string &id)
 {
+
+  nd.dump();
+
   id = name = clang_c_convertert::get_decl_name(nd);
   std::string id_suffix = "";
 
   switch (nd.getKind())
   {
+  case clang::Decl::CXXMethod:
+  {    
+    llvm::errs() << "Entered CXXMethod" << " ===\n";
+    llvm::errs() << "Method: " << id << "\n";
+    // Cast generic node to Method node. Derives from Function Node.
+    const clang::CXXMethodDecl &fd =
+      static_cast<const clang::CXXMethodDecl &>(nd);
+    
+    const clang::DeclContext *ctx = fd.getDeclContext();
+    
+    if (const auto *record = llvm::dyn_cast<clang::CXXRecordDecl>(ctx))
+    {
+      if (
+        const auto *spec =
+          llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record))
+      {
+        llvm::errs() << "=== CLASS TEMPLATE SPECIALIZATION ===\n";
+
+        const clang::TemplateArgumentList &args = spec->getTemplateArgs();
+
+        for (unsigned i = 0; i < args.size(); ++i)
+        {
+          llvm::errs() << "=== ARG " << i << " ===\n";
+          if (isLambdaTemplateArgument(args[i]))
+          {
+            std::string custom_id;
+
+          }            
+        }
+      }
+    }
+
+    clang_c_convertert::get_decl_name(nd, name, id);
+    return;
+  }
   case clang::Decl::CXXConstructor:
     if (name.empty())
     {
@@ -211,21 +260,22 @@ void clang_cpp_convertert::get_decl_name(
   case clang::Decl::ParmVar:
   {
     const clang::ParmVarDecl &pd = static_cast<const clang::ParmVarDecl &>(nd);
-    // If the parameter is unnamed, it will be handled by `name_param_and_continue`, but not here.
+    // If the parameter is unnamed, it will be handled by
+    // `name_param_and_continue`, but not here.
     if (!name.empty())
     {
       /* Add the parameter index to the name and id to avoid name clashes.
-     * Consider the following example:
-     * ```
-     * template <typename... f> int e(f... g) {return 0;};
-     * int d = e(1, 2.0);
-     * ```
-     * The two parameters in the function e will have the same name and id
-     * because clang does not differentiate between them. This will cause
-     * the second parameter to overwrite the first in the symbol table which
-     * causes all kinds of problems. To avoid this, we append the parameter
-     * index to the name and id.
-    */
+       * Consider the following example:
+       * ```
+       * template <typename... f> int e(f... g) {return 0;};
+       * int d = e(1, 2.0);
+       * ```
+       * The two parameters in the function e will have the same name and id
+       * because clang does not differentiate between them. This will cause
+       * the second parameter to overwrite the first in the symbol table which
+       * causes all kinds of problems. To avoid this, we append the parameter
+       * index to the name and id.
+       */
       name += "::" + std::to_string(pd.getFunctionScopeIndex());
       id_suffix = "::" + std::to_string(pd.getFunctionScopeIndex());
       break;
@@ -267,7 +317,7 @@ void clang_cpp_convertert::get_decl_name(
   std::ostringstream oss;
   llvm::raw_os_ostream ross(oss);
   enable_ast_dump_colors(ross, *ASTContext);
-  ross << "Unable to generate the USR for:\n";
+  ross << "Unable to generate the USR for1:\n";
   nd.dump(ross);
   ross.flush();
   log_error("{}", oss.str());
@@ -395,7 +445,8 @@ bool clang_cpp_convertert::get_method(
   const clang::CXXMethodDecl &md,
   exprt &new_expr)
 {
-  // Only convert instantiated functions/methods not depending on a template parameter
+  // Only convert instantiated functions/methods not depending on a template
+  // parameter
   if (md.isDependentContext())
     return false;
 
@@ -814,8 +865,9 @@ bool clang_cpp_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
     auto args = operator_call.arguments();
     auto begin = args.begin();
     const auto *direct = operator_call.getDirectCallee();
-    if (const auto *md = llvm::dyn_cast_or_null<clang::CXXMethodDecl>(direct);
-        md && md->isStatic())
+    if (
+      const auto *md = llvm::dyn_cast_or_null<clang::CXXMethodDecl>(direct);
+      md && md->isStatic())
     {
       assert(begin != args.end());
       ++begin;
@@ -1130,7 +1182,8 @@ bool clang_cpp_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
   {
     const clang::CXXPseudoDestructorExpr &cxxpd =
       static_cast<const clang::CXXPseudoDestructorExpr &>(stmt);
-    // A pseudo-destructor expression has no run-time semantics beyond evaluating the base expression.
+    // A pseudo-destructor expression has no run-time semantics beyond
+    // evaluating the base expression.
     exprt base;
     if (get_expr(*cxxpd.getBase(), base))
       return true;
@@ -1185,8 +1238,8 @@ bool clang_cpp_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
       return true;
 
     // In a lambda `CXXThisExpr` refers to the captured `this` pointer,
-    // while the `this_map` refers to the `this` pointer of the lambda closure type.
-    // This causes a mismatch, so ignore the type check in this case.
+    // while the `this_map` refers to the `this` pointer of the lambda closure
+    // type. This causes a mismatch, so ignore the type check in this case.
     assert(this_type == it->second.second || is_lambda());
 
     if (is_lambda())
@@ -1493,7 +1546,8 @@ bool clang_cpp_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
       return true;
 
     exprt sym("struct", lambda_class_type);
-    // both `captures` (via `capture_begin`) and `capture_inits` have hopefully the same size and order
+    // both `captures` (via `capture_begin`) and `capture_inits` have hopefully
+    // the same size and order
     auto capture = lambda_expr.capture_begin();
     for (const auto &it : lambda_expr.capture_inits())
     {
@@ -1911,7 +1965,8 @@ bool clang_cpp_convertert::build_destructor_chain(
     dereference_exprt(symbol_exprt(this_id, this_ptr_type), this_ptr_type);
 
   // Trivial destructors are no-ops; skip symbol table lookup for them.
-  auto lookup_dtor = [&](const clang::CXXDestructorDecl *d) -> const symbolt * {
+  auto lookup_dtor = [&](const clang::CXXDestructorDecl *d) -> const symbolt *
+  {
     if (!d || d->isTrivial())
       return nullptr;
     std::string name, id;
@@ -1920,7 +1975,8 @@ bool clang_cpp_convertert::build_destructor_chain(
   };
 
   // Build and append a destructor call to `body`.
-  auto emit_dtor_call = [&](const symbolt &sym, exprt arg) {
+  auto emit_dtor_call = [&](const symbolt &sym, exprt arg)
+  {
     exprt fn("symbol", sym.get_type());
     fn.identifier(sym.id);
     code_function_callt call;
@@ -1935,7 +1991,8 @@ bool clang_cpp_convertert::build_destructor_chain(
   // subobject before the base destructor runs, otherwise ~Base reads the
   // derived's leading storage (github #6021). This mirrors the method-receiver
   // adjustment in clang_c_convert.cpp (char* + byte offset + reinterpret).
-  auto emit_base_dtor = [&](const symbolt &sym, uint64_t offset) {
+  auto emit_base_dtor = [&](const symbolt &sym, uint64_t offset)
+  {
     exprt this_expr = symbol_exprt(this_id, this_ptr_type);
     if (offset > 0)
     {
@@ -1984,7 +2041,8 @@ bool clang_cpp_convertert::build_destructor_chain(
       // order.  Emit one destructor call per element, recursing into nested
       // arrays so every leaf element is destroyed.
       std::function<bool(const exprt &)> destroy_elements =
-        [&](const exprt &arr) -> bool {
+        [&](const exprt &arr) -> bool
+      {
         const array_typet &arr_type = to_array_type(ns.follow(arr.type()));
         BigInt count;
         if (to_integer(arr_type.size(), count))
@@ -2297,7 +2355,8 @@ bool clang_cpp_convertert::get_function_body(
           return true;
 
         build_member_from_component(fd, member);
-        // set #member_init flag again, as it has been cleared between the first call...
+        // set #member_init flag again, as it has been cleared between the first
+        // call...
         member.set("#member_init", 1);
 
         exprt rhs;
@@ -2392,32 +2451,33 @@ bool clang_cpp_convertert::get_function_body(
              * so every leaf element is constructed, recursing into nested
              * arrays.  Mirrors the static/local path in clang_cpp_main.cpp. */
             std::function<void(const exprt &)> construct_elements =
-              [&](const exprt &arr) {
-                const array_typet &arr_type =
-                  to_array_type(ns.follow(arr.type()));
-                BigInt count;
-                if (to_integer(arr_type.size(), count))
-                {
-                  log_error("cannot determine array size for member ctor init");
-                  abort();
-                }
+              [&](const exprt &arr)
+            {
+              const array_typet &arr_type =
+                to_array_type(ns.follow(arr.type()));
+              BigInt count;
+              if (to_integer(arr_type.size(), count))
+              {
+                log_error("cannot determine array size for member ctor init");
+                abort();
+              }
 
-                const typet &elem_type = arr_type.subtype();
-                for (BigInt idx = 0; idx < count; ++idx)
+              const typet &elem_type = arr_type.subtype();
+              for (BigInt idx = 0; idx < count; ++idx)
+              {
+                index_exprt element(
+                  arr, from_integer(idx, index_type()), elem_type);
+                if (ns.follow(elem_type).is_array())
                 {
-                  index_exprt element(
-                    arr, from_integer(idx, index_type()), elem_type);
-                  if (ns.follow(elem_type).is_array())
-                  {
-                    construct_elements(element);
-                    continue;
-                  }
-                  side_effect_exprt elem_init("assign", elem_type);
-                  elem_init.copy_to_operands(element, rhs);
-                  elem_init.location() = new_expr.location();
-                  initializers.push_back(elem_init);
+                  construct_elements(element);
+                  continue;
                 }
-              };
+                side_effect_exprt elem_init("assign", elem_type);
+                elem_init.copy_to_operands(element, rhs);
+                elem_init.location() = new_expr.location();
+                initializers.push_back(elem_init);
+              }
+            };
             construct_elements(new_member);
           }
           else
@@ -2469,8 +2529,9 @@ bool clang_cpp_convertert::get_function_body(
   // and base-subobject destructor calls.
   else if (fd.getKind() == clang::Decl::CXXDestructor)
   {
-    if (build_destructor_chain(
-          static_cast<const clang::CXXDestructorDecl &>(fd), body))
+    if (
+      build_destructor_chain(
+        static_cast<const clang::CXXDestructorDecl &>(fd), body))
       return true;
   }
 
@@ -2812,9 +2873,10 @@ bool clang_cpp_convertert::get_decl_ref(
     // Replace decl in the lambda operator with FieldDecl
     // x = 1 convert into this->_x = 1;
     if (auto it = cap_map.find(address); it != cap_map.end())
-      if (auto it1 =
-            it->second.first.find(llvm::dyn_cast<CAPTURE_VARIABLE_TYPE>(&decl));
-          it1 != it->second.first.end())
+      if (
+        auto it1 =
+          it->second.first.find(llvm::dyn_cast<CAPTURE_VARIABLE_TYPE>(&decl));
+        it1 != it->second.first.end())
       {
         typet t;
         if (get_type(it1->first->getType(), t))
@@ -2833,9 +2895,9 @@ bool clang_cpp_convertert::get_decl_ref(
   /**
    * References are modeled as pointers in ESBMC.
    * Normally, when getting a reference, we should therefore dereference it.
-   * However, when a reference type variable is initialized in a (member initializer) constructor call,
-   * we should not dereference it, because the reference/pointer is _not_ yet initialized.
-   * See test case "RefMemberInit".
+   * However, when a reference type variable is initialized in a (member
+   * initializer) constructor call, we should not dereference it, because the
+   * reference/pointer is _not_ yet initialized. See test case "RefMemberInit".
    */
   bool should_dereference = !new_expr.get_bool("#member_init");
 
@@ -2896,7 +2958,8 @@ bool clang_cpp_convertert::get_decl_ref(
     if (get_function_params(fd, fd_type.arguments()))
       return true;
 
-    // annotate return type - will be used to adjust the initiliazer or decl-derived stmt
+    // annotate return type - will be used to adjust the initiliazer or
+    // decl-derived stmt
     const auto *md = llvm::dyn_cast<clang::CXXMethodDecl>(&fd);
     assert(md);
     annotate_ctor_dtor_rtn_type(*md, fd_type.return_type());
@@ -3021,9 +3084,9 @@ bool clang_cpp_convertert::annotate_class_method(
      * We also have a `component` in class type representing the ctor/dtor.
      * Need to sync the type of this function symbol and its corresponding type
      * of the component inside the class' symbol
-     * We just need "#member_name" and "return_type" fields to be synced for later use
-     * in the adjuster.
-     * So let's do the sync before adding more annotations.
+     * We just need "#member_name" and "return_type" fields to be synced for
+     * later use in the adjuster. So let's do the sync before adding more
+     * annotations.
      */
     symbolt *fd_symb = get_fd_symbol(cxxmdd);
     if (fd_symb)
@@ -3242,7 +3305,8 @@ bool clang_cpp_convertert::get_base_map(
   base_map &map)
 {
   /*
-   * This function gets all the base classes from which we need to get the components/methods
+   * This function gets all the base classes from which we need to get the
+   * components/methods
    */
   for (const clang::CXXBaseSpecifier &base : cxxrd.bases())
   {
@@ -3264,9 +3328,11 @@ bool clang_cpp_convertert::get_base_map(
 
     // avoid adding the same base, e.g. in case of diamond problem; keep
     // declaration order so the flattened layout matches the ABI base order
-    if (std::any_of(map.begin(), map.end(), [&](const auto &e) {
-          return e.first == class_id;
-        }))
+    if (
+      std::any_of(
+        map.begin(),
+        map.end(),
+        [&](const auto &e) { return e.first == class_id; }))
       continue;
 
     map.emplace_back(class_id, &base_cxxrd);
@@ -3479,9 +3545,10 @@ bool clang_cpp_convertert::is_ConstructorOrDestructor(
  * if_exprt instead materialises a temporary per branch plus a result temporary
  * and copies between them with a plain assignment, so no copy/move constructor
  * runs and every one of those temporaries is destroyed, including the branch
- * that was not taken. Emit a single temporary_object whose initializer branches,
- * so replace_new_object points both constructors at the same object -- the same
- * elision the MaterializeTemporaryExpr arm above performs one level down.
+ * that was not taken. Emit a single temporary_object whose initializer
+ * branches, so replace_new_object points both constructors at the same object
+ * -- the same elision the MaterializeTemporaryExpr arm above performs one level
+ * down.
  *
  * Only the shape where both branches are constructor temporaries is rewritten;
  * anything else (an lvalue operand, a non-constructor temporary) keeps the
