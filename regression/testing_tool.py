@@ -227,6 +227,10 @@ STATIC_CAPABILITIES = {
     # The 32-bit target (--32) is usable: multi-arch headers exist and the
     # frontend's type model matches them. See issue #1400.
     "arch32",
+    # The operational-model library is bundled as a goto binary. With
+    # ESBMC_BUNDLE_LIBC=OFF it is parsed from sources instead, and anything
+    # measuring the blob has nothing to measure.
+    "bundled_libc",
 }
 
 # Capabilities of the frontend itself, which the build system cannot answer:
@@ -500,19 +504,23 @@ class Executor:
                 # Gracefully shut down the whole process group so
                 # grandchildren don't linger and starve the CI runner.
                 if os.name == "posix":
-                    # Best-effort: on macOS killpg can raise EPERM when the
-                    # group holds a process we can no longer signal, which
-                    # otherwise turns a tolerated timeout into a hard ERROR.
+                    # ESBMC does not necessarily die on SIGTERM, so the SIGKILL
+                    # escalation has to run even when the SIGTERM itself failed.
+                    # Sharing one try with the wait meant a killpg that raised
+                    # (on macOS it raises EPERM when the group holds a process
+                    # we can no longer signal) skipped the kill entirely and
+                    # left the group running.
                     try:
                         os.killpg(proc.pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+                    try:
                         proc.wait(timeout=_TERM_GRACE)
                     except subprocess.TimeoutExpired:
                         try:
                             os.killpg(proc.pid, signal.SIGKILL)
                         except OSError:
                             pass
-                    except OSError:
-                        pass
                 else:
                     proc.kill()
                 stdout, stderr = proc.communicate()
