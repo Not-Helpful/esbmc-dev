@@ -178,48 +178,44 @@ void clang_cpp_convertert::get_decl_name(
   std::string &id)
 {
 
-  nd.dump();
 
   id = name = clang_c_convertert::get_decl_name(nd);
   std::string id_suffix = "";
 
   switch (nd.getKind())
   {
-  case clang::Decl::CXXMethod:
-  {    
-    llvm::errs() << "Entered CXXMethod" << " ===\n";
-    llvm::errs() << "Method: " << id << "\n";
-    // Cast generic node to Method node. Derives from Function Node.
-    const clang::CXXMethodDecl &fd =
-      static_cast<const clang::CXXMethodDecl &>(nd);
+  // case clang::Decl::CXXMethod:
+  // {    
+  //   llvm::errs() << "Entered CXXMethod" << " ===\n";
+  //   llvm::errs() << "Method: " << id << "\n";
+  //   // Cast generic node to Method node. Derives from Function Node.
+  //   const clang::CXXMethodDecl &fd =
+  //     static_cast<const clang::CXXMethodDecl &>(nd);
     
-    const clang::DeclContext *ctx = fd.getDeclContext();
+  //   const clang::DeclContext *ctx = fd.getDeclContext();
     
-    if (const auto *record = llvm::dyn_cast<clang::CXXRecordDecl>(ctx))
-    {
-      if (
-        const auto *spec =
-          llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record))
-      {
-        llvm::errs() << "=== CLASS TEMPLATE SPECIALIZATION ===\n";
+  //   if (const auto *record = llvm::dyn_cast<clang::CXXRecordDecl>(ctx))
+  //   {
+  //     if (
+  //       const auto *spec =
+  //         llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record))
+  //     {
+  //       llvm::errs() << "=== CLASS TEMPLATE SPECIALIZATION ===\n";
 
-        const clang::TemplateArgumentList &args = spec->getTemplateArgs();
+  //       const clang::TemplateArgumentList &args = spec->getTemplateArgs();
 
-        for (unsigned i = 0; i < args.size(); ++i)
-        {
-          llvm::errs() << "=== ARG " << i << " ===\n";
-          if (isLambdaTemplateArgument(args[i]))
-          {
-            std::string custom_id;
+  //       for (unsigned i = 0; i < args.size(); ++i)
+  //       {
+  //         llvm::errs() << "=== ARG " << i << " ===\n";
+  //         args[i].dump();
 
-          }            
-        }
-      }
-    }
+  //      }
+  //     }
+  //   }
 
-    clang_c_convertert::get_decl_name(nd, name, id);
-    return;
-  }
+  //   clang_c_convertert::get_decl_name(nd, name, id);
+  //   return;
+  // }
   case clang::Decl::CXXConstructor:
     if (name.empty())
     {

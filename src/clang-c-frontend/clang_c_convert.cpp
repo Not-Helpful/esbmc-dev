@@ -12,7 +12,8 @@ CC_DIAGNOSTIC_IGNORE_LLVM_CHECKS()
 #include <clang/AST/Type.h>
 #include <clang/Basic/Version.inc>
 #include <clang/Basic/Builtins.h>
-#include <clang/Index/USRGeneration.h>
+//#include <clang/Index/USRGeneration.h>
+#include <clang/UnifiedSymbolResolution/USRGeneration.h>
 #include <clang/Frontend/ASTUnit.h>
 #include <llvm/Support/raw_os_ostream.h>
 #include <clang-c-frontend/clang_ast_dump.h>
@@ -4833,7 +4834,7 @@ getFullyQualifiedName(const clang::QualType &t, const clang::ASTContext &c)
 {
   clang::PrintingPolicy Policy(c.getPrintingPolicy());
   Policy.SuppressScope = false;
-  Policy.AnonymousTagLocations = true;
+  //Policy.AnonymousTagLocations = true;
   Policy.PolishForDeclaration = true;
   Policy.SuppressUnwrittenScope = true;
   return clang::TypeName::getFullyQualifiedName(t, c, Policy);
@@ -5008,6 +5009,7 @@ void clang_c_convertert::get_decl_name(
 
   if (!failed)
   {
+    llvm::errs() << id << "\n";    
     id = DeclUSR.str().str();
     return;
   }
