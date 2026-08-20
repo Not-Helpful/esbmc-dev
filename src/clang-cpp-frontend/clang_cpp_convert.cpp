@@ -12,7 +12,14 @@ CC_DIAGNOSTIC_IGNORE_LLVM_CHECKS()
 #include <clang/AST/QualTypeNames.h>
 #include <clang/AST/RecordLayout.h>
 #include <clang/AST/Type.h>
+
+#include "llvm/Config/llvm-config.h"
+#if LLVM_VERSION_MAJOR >= 23
+#include <clang/UnifiedSymbolResolution/USRGeneration.h>
+#else
 #include <clang/Index/USRGeneration.h>
+#endif
+
 #include <clang/Frontend/ASTUnit.h>
 #include <clang/AST/ParentMapContext.h>
 #include <llvm/ADT/SmallVector.h>
@@ -300,6 +307,7 @@ void clang_cpp_convertert::get_decl_name(
 
   default:
     clang_c_convertert::get_decl_name(nd, name, id);
+    llvm::errs() << name << "\n";
     return;
   }
 

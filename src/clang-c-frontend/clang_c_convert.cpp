@@ -12,8 +12,14 @@ CC_DIAGNOSTIC_IGNORE_LLVM_CHECKS()
 #include <clang/AST/Type.h>
 #include <clang/Basic/Version.inc>
 #include <clang/Basic/Builtins.h>
-//#include <clang/Index/USRGeneration.h>
+
+#include "llvm/Config/llvm-config.h"
+#if LLVM_VERSION_MAJOR >= 23
 #include <clang/UnifiedSymbolResolution/USRGeneration.h>
+#else
+#include <clang/Index/USRGeneration.h>
+#endif
+
 #include <clang/Frontend/ASTUnit.h>
 #include <llvm/Support/raw_os_ostream.h>
 #include <clang-c-frontend/clang_ast_dump.h>
@@ -5004,13 +5010,17 @@ void clang_c_convertert::get_decl_name(
     }
   }
 
+#if LLVM_VERSION_MAJOR >= 23
   bool failed = clang::index::generateUSRForDecl(&nd, DeclUSR);
+#else
+  bool failed = clang::index::generateUSRForDecl(&nd, DeclUSR);
+#endif
 
 
   if (!failed)
   {
-    llvm::errs() << id << "\n";    
     id = DeclUSR.str().str();
+    llvm::errs() << id << "\n";    
     return;
   }
 
