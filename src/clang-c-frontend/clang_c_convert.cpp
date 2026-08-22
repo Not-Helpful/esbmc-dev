@@ -4921,6 +4921,7 @@ void clang_c_convertert::get_decl_name(
         std::string parent_name, parent_id;
         get_decl_name(*parent, parent_name, parent_id);
         name += "_" + parent_id;
+        llvm::errs() << "##### " << name << "\n";          
       }
 
       std::replace(name.begin(), name.end(), '.', '_');
@@ -5021,7 +5022,6 @@ void clang_c_convertert::get_decl_name(
   if (!failed)
   {
     id = DeclUSR.str().str();
-    llvm::errs() << id << "\n";    
     return;
   }
 
