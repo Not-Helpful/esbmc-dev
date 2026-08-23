@@ -4845,6 +4845,7 @@ getFullyQualifiedName(const clang::QualType &t, const clang::ASTContext &c)
   Policy.SuppressUnwrittenScope = true;
   return clang::TypeName::getFullyQualifiedName(t, c, Policy);
 }
+
 void clang_c_convertert::get_decl_name(
   const clang::NamedDecl &nd,
   std::string &name,
@@ -4953,12 +4954,12 @@ void clang_c_convertert::get_decl_name(
     }
     else
 #if CLANG_VERSION_MAJOR >= 22
-      name = rd.getKindName().str() + " " +
+      name = rd.getKindName().str() + " " + "&$&$&$&" +
              getFullyQualifiedName(
                ASTContext->getTypeDeclType(llvm::cast<clang::TypeDecl>(&rd)),
                *ASTContext);
 #else
-      name =
+      name = "&$&$&$&" +
         getFullyQualifiedName(ASTContext->getTagDeclType(&rd), *ASTContext);
 #endif
 
