@@ -15,9 +15,9 @@ CC_DIAGNOSTIC_IGNORE_LLVM_CHECKS()
 
 #include "llvm/Config/llvm-config.h"
 #if LLVM_VERSION_MAJOR >= 23
-#include <clang/UnifiedSymbolResolution/USRGeneration.h>
+#  include <clang/UnifiedSymbolResolution/USRGeneration.h>
 #else
-#include <clang/Index/USRGeneration.h>
+#  include <clang/Index/USRGeneration.h>
 #endif
 
 #include <clang/Frontend/ASTUnit.h>
@@ -2188,6 +2188,20 @@ bool clang_c_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
 
     if (convert_character_literal(char_literal, new_expr))
       return true;
+
+    break;
+  }
+
+  // TODO: Test
+  case clang::Stmt::ConceptSpecializationExprClass:
+  {
+    const clang::ConceptSpecializationExpr &concept_expr =
+      static_cast<const clang::ConceptSpecializationExpr &>(stmt);
+
+    if (concept_expr.isSatisfied())
+      new_expr = true_exprt();
+    else
+      new_expr = false_exprt();
 
     break;
   }
@@ -4840,7 +4854,7 @@ getFullyQualifiedName(const clang::QualType &t, const clang::ASTContext &c)
 {
   clang::PrintingPolicy Policy(c.getPrintingPolicy());
   Policy.SuppressScope = false;
-  //Policy.AnonymousTagLocations = true;
+  // Policy.AnonymousTagLocations = true;
   Policy.PolishForDeclaration = true;
   Policy.SuppressUnwrittenScope = true;
   return clang::TypeName::getFullyQualifiedName(t, c, Policy);
@@ -4851,7 +4865,6 @@ void clang_c_convertert::get_decl_name(
   std::string &name,
   std::string &id)
 {
-
   id = name = get_decl_name(nd);
   switch (nd.getKind())
   {
@@ -4922,7 +4935,6 @@ void clang_c_convertert::get_decl_name(
         std::string parent_name, parent_id;
         get_decl_name(*parent, parent_name, parent_id);
         name += "_" + parent_id;
-        llvm::errs() << "##### " << name << "\n";          
       }
 
       std::replace(name.begin(), name.end(), '.', '_');
@@ -4939,7 +4951,7 @@ void clang_c_convertert::get_decl_name(
                                        "_" +
                                        location_begin.column().as_string();
       std::string kind_name = rd.getKindName().str();
-      // TODO: Here!      
+      // TODO: Here!
 #if CLANG_VERSION_MAJOR >= 22
       std::string tag_name = getFullyQualifiedName(
         ASTContext->getTypeDeclType(llvm::cast<clang::TypeDecl>(&rd)),
@@ -4959,8 +4971,8 @@ void clang_c_convertert::get_decl_name(
                ASTContext->getTypeDeclType(llvm::cast<clang::TypeDecl>(&rd)),
                *ASTContext);
 #else
-      name = "&$&$&$&" +
-        getFullyQualifiedName(ASTContext->getTagDeclType(&rd), *ASTContext);
+      name = "&$&$&$&" + getFullyQualifiedName(
+                           ASTContext->getTagDeclType(&rd), *ASTContext);
 #endif
 
     id = "tag-" + name;
@@ -4986,7 +4998,6 @@ void clang_c_convertert::get_decl_name(
     }
     break;
 
-    
   default:
     if (name.empty())
     {
@@ -5005,8 +5016,8 @@ void clang_c_convertert::get_decl_name(
   auto debugname = nd.getDeclKindName();
 
   if (
-    std::strcmp(debugname, "Function") == 0
-    || std::strcmp(debugname, "CXXMethod") == 0)
+    std::strcmp(debugname, "Function") == 0 ||
+    std::strcmp(debugname, "CXXMethod") == 0)
   {
     if (auto *fd = llvm::dyn_cast<clang::FunctionDecl>(&nd))
     {
@@ -5018,7 +5029,6 @@ void clang_c_convertert::get_decl_name(
 #else
   bool failed = clang::index::generateUSRForDecl(&nd, DeclUSR);
 #endif
-
 
   if (!failed)
   {
@@ -5251,8 +5261,9 @@ bool clang_c_convertert::process_record_layout_attributes(
     }
 
     case clang::attr::Aligned:
-      if (process_aligned_attribute(
-            static_cast<const clang::AlignedAttr &>(*attr), t))
+      if (
+        process_aligned_attribute(
+          static_cast<const clang::AlignedAttr &>(*attr), t))
         return true;
       break;
 
