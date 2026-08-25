@@ -2290,7 +2290,32 @@ bool clang_cpp_convertert::get_function_body(
     // `init` type is clang::CXXCtorInitializer
     for (auto init : cxxcd.inits())
     {
+      // Debug print the init
+      if (init->isBaseInitializer())
+        llvm::errs() << "isBaseInitializer\n";
+
+      if (init->isMemberInitializer())
+        llvm::errs() << "isMemberInitializer\n";
+
+      if (init->isAnyMemberInitializer())
+        llvm::errs() << "isAnyMemberInitializer\n";
+
+      if (init->isInClassMemberInitializer())
+        llvm::errs() << "isInClassMemberInitializer\n";
+
+      if (init->isDelegatingInitializer())
+        llvm::errs() << "isDelegatingInitializer\n";
+
+      if (init->isPackExpansion())
+        llvm::errs() << "isPackExpansion\n";
+
       exprt initializer;
+
+      if (init->isIndirectMemberInitializer())
+      {
+        llvm::errs() << "isIndirectMemberInitializer\n";
+        
+      }        
 
       if (init->isDelegatingInitializer())
       {
@@ -2535,8 +2560,6 @@ bool clang_cpp_convertert::get_function_body(
       }
       else
       {
-        llvm::errs() << "Hello?"
-                     << "\n";          
         // Otherwise, abort
         log_error("Unsupported initializer in {}", __func__);
         fd.dump();
