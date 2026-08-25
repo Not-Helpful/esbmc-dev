@@ -15,9 +15,9 @@ CC_DIAGNOSTIC_IGNORE_LLVM_CHECKS()
 
 #include "llvm/Config/llvm-config.h"
 #if LLVM_VERSION_MAJOR >= 23
-#include <clang/UnifiedSymbolResolution/USRGeneration.h>
+#  include <clang/UnifiedSymbolResolution/USRGeneration.h>
 #else
-#include <clang/Index/USRGeneration.h>
+#  include <clang/Index/USRGeneration.h>
 #endif
 
 #include <clang/Frontend/ASTUnit.h>
@@ -169,14 +169,15 @@ bool clang_cpp_convertert::get_decl(const clang::Decl &decl, exprt &new_expr)
   return false;
 }
 
-bool isLambdaTemplateArgument(const clang::TemplateArgument& Arg) {
-    if (Arg.getKind() != clang::TemplateArgument::Type)
-        return false;
+bool isLambdaTemplateArgument(const clang::TemplateArgument &Arg)
+{
+  if (Arg.getKind() != clang::TemplateArgument::Type)
+    return false;
 
-    clang::QualType T = Arg.getAsType();
-    const clang::CXXRecordDecl* RD = T->getAsCXXRecordDecl();
+  clang::QualType T = Arg.getAsType();
+  const clang::CXXRecordDecl *RD = T->getAsCXXRecordDecl();
 
-    return RD && RD->isLambda();
+  return RD && RD->isLambda();
 }
 
 void clang_cpp_convertert::get_decl_name(
@@ -184,23 +185,21 @@ void clang_cpp_convertert::get_decl_name(
   std::string &name,
   std::string &id)
 {
-
-
   id = name = clang_c_convertert::get_decl_name(nd);
   std::string id_suffix = "";
 
   switch (nd.getKind())
   {
   // case clang::Decl::CXXMethod:
-  // {    
+  // {
   //   llvm::errs() << "Entered CXXMethod" << " ===\n";
   //   llvm::errs() << "Method: " << id << "\n";
   //   // Cast generic node to Method node. Derives from Function Node.
   //   const clang::CXXMethodDecl &fd =
   //     static_cast<const clang::CXXMethodDecl &>(nd);
-    
+
   //   const clang::DeclContext *ctx = fd.getDeclContext();
-    
+
   //   if (const auto *record = llvm::dyn_cast<clang::CXXRecordDecl>(ctx))
   //   {
   //     if (
@@ -2029,13 +2028,14 @@ bool clang_cpp_convertert::build_destructor_chain(
 
   // Cast `this` to the base's expected pointer type and emit the call.
   auto emit_base_dtor =
-    [&](const symbolt &sym, const clang::CXXRecordDecl *rec, uint64_t offset) {
-      exprt this_expr =
-        base_dtor_this(*rec, deref, this_id, this_ptr_type, offset);
-      gen_typecast(
-        ns, this_expr, to_code_type(sym.get_type()).arguments().front().type());
-      emit_dtor_call(sym, std::move(this_expr));
-    };
+    [&](const symbolt &sym, const clang::CXXRecordDecl *rec, uint64_t offset)
+  {
+    exprt this_expr =
+      base_dtor_this(*rec, deref, this_id, this_ptr_type, offset);
+    gen_typecast(
+      ns, this_expr, to_code_type(sym.get_type()).arguments().front().type());
+    emit_dtor_call(sym, std::move(this_expr));
+  };
 
   // 1. Member subobjects, reverse declaration order (C++ [class.dtor]/9).
   llvm::SmallVector<const clang::FieldDecl *, 8> fields(parent->fields());
@@ -2535,7 +2535,11 @@ bool clang_cpp_convertert::get_function_body(
       }
       else
       {
+        llvm::errs() << "Hello?"
+                     << "\n";          
+        // Otherwise, abort
         log_error("Unsupported initializer in {}", __func__);
+        fd.dump();
         abort();
       }
     }

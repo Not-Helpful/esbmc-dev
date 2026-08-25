@@ -2192,7 +2192,7 @@ bool clang_c_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
     break;
   }
 
-  // TODO: Test
+  // ~TODO: Test
   case clang::Stmt::ConceptSpecializationExprClass:
   {
     const clang::ConceptSpecializationExpr &concept_expr =
