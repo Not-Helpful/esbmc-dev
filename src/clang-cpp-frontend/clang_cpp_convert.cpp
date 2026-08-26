@@ -13,6 +13,7 @@ CC_DIAGNOSTIC_IGNORE_LLVM_CHECKS()
 #include <clang/AST/RecordLayout.h>
 #include <clang/AST/Type.h>
 
+#include <typeinfo>
 #include "llvm/Config/llvm-config.h"
 #if LLVM_VERSION_MAJOR >= 23
 #  include <clang/UnifiedSymbolResolution/USRGeneration.h>
@@ -2311,11 +2312,7 @@ bool clang_cpp_convertert::get_function_body(
 
       exprt initializer;
 
-      if (init->isIndirectMemberInitializer())
-      {
-        llvm::errs() << "isIndirectMemberInitializer\n";
-        
-      }        
+
 
       if (init->isDelegatingInitializer())
       {
@@ -2391,6 +2388,27 @@ bool clang_cpp_convertert::get_function_body(
         initializers.push_back(initializer);
         init_sym_uptodate = false;
       }
+      else if (init->isIndirectMemberInitializer())
+      {
+        llvm::errs() << "isIndirectMemberInitializer\n";
+
+        const clang::IndirectFieldDecl *member_decl = init->getIndirectMember();
+
+        llvm::errs() << "#######################" << "\n";
+        llvm::errs() << member_decl->getName() << "\n";
+        member_decl->getAnonField()->getParent()->dump();
+
+        llvm::errs() << typeid(member_decl->getAnonField()->getParent()).name() << '\n';
+
+        exprt member;
+
+
+        //TODO: Finish
+        log_error("FIXME: isIndirectMemberInitializer", __func__);
+        fd.dump();
+        abort();
+        
+      }        
       else if (init->isMemberInitializer())
       {
         // parsing non-static member initializer
@@ -2565,7 +2583,9 @@ bool clang_cpp_convertert::get_function_body(
         fd.dump();
         abort();
       }
+      initializer.dump();
     }
+    
 
     for (exprt &initializer : initializers)
       convert_expression_to_code(initializer);
