@@ -94,7 +94,7 @@ bool clang_cpp_convertert::get_decl(const clang::Decl &decl, exprt &new_expr)
     break;
   }
 
-  case clang::Decl::Namespace:
+  case clang::D:Namespace:
   {
     const clang::NamespaceDecl &namesd =
       static_cast<const clang::NamespaceDecl &>(decl);
@@ -2312,9 +2312,7 @@ bool clang_cpp_convertert::get_function_body(
 
       exprt initializer;
 
-
-
-      if (init->isDelegatingInitializer())
+      if (init->sDelegatingInitializer())
       {
         /* The "A(1)" initializer here is a delegating initializer.
          * There can only be one initializer in that case.
@@ -2398,17 +2396,16 @@ bool clang_cpp_convertert::get_function_body(
         llvm::errs() << member_decl->getName() << "\n";
         member_decl->getAnonField()->getParent()->dump();
 
-        llvm::errs() << typeid(member_decl->getAnonField()->getParent()).name() << '\n';
+        llvm::errs() << typeid(member_decl->getAnonField()->getParent()).name()
+                     << '\n';
 
         exprt member;
 
-
-        //TODO: Finish
+        // TODO: Finish
         log_error("FIXME: isIndirectMemberInitializer", __func__);
         fd.dump();
         abort();
-        
-      }        
+      }
       else if (init->isMemberInitializer())
       {
         // parsing non-static member initializer
@@ -2585,7 +2582,6 @@ bool clang_cpp_convertert::get_function_body(
       }
       initializer.dump();
     }
-    
 
     for (exprt &initializer : initializers)
       convert_expression_to_code(initializer);
