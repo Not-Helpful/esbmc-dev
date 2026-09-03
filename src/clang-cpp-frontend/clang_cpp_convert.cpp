@@ -94,7 +94,7 @@ bool clang_cpp_convertert::get_decl(const clang::Decl &decl, exprt &new_expr)
     break;
   }
 
-  case clang::D:Namespace:
+  case clang::Decl::Namespace:
   {
     const clang::NamespaceDecl &namesd =
       static_cast<const clang::NamespaceDecl &>(decl);
@@ -1942,6 +1942,8 @@ void clang_cpp_convertert::build_member_from_component(
     abort();
   }
 
+  component.type().dump();
+
   member_exprt member(
     symbol_exprt(it->second.first, it->second.second),
     component.name(),
@@ -2312,7 +2314,7 @@ bool clang_cpp_convertert::get_function_body(
 
       exprt initializer;
 
-      if (init->sDelegatingInitializer())
+      if (init->isDelegatingInitializer())
       {
         /* The "A(1)" initializer here is a delegating initializer.
          * There can only be one initializer in that case.
@@ -2406,6 +2408,7 @@ bool clang_cpp_convertert::get_function_body(
         fd.dump();
         abort();
       }
+
       else if (init->isMemberInitializer())
       {
         // parsing non-static member initializer
