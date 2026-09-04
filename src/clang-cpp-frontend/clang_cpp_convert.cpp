@@ -2398,8 +2398,9 @@ bool clang_cpp_convertert::get_function_body(
         llvm::errs() << member_decl->getName() << "\n";
         member_decl->getAnonField()->getParent()->dump();
 
-        llvm::errs() << typeid(member_decl->getAnonField()->getParent()).name()
-                     << '\n';
+        // RecordDecl        
+        //llvm::errs() << typeid(member_decl->getAnonField()->getParent()).name()
+        //            << '\n';
 
         exprt member;
 

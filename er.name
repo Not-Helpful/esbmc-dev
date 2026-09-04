@@ -1,0 +1,35 @@
+[33mcommit 33d2c44ab4e975992c83933c5aaeb100b39c10a3[m
+Author: Zhi Han <zhih@fb.com>
+Date:   Wed Apr 29 09:27:26 2026 -0400
+
+    [cpp] route dynamic_cast through C++-frontend dispatch (#4147)
+    
+    Move dynamic_cast lowering out of the C frontend's structural-cast
+    fall-through. The CXXDynamicCastExprClass arm now calls a new
+    clang_cpp_convertert::build_dynamic_cast helper, and get_cast_expr fails
+    loudly if any CK_Dynamic still reaches it. The helper currently mirrors
+    the legacy gen_typecast behaviour so existing tests keep their status;
+    follow-up patches will replace its body with the runtime vptr-comparison
+    ITE described in docs/dynamic_cast_rtti_plan.md (steps 5.3-5.6).
+    
+    ---------
+    
+    Co-authored-by: XLiZHI <958689657@qq.com>
+    Co-authored-by: Lucas C. Cordeiro <lucasccordeiro@gmail.com>
+
+[1mdiff --git a/src/clang-cpp-frontend/clang_cpp_convert.cpp b/src/clang-cpp-frontend/clang_cpp_convert.cpp[m
+[1mindex b9361b05da..e06b045d32 100644[m
+[1m--- a/src/clang-cpp-frontend/clang_cpp_convert.cpp[m
+[1m+++ b/src/clang-cpp-frontend/clang_cpp_convert.cpp[m
+[36m@@ -583,7 +583,10 @@[m [mbool clang_cpp_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)[m
+ [m
+       new_expr = gen_zero(gen_pointer_type(t));[m
+     }[m
+[31m-    else if (get_cast_expr(cast, new_expr))[m
+[32m+[m[32m    // Route every other dynamic_cast through build_dynamic_cast rather[m
+[32m+[m[32m    // than get_cast_expr — get_cast_expr now rejects CK_Dynamic since the[m
+[32m+[m[32m    // C frontend cannot perform the runtime check the cast requires.[m
+[32m+[m[32m    else if (build_dynamic_cast(cast, new_expr))[m
+       return true;[m
+ [m
+     break;[m
