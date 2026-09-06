@@ -1942,12 +1942,17 @@ void clang_cpp_convertert::build_member_from_component(
     abort();
   }
 
-  component.type().dump();
-
   member_exprt member(
     symbol_exprt(it->second.first, it->second.second),
     component.name(),
     component.type());
+
+        llvm::errs() << "Member DUMP2:" << "\n";
+        member.dump();
+        llvm::errs() << "Member END" << "\n";
+
+
+
 
   component.swap(member);
 }
@@ -2416,7 +2421,11 @@ bool clang_cpp_convertert::get_function_body(
         const clang::FieldDecl *member_decl = init->getMember();
 
         exprt member;
+
+
         member.set("#member_init", 1);
+
+        // Sets the type and id name
         if (get_decl_ref(*member_decl, member))
           return true;
 
@@ -2425,10 +2434,16 @@ bool clang_cpp_convertert::get_function_body(
         // carries the #bitfield/width-N marker symex relies on; otherwise
         // symex routes through dereferencet's non-scalar path and produces
         // spurious bounds / alignment VCCs on bitfield members. See #4281.
+        // Did nothing, makes sense given the name        
         if (wrap_bitfield_type_if_needed(*member_decl, member.type()))
           return true;
 
         build_member_from_component(fd, member);
+        llvm::errs() << "Member DUMP:" << "\n";
+        member.dump();
+        llvm::errs() << "Member END" << "\n";
+
+
         // set #member_init flag again, as it has been cleared between the first
         // call...
         member.set("#member_init", 1);

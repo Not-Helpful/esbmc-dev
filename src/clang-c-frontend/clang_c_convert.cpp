@@ -5013,22 +5013,11 @@ void clang_c_convertert::get_decl_name(
 #include <iostream>
   clang::SmallString<128> DeclUSR;
 
-  auto debugname = nd.getDeclKindName();
-
-  if (
-    std::strcmp(debugname, "Function") == 0 ||
-    std::strcmp(debugname, "CXXMethod") == 0)
-  {
-    if (auto *fd = llvm::dyn_cast<clang::FunctionDecl>(&nd))
-    {
-    }
-  }
-
-#if LLVM_VERSION_MAJOR >= 23
+  //#if LLVM_VERSION_MAJOR >= 23
   bool failed = clang::index::generateUSRForDecl(&nd, DeclUSR);
-#else
-  bool failed = clang::index::generateUSRForDecl(&nd, DeclUSR);
-#endif
+  //#else
+  //bool failed = clang::index::generateUSRForDecl(&nd, DeclUSR);
+  //#endif
 
   if (!failed)
   {
