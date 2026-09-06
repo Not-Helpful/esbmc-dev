@@ -1930,14 +1930,14 @@ void clang_cpp_convertert::build_member_from_component(
   const clang::FunctionDecl &fd,
   exprt &component)
 {
-  // Add this pointer as first argument
+  // add this pointer as first argument
   std::size_t address = reinterpret_cast<std::size_t>(fd.getFirstDecl());
 
   this_mapt::iterator it = this_map.find(address);
   if (this_map.find(address) == this_map.end())
   {
     log_error(
-      "Pointer `this' for method {} was not added to scope",
+      "pointer `this' for method {} was not added to scope",
       clang_c_convertert::get_decl_name(fd));
     abort();
   }
@@ -1946,13 +1946,6 @@ void clang_cpp_convertert::build_member_from_component(
     symbol_exprt(it->second.first, it->second.second),
     component.name(),
     component.type());
-
-        llvm::errs() << "Member DUMP2:" << "\n";
-        member.dump();
-        llvm::errs() << "Member END" << "\n";
-
-
-
 
   component.swap(member);
 }
@@ -2393,35 +2386,53 @@ bool clang_cpp_convertert::get_function_body(
         initializers.push_back(initializer);
         init_sym_uptodate = false;
       }
-      else if (init->isIndirectMemberInitializer())
+      // else if (init->isIndirectMemberInitializer())
+      // {
+      //   llvm::errs() << "isIndirectMemberInitializer\n";
+
+      //   const clang::IndirectFieldDecl *member_decl =
+      //   init->getIndirectMember();
+
+      //   exprt member;
+      //   clang_c_convertert::get_decl(*member_decl, member);
+
+      //   llvm::errs() << "Member DUMP:" << "\n";
+      //   member.dump();
+      //   llvm::errs() << "Member END" << "\n";
+
+      //   llvm::errs() << "#######################" << "\n";
+      //   llvm::errs() << member_decl->getName() << "\n";
+      //   member_decl->getAnonField()->getParent()->dump();
+
+      //   // RecordDecl
+      //   //llvm::errs() <<
+      //   typeid(member_decl->getAnonField()->getParent()).name()
+      //   //            << '\n';
+
+      //   // TODO: Finish
+      //   log_error("FIXME: isIndirectMemberInitializer", __func__);
+      //   fd.dump();
+      //   abort();
+      // }
+
+      else if (
+        init->isMemberInitializer() || init->isIndirectMemberInitializer())
       {
-        llvm::errs() << "isIndirectMemberInitializer\n";
+        const clang::FieldDecl *member_decl = nullptr;
 
-        const clang::IndirectFieldDecl *member_decl = init->getIndirectMember();
+        if (init->isIndirectMemberInitializer())
+        {
+          const clang::IndirectFieldDecl *indirect = init->getIndirectMember();
+          // last link in the chain is the actual field being initialized
+          member_decl = llvm::cast<clang::FieldDecl>(indirect->chain().back());
+        }
+        else
+        {
+          member_decl = init->getMember();
+        }
 
-        llvm::errs() << "#######################" << "\n";
-        llvm::errs() << member_decl->getName() << "\n";
-        member_decl->getAnonField()->getParent()->dump();
-
-        // RecordDecl        
-        //llvm::errs() << typeid(member_decl->getAnonField()->getParent()).name()
-        //            << '\n';
 
         exprt member;
-
-        // TODO: Finish
-        log_error("FIXME: isIndirectMemberInitializer", __func__);
-        fd.dump();
-        abort();
-      }
-
-      else if (init->isMemberInitializer())
-      {
-        // parsing non-static member initializer
-        const clang::FieldDecl *member_decl = init->getMember();
-
-        exprt member;
-
 
         member.set("#member_init", 1);
 
@@ -2434,18 +2445,24 @@ bool clang_cpp_convertert::get_function_body(
         // carries the #bitfield/width-N marker symex relies on; otherwise
         // symex routes through dereferencet's non-scalar path and produces
         // spurious bounds / alignment VCCs on bitfield members. See #4281.
-        // Did nothing, makes sense given the name        
+        // Did nothing, makes sense given the name
         if (wrap_bitfield_type_if_needed(*member_decl, member.type()))
           return true;
 
         build_member_from_component(fd, member);
-        llvm::errs() << "Member DUMP:" << "\n";
-        member.dump();
-        llvm::errs() << "Member END" << "\n";
-
+        // llvm::errs() << "Member DUMP:" << "\n";
+        // member.dump();
+        // llvm::errs() << "Member END" << "\n";
 
         // set #member_init flag again, as it has been cleared between the first
         // call...
+
+        // Its because the swap in
+        // build_member_from_component(fd, member);
+        // does not preserve the .set() flags
+
+        // This is quite a bad work around. It should have just been fixed
+
         member.set("#member_init", 1);
 
         exprt rhs;
