@@ -192,38 +192,6 @@ void clang_cpp_convertert::get_decl_name(
 
   switch (nd.getKind())
   {
-  // case clang::Decl::CXXMethod:
-  // {
-  //   llvm::errs() << "Entered CXXMethod" << " ===\n";
-  //   llvm::errs() << "Method: " << id << "\n";
-  //   // Cast generic node to Method node. Derives from Function Node.
-  //   const clang::CXXMethodDecl &fd =
-  //     static_cast<const clang::CXXMethodDecl &>(nd);
-
-  //   const clang::DeclContext *ctx = fd.getDeclContext();
-
-  //   if (const auto *record = llvm::dyn_cast<clang::CXXRecordDecl>(ctx))
-  //   {
-  //     if (
-  //       const auto *spec =
-  //         llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record))
-  //     {
-  //       llvm::errs() << "=== CLASS TEMPLATE SPECIALIZATION ===\n";
-
-  //       const clang::TemplateArgumentList &args = spec->getTemplateArgs();
-
-  //       for (unsigned i = 0; i < args.size(); ++i)
-  //       {
-  //         llvm::errs() << "=== ARG " << i << " ===\n";
-  //         args[i].dump();
-
-  //      }
-  //     }
-  //   }
-
-  //   clang_c_convertert::get_decl_name(nd, name, id);
-  //   return;
-  // }
   case clang::Decl::CXXConstructor:
     if (name.empty())
     {
@@ -308,9 +276,6 @@ void clang_cpp_convertert::get_decl_name(
 
   default:
     clang_c_convertert::get_decl_name(nd, name, id);
-<<<<<<< HEAD
-    llvm::errs() << name << "\n";
-=======
     /* A lambda's operator(), __invoke and conversion-operator USRs name the
      * enclosing specialisation but not the closure, so siblings in one
      * instantiation share an id and the last body converted wins (#7499); the
@@ -323,7 +288,6 @@ void clang_cpp_convertert::get_decl_name(
       get_decl_name(*md->getParent(), closure_name, closure_id);
       id += "@" + closure_id;
     }
->>>>>>> upstream/master
     return;
   }
 
@@ -2043,23 +2007,12 @@ bool clang_cpp_convertert::build_destructor_chain(
 
   // Cast `this` to the base's expected pointer type and emit the call.
   auto emit_base_dtor =
-<<<<<<< HEAD
-    [&](const symbolt &sym, const clang::CXXRecordDecl *rec, uint64_t offset)
-  {
-    exprt this_expr =
-      base_dtor_this(*rec, deref, this_id, this_ptr_type, offset);
-    gen_typecast(
-      ns, this_expr, to_code_type(sym.get_type()).arguments().front().type());
-    emit_dtor_call(sym, std::move(this_expr));
-  };
-=======
     [&](const symbolt &sym, const clang::CXXRecordDecl *rec) {
       exprt this_expr = base_dtor_this(*rec, deref, this_id, this_ptr_type);
       gen_typecast(
         ns, this_expr, to_code_type(sym.get_type()).arguments().front().type());
       emit_dtor_call(sym, std::move(this_expr));
     };
->>>>>>> upstream/master
 
   // 1. Member subobjects, reverse declaration order (C++ [class.dtor]/9).
   llvm::SmallVector<const clang::FieldDecl *, 8> fields(parent->fields());
@@ -2329,25 +2282,6 @@ bool clang_cpp_convertert::get_function_body(
     // `init` type is clang::CXXCtorInitializer
     for (auto init : cxxcd.inits())
     {
-      // Debug print the init
-      if (init->isBaseInitializer())
-        llvm::errs() << "isBaseInitializer\n";
-
-      if (init->isMemberInitializer())
-        llvm::errs() << "isMemberInitializer\n";
-
-      if (init->isAnyMemberInitializer())
-        llvm::errs() << "isAnyMemberInitializer\n";
-
-      if (init->isInClassMemberInitializer())
-        llvm::errs() << "isInClassMemberInitializer\n";
-
-      if (init->isDelegatingInitializer())
-        llvm::errs() << "isDelegatingInitializer\n";
-
-      if (init->isPackExpansion())
-        llvm::errs() << "isPackExpansion\n";
-
       exprt initializer;
 
       if (init->isDelegatingInitializer())
@@ -2424,53 +2358,6 @@ bool clang_cpp_convertert::get_function_body(
         initializers.push_back(initializer);
         init_sym_uptodate = false;
       }
-<<<<<<< HEAD
-      // else if (init->isIndirectMemberInitializer())
-      // {
-      //   llvm::errs() << "isIndirectMemberInitializer\n";
-
-      //   const clang::IndirectFieldDecl *member_decl =
-      //   init->getIndirectMember();
-
-      //   exprt member;
-      //   clang_c_convertert::get_decl(*member_decl, member);
-
-      //   llvm::errs() << "Member DUMP:" << "\n";
-      //   member.dump();
-      //   llvm::errs() << "Member END" << "\n";
-
-      //   llvm::errs() << "#######################" << "\n";
-      //   llvm::errs() << member_decl->getName() << "\n";
-      //   member_decl->getAnonField()->getParent()->dump();
-
-      //   // RecordDecl
-      //   //llvm::errs() <<
-      //   typeid(member_decl->getAnonField()->getParent()).name()
-      //   //            << '\n';
-
-      //   // TODO: Finish
-      //   log_error("FIXME: isIndirectMemberInitializer", __func__);
-      //   fd.dump();
-      //   abort();
-      // }
-
-      else if (
-        init->isMemberInitializer() || init->isIndirectMemberInitializer())
-      {
-        const clang::FieldDecl *member_decl = nullptr;
-
-        if (init->isIndirectMemberInitializer())
-        {
-          const clang::IndirectFieldDecl *indirect = init->getIndirectMember();
-          // last link in the chain is the actual field being initialized
-          member_decl = llvm::cast<clang::FieldDecl>(indirect->chain().back());
-        }
-        else
-        {
-          member_decl = init->getMember();
-        }
-
-=======
       else if (
         init->isMemberInitializer() || init->isIndirectMemberInitializer())
       {
@@ -2479,7 +2366,6 @@ bool clang_cpp_convertert::get_function_body(
         // sets isIndirectMemberInitializer instead; getAnyMember() yields the
         // underlying FieldDecl for both (#7560).
         const clang::FieldDecl *member_decl = init->getAnyMember();
->>>>>>> upstream/master
 
         exprt member;
 

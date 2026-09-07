@@ -1,5 +1,5 @@
 use.hs llvm USR-patch
-cd build/USR-patch/
+cd build/clang-24-with-print/
 ninja -v src/esbmc/esbmc
 cd ./../../
 
@@ -16,11 +16,6 @@ cd ./../../
 # mv ./--.html ./.srcwalk/srcwalk.html
 # firefox ./.srcwalk/srcwalk.html
 # rm ./srcwalk*
-
-
-
-
-use.hs llvm default
 
 cd /home/helpful/.repos/writing/hpx_memory_usage_bug/
 ./build.sh
