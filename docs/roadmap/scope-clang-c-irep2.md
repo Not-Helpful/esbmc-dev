@@ -3458,6 +3458,7 @@ is not this scope's business.
 
 `esbmc-unix` (438) is the last of §101's list. On the evidence of `cstd` and
 `floats`, expect the same four owned causes and no new ones.
+
 ## 99. The fifteen open PRs do not batch-merge — an integration attempt
 
 Fifteen Phase 6 PRs were open with none merged, so rather than add a sixteenth
@@ -3513,6 +3514,7 @@ against master with only that arm applied, and those stand; how far the fifteen
 together take the corpus is unmeasured, and will stay unmeasured until they can
 be built together. Stated plainly because the obvious summary — "201 down to N"
 — is one this scope has not earned.
+
 ## 98. The `DEAD` class: a live variable marked dead, and a hoist that does not fix it
 
 §97 left 13 untagged tests, most showing a `DEAD` instruction in a different
@@ -4587,6 +4589,7 @@ the second time that distinction has cost a prediction.
 | assignment arm disabled | `..._assign_array_decay` only |
 | binary-arithmetic arm disabled | `..._bitint_arith` only |
 
+
 ## 94. `adjust_address_of`'s array decay, and a guard that had no witness
 
 `&a` on an array is `&a[0]`: the pointer designates the first element, not the
@@ -4637,9 +4640,49 @@ registered on macOS (`gotcha`: run its `test.desc` by hand, as here).
 
 ### 94.3 Result
 
+## 100. §98 was wrong: the hoist is the fix, and the bug was in my port
+
+§98.2 reported that porting `adjust_for`'s block hoist "leaves the misplaced
+`DEAD` exactly where it was" and concluded it was not the fix. That conclusion
+was wrong. The hoist *is* the fix; the port had a bug that made it look
+otherwise.
+
+### 100.1 The instrument §98 should have used
+
+§98 compared goto programs. The adjuster's output is the **symbol table**, and
+`--symbol-table-only` shows it directly:
+
+```
+default:  {  signed int i=0;    for(; i < 3; i++;) s += i;  }
+-only:       for(signed int i=0; ; i < 3; i++;) s += i;
+```
+
+One command, and the hoist is visibly the difference. Three iterations of this
+scope inferred adjuster behaviour from goto programs — two stages downstream —
+when the pass's own output was one flag away. That is the reusable lesson.
+
+### 100.2 The bug
+
+`f.init` is itself block-shaped, and the first port made it a single operand of
+the new wrapper:
+
+```
+default:  {  signed int i=0;   for(...) ... }
+first port: { { signed int i=0; } for(...) ... }
+```
+
+The inner block ends the declaration's scope at its own closing brace, so `i`
+is DEAD before the loop that reads it — the very symptom the arm was meant to
+fix, reproduced by the arm. `clang_c_adjust` moves the init *operand* into the
+wrapper, so its declaration sits directly there; the port must splice a
+block-shaped init rather than nest it.
+
+### 100.3 Result
+
 | | master | with the arm |
 |---|---:|---:|
 | `-only` divergence, 297-test sample | 202 | **200** |
+
 | regressions | -- | **0** |
 
 Cleared: `github_159_postdecrement_fail`, `github_159_preincrement_fail`, whose
@@ -4653,3 +4696,2832 @@ would be the same unwitnessed instrumentation §94.1 just removed.
 | mutant | killed by |
 |---|---|
 | arm absent (master) | `..._address_of_array` |
+
+
+| differing lines corpus-wide | 33 767 | **25 341** |
+| regressions | -- | **0** |
+
+The line count is the number that matters here: **−8 426, a 25 % reduction**,
+the largest of any arm in this sequence, and all of it was hidden behind the
+nesting bug. Two tests clear outright (`github_1067`, `github_286_2`); the rest
+converge substantially because a wrong scope perturbs every location and
+destructor placement after it.
+
+| mutant | killed by |
+|---|---|
+| arm absent (master) | `..._for_scope` |
+| splice replaced by nesting (the original bug) | `..._for_scope` |
+
+The second mutant is the one worth having: it is not a hypothetical, it is the
+code that shipped in the §98 measurement.
+
+### 100.4 Consequences for #7102
+
+PR #7102 records §98's conclusion and adds
+`irep2_only_for_scope_knownbug` as KNOWNBUG. Both are now wrong: the KNOWNBUG
+passes with this arm, so `testing_tool.py` would exit 77 (unexpected pass). When
+these two land, #7102's test must become CORE or be dropped in favour of
+`irep2_only_for_scope` here, and §98.2's "not the fix" must be read together
+with this section.
+
+## 96. The type symbols were never walked
+
+§95's census left 29 tests with no cause any open PR owned. Reading five of
+them found three showing the same thing: struct and union types in the `-only`
+symbol table have **no padding**.
+
+```
+default:  struct s { signed int a; signed char c; unsigned _ExtInt(24) anon_pad#2; }
+-only:    struct s { signed int a; signed char c; }
+```
+
+### 96.1 Why, and why it is not cosmetic
+
+`clang_c_adjust::adjust()` walks the symbol list twice over: once for every
+**type** symbol, through `adjust_type`, which pads a complete struct or union
+(`clang_c_adjust_expr.cpp:1006`); and once for values. `clang_c_adjust_irep2`
+only ever walked values — `if (!s->is_type && s->get_value().is_not_nil())`.
+Type symbols were skipped entirely, so nothing padded them.
+
+That is a layout difference, not a spelling one. The symbol table's type is what
+ESBMC sizes objects and computes member offsets from, so every hole in a
+`-only` layout shifts the members after it. It is the most consequential
+divergence this scope has found, and it was invisible in the census because the
+tests carrying it were tagged by whatever *else* they also diverged on.
+
+### 96.2 Reuse, not reimplementation
+
+`add_padding` is shared (`clang-c-frontend/padding.h`), operates on `typet`, and
+`adjust_type`'s own `#ifndef NDEBUG` block asserts it is idempotent — it re-pads
+a copy and requires the result to be equal. So the arm calls it rather than
+growing a second layout algorithm over `type2tc`; §94.1 and §100.1 are two
+records of what a second copy of a shared rule costs here.
+
+Only the padding half of `adjust_type` is ported. The rest — resolving a
+`symbol` type through the symbol table, and adjusting a VLA's size expression —
+has no witness in the corpus under this flag, and §94.1 is the standing reason
+not to ship an arm without one.
+
+### 96.3 Result
+
+| | master | with the arm |
+|---|---:|---:|
+| `-only` divergence, 297-test sample | 202 | **193** |
+| regressions | -- | **0** |
+
+Nine tests reach byte-identity: `github_{133_flex_array,170,345_false,357,6950_fail}`,
+`github_732-1-align_check`, `github_963-no-union`, `overflow_24`,
+`time_h_localtime_r_null_fail`. The best single-arm result on master since the
+sequence began, and the reason is that padding is a *precondition* for the rest
+rather than one more spelling: several of those tests had no other cause left.
+
+The union half is exercised by the corpus rather than by the test —
+`github_345_false` is a bitfield union and clears here — while the test pins the
+struct cases directly, including interior padding (`char` then `int`) as well as
+tail padding.
+
+| mutant | killed by |
+|---|---|
+| arm absent (master) | `..._struct_padding` |
+
+`sizeof(struct s)` is **not** a usable probe: clang folds it in its own AST, so
+it reads 8 on both paths and a verdict test built on it passes against the
+control. The first draft of this test did exactly that and proved nothing.
+
+## 111. The two aborts §110.4 named, and what fixed one of them (2026-08-22)
+
+§110.4 put the two tests where the hop-off emits no symbol table at all ahead of
+the remaining spelling differences: a hard stop is not a divergence you can
+measure. Neither is the by-name union tag the class comment on
+`clang_c_adjust_irep2` documents — that attribution in §110.4 is wrong, and the
+two tests fail for two unrelated reasons.
+
+### 111.1 `builtin_memcpy`: an array operand of pointer arithmetic
+
+```
+Assertion failed: (p2 || (is_bv_type(t) == is_bv_type(v1->type) &&
+  t->get_width() == v1->type->get_width())), assert_arith_2ops_consistency
+```
+
+Reduced to `char a[9]; char *p = a + 1;` — nothing to do with `memcpy`.
+`clang_c_convert` drops the decay cast on purpose
+(`case clang::CK_ArrayToPointerDecay: break;`) and leaves `clang_c_adjust` to
+insert the `&a[0]`. Under the flag that pass does not run, so `migrate_expr`
+builds `add2t` with a pointer result and an *array* operand, and `add2t`'s
+invariant is a post-adjust one.
+
+The adjuster cannot fix it: the node has to be constructed before any pass can
+walk it. So the decay goes where the node is built —
+`decay_array_operand` in `migrate.cpp`, applied to both operands of the `plus`
+and `minus` arms. On the legacy path the operands are already `&a[0]`, so it is
+a no-op there; the C++, C and 400-test Python slices are unchanged.
+
+Only `+` and `-` assert on an array operand. `a > q`, `a == q` and `a[1]` all
+migrate today — measured, not assumed.
+
+The `-` case needed the guard widened. Keying the decay on a pointer *result*
+type fixes `a + 1` and not `a - q`, whose result is `ptrdiff_t`: C11 6.3.2.1p3
+decays an array operand in either position regardless of what the operator
+returns, and C has no array arithmetic for the unconditional form to catch.
+
+`--goto-functions-only` on the new test is byte-identical between the two paths,
+which is the §1.3 gate. The *symbol table* still prints `a + 1` where legacy
+prints `&a[0] + 1`, and that is not this defect: the pass writes a value back
+only when it changed it (`value != before`), and `before` is now already
+decayed, so nothing is written and the unadjusted legacy value survives in the
+table. Closing that means comparing the write-back against the legacy value
+rather than the migrated one — a change to the pass's write-back policy, not
+another arm.
+
+| mutant | killed by |
+|---|---|
+| decay absent (master) | `irep2_only_array_arith_decay`, `..._memcpy` |
+
+### 111.2 `cwe_uninit_array_vla` is still open, and it is a segfault
+
+`int a[n];` with a runtime `n` segfaults under the flag with no diagnostic —
+`int main(int argc, char **argv){ int n = argc; int a[n]; return 0; }` is
+enough, and the array need not be read. It survives this patch, so it is a
+second cause and not a second symptom.
+
+**§112 corrects this: the VLA is not the trigger.** The reduction kept the VLA
+because it stopped as soon as the crash reproduced, and the crash reproduces on
+`int main(int argc, char **argv){ return 0; }` with no array at all. Reduce past
+the construct you came in for.
+
+## 112. `argc'`/`argv'` — a symbol-table side effect the sole adjuster owed
+## (2026-08-22)
+
+§111.2 named the VLA as the second abort's cause. It is not. Reduced past the
+construct the test was named for:
+
+```c
+int main(int argc, char **argv) { return 0; }
+```
+
+segfaults under `--clang-c-irep2-adjust-only`. No array, no VLA, no body. The
+same program on the default path is fine.
+
+`clang_c_main` looks the symbols up without a null check
+(`const symbolt &argc_symbol = *ns.lookup("argc'");`, clang_c_main.cpp:157), and
+they are created by `clang_c_adjust::adjust_argc_argv`. Under the flag the
+legacy pass does not run, so the lookup dereferences null.
+
+That is the same class as `declare_implicit_callee` (§70): a **symbol-table side
+effect** rather than an expression rewrite, so it belongs to whichever pass is
+in charge rather than to the dispatcher. Extracted as a free
+`declare_argc_argv(contextt &, const symbolt &)` and called from both, so there
+is one definition rather than a port to keep in step.
+
+### 112.1 What this says about the census
+
+The two "aborts" §110.4 ranked ahead of the spelling causes were:
+
+| test | actual cause | closed by |
+|---|---|---|
+| `builtin_memcpy` | undecayed array operand of `+` | §111.1 |
+| `cwe_uninit_array_vla` | missing `argc'`/`argv'` | this section |
+
+Neither was the by-name union tag §110.4 attributed them to, and neither had
+anything to do with the construct its test is named for. Both attributions came
+from reading the test name and the class comment instead of reducing. The rule
+that follows is the one §104.2 already states for tags and applies equally to
+crashes: read the residue, do not infer it.
+
+Stride-8 sample over `regression/esbmc`, symbol tables, blank lines ignored:
+
+| branch | same | differing |
+|---|---:|---:|
+| master `595f52b025` | 90 | 138 |
+| §112 alone, on master | 97 | 132 |
+| §111.1 + §112 stacked | 100 | 129 |
+
+**These two figures are inflated and §113.2 corrects them to 94/134 for the
+stacked pair.** The sample is a stride over the sorted test list, so adding
+regression test directories -- which these patches do, and which are
+byte-identical by construction -- changes *which* tests are sampled. Compare
+across branches only on a test list pinned to one commit.
+| §111.1 + §112 stacked | **100** | **129** |
+
+`cwe_uninit_array_vla`'s symbol table is byte-identical once it runs, and so is
+the reduction's; the three-argument `envp` form is byte-identical too.
+
+| mutant | killed by |
+|---|---|
+| side effect absent (master) | `irep2_only_argc_argv`, `..._argc_argv_envp` |
+
+### 112.2 A pre-existing abort found alongside, and not fixed here
+
+`int main(int argc) { return 0; }` -- one argument -- aborts on
+`assert(false)` at clang_c_main.cpp:399 on **both** paths. It is not a hop-off
+defect and it is not in this scope; recorded so the next reduction does not
+mistake it for one.
+
+### 112.3 Next
+
+The remaining causes are all spelling differences again, and §110.1's table
+still ranks them. The two that are not printer artefacts are the
+function-pointer cast at a call argument and the coupled arith-assign
+(`scope-coupled-arith-assign-conversion.md`).
+
+## 113. The compound assignment, and a census that was measuring itself
+## (2026-08-22)
+
+§112.3 left two non-printer causes. This closes the second and disqualifies the
+first.
+
+### 113.1 The compound assignment was a third abort, not a spelling difference
+
+`compound_assign_narrow_overflow` appears in §110.1's untagged residue as
+`(signed int)b += a;` versus `b += a;` — a text difference. It is not: with
+`--goto-functions-only` the hop-off *aborts*, on the same
+`assert_arith_2ops_consistency` §111.1 met. The symbol-table census could not
+see it because the abort happens in `goto_convert`, two stages after the pass
+whose output that census reads. **A symbol-table census under-reports by
+construction; a differing text there may be a crash further on.**
+
+`adjust_plain_assignment` ports only the `"assign"` case of
+`clang_c_adjust::adjust_side_effect_assignment`, and its comment says the
+compound spellings were "left where this mode already had them". Where they
+were was: unconverted. C11 6.5.16.2p3 makes `b op= a` equivalent to
+`b = b op (a)`, so a `char` target promotes to `int` before the operation, and
+without that promotion `goto_convert`'s lowering builds `add2t` on a `char` and
+an `int`.
+
+Measured across all ten spellings on `char b; int a; b op= a;`:
+
+| spelling | before |
+|---|---|
+| `+= -= *= /= %=` | **abort** |
+| `&= \|= ^=` | diverge, no abort |
+| `<<= >>=` | already byte-identical |
+
+So the port is the tail of the legacy arm — the arithmetic conversion on *both*
+operands — and not its shift branch, which returns early after promoting only
+the right operand and which the corpus shows is already the migrated shape.
+All ten are byte-identical afterwards, in the symbol table and in the goto
+program.
+
+### 113.2 The census had started measuring its own tests
+
+§112's table reported the stacked pair at 100 same / 129 differing. On a test
+list pinned to `595f52b025` it is **94 / 134**. The difference is not drift: the
+sample is `awk 'NR%8==0'` over the sorted `test.desc` list, and every patch in
+this sequence adds regression directories which are byte-identical by
+construction. Adding them both inserts guaranteed-same entries and shifts which
+other tests land on a stride position.
+
+Corrected, on the pinned list (230 tests):
+
+| branch | same | differing |
+|---|---:|---:|
+| master `595f52b025` | 90 | 138 |
+| + §111.1 + §112 | 94 | 134 |
+| + §113.1 | **95** | **133** |
+
+§113.1 gains one test on this sample, which is the honest number: the sample
+holds few narrow-target compound assignments. Its value is the three abort
+classes it removes, not the sample delta.
+
+### 113.3 The function-pointer cast is a "do not mirror", not a gap
+
+§110.4's other non-printer cause: `atexit((void (*)())(&free_g2))` versus
+`atexit(&free_g2)`, and unlike §110.2's `(void)0` this one *does* reach the
+goto program. It is still not work.
+
+Instrumented at the conversion site, `arg->type == params[i]` is **true**: the
+argument is `void (*)(void)` and the parameter `void (*)()`, and `migrate_type`
+maps both to the same `code_type2t` — same empty argument vector, same return
+type, same ellipsis flag. The legacy pass emits a cast because the *legacy*
+types differ; in IREP2 the cast is the identity, and no pass reading IREP2 can
+know it is owed.
+
+Confirmed twice over: disabling `same_function_pointer_ignoring_argument_names`
+at that site does not restore the cast, so the §100.1 guard is not suppressing
+it; and `atexit-1` returns the same verdict on both paths under its own flags.
+
+Emitting an identity typecast to match the legacy printer is §110.2's mistake
+with a different node. Closing it for real means `code_type2t` carrying the
+prototyped/unprototyped distinction, which is a representation change and needs
+its own justification.
+
+### 113.4 Next
+
+Every cause §110.1 names is now either closed or argued not to be work, except
+the printer-only set (`+1` vs `1`, the float literal suffix, block indentation)
+and the `migrate_expr` renaming warning. The measured 133 residue on the pinned
+sample wants a fresh cause census before another arm is written — the old one
+is stale, and §113.1 shows it was reading the wrong stage.
+
+## 120. The verdict census reaches zero — and the last live row was a comma
+## (2026-08-23)
+
+(§120: PRs #7266, #7271, #7274, #7275 and #7278 are in flight against this file
+and claim §115-§119.)
+
+With those five merged locally, both censuses were re-run on the pinned
+stride-8 list (226 C sources).
+
+| | before the series | after |
+|---|---:|---:|
+| goto program differing | 24 | **6** |
+| **verdict differing** | 3 | **0** |
+
+Every test in the sample now returns the same verdict on both paths. That is
+the first time this scope has measured zero on the instrument that matters.
+
+### 120.1 §119.4's row was already closed
+
+`github_3487`'s `bad_optional_access` is `member2t::do_simplify` calling
+`.value()` on an unresolvable component number
+(`expr_simplifier.cpp:1327`). The member it fails to find is **`anon_pad#1`**:
+the source is a `constant_struct2t` still carrying the pre-padding operand list,
+so the padding member the read names is not in its type. §119's arm removes the
+producer, and the test verifies.
+
+**Do not "harden" the `.value()`.** `member2t`'s constructor already asserts
+that the member resolves (`irep2_expr.h:1607-1610`), exempting only the
+transient symbol/pointer/array source types — which a `constant_struct2t` is
+not. So an assert-enabled build (CI's DebugOpt) would have caught this at
+construction, and the uncaught exception is only how a `-DNDEBUG` build notices
+the same violated invariant. Returning `expr2tc()` there would convert an
+asserted invariant into a silent decline and hide the next producer. The three
+unguarded `.value()` calls in that file (1226, 1243, 1327) are correct as they
+stand.
+
+### 120.2 The six remaining goto rows, classified
+
+| rows | cause | verdict |
+|---:|---|---|
+| 2 | identity cast from an alignment attribute (`aligned_attr`, `github_2337_6`) | do not mirror, §115.1 |
+| 3 | function-pointer identity cast (`atexit-1`, `github_5138_fail`, `github_5296`) | do not mirror, §113.3 |
+| 1 | `00_aiob_4_true-unreach-call` | **work**, §120.3 |
+
+Five of six were already-recorded decisions. Only one was live.
+
+### 120.3 The comma expression's type
+
+Reduced from `00_aiob_4`:
+
+```c
+unsigned g[42][3];
+unsigned i;
+int main(void) { i = 3; if ((i = i, g[i])[0] != 0) return 1; return 0; }
+```
+
+```
+<         ASSERT (signed long int)i >= 0 // array bounds violated: array `g' lower bound
+<         ASSERT (signed long int)i < 42 // array bounds violated: array `g' upper bound
+<         IF !(g[(signed long int)i][0] != 0) THEN GOTO 1
+---
+>         IF !((&g[(signed long int)i][0])[0] != 0) THEN GOTO 1
+```
+
+C11 6.5.17p2 gives a comma expression its right operand's type. Clang hands the
+node the *decayed* type when that operand is an array, and
+`clang_c_adjust::adjust_comma` overwrites it (`expr.type() = expr.op1().type()`,
+`clang_c_adjust_expr.cpp:1884`). This pass had no such arm — `adjust_sole_arms`
+never matched `code_comma2t` at all — so the pointer type survived,
+`adjust_index` took its `p[i]` sugar path, and the row was indexed as a pointer.
+
+The visible cost is the two named array-bounds ASSERTs. It is **not** a
+soundness hole: an out-of-range subscript is still caught, as
+`dereference failure: array bounds violated` rather than
+``array bounds violated: array `g' upper bound``. What is lost is the check's
+attribution, and with it the ability of a `test.desc` to pin *which* check
+fired — which is why the `_fail` test regexes the named form.
+
+`adjust_comma_at_dispatch` (`clang_c_adjust_irep2.cpp:875-885`) already performs
+exactly this rewrite for the `--clang-c-irep2-adjust` probe; the sole-adjuster
+path simply never called it. The arm added here is the same three lines,
+natively.
+
+### 120.4 Result
+
+Census 24 → 23 for this patch alone, with `00_aiob_4_true-unreach-call`
+converging and nothing new; default path byte-identical on all 226 C sources.
+Suites: `esbmc` 1857/1857, `cstd` 142/142, `floats` 106/106,
+`function_contract` 414/414, `goto-coverage` 144/144.
+
+Applied on top of the other five, the goto residue falls to **5**, and all five
+are recorded do-not-mirror decisions.
+
+### 120.5 Next
+
+The stride-8 sample is exhausted: zero verdict divergences, and every goto
+difference is a recorded decision. The sample was pinned at 226 of 1 863 tests,
+so the honest next step is **not another slice but a wider census** — run the
+verdict comparison over the whole `regression/esbmc` suite rather than 1-in-8,
+which is where any remaining live divergence now has to come from. §118.5's
+artefact warning applies at that scale: the run must clean up after itself.
+## 125. The unary promotion the complex arm displaced (2026-08-23)
+
+(§125: PRs #7266-#7285 are in flight against this file and claim §115-§124.)
+
+§124.4 guessed that `github_4078_unary_bool` was an unported arm and said it
+was cheap to check first. It was, and it was.
+
+### 125.1 One `if`, two obligations
+
+`clang_c_adjust` handles `unary-` and `bitnot` in a single arm that does two
+things: recurse into the operands, and promote a boolean operand to the node's
+type (`clang_c_adjust_expr.cpp:150-160`, added for #4078). This pass ported the
+*complex* half of the unary story — `adjust_complex_unary`, guarded by
+`is_complex_unary`, which requires `is_complex_type(expr->type)` — and nothing
+covers the ordinary case. A `~(a || b)` therefore kept a boolean operand, and
+the solver was handed a boolean where it wanted a bitvector:
+
+```
+$ esbmc main.c --unwind 2 --clang-c-irep2-adjust-only
+ERROR: Bitwuzla error encountered
+```
+
+The port is the same shape as the legacy arm, expressed with
+`c_implicit_typecast`, and hangs off the existing `is_complex_unary` branch as
+its `else`.
+
+### 125.2 Result
+
+Closes `github_4078_unary_bool` and `github_4078_unary_bool_fail`. The
+`gcc_vector_float_{arith,scalar_mul}` pair that §124.4 grouped with them is a
+different cause — both still abort in bitwuzla after this patch — so the
+"SIGABRT on vectors / unary bool" row was two causes, as its name half-admitted.
+That is the second time a cluster named by *symptom* has split on inspection
+(§123.2 was the first); the census groups by signal, and a signal is not a
+cause.
+
+Whole-suite verdict residue **11 → 9**. Both new tests abort in bitwuzla on the
+pre-patch binary and return SUCCESSFUL / FAILED after; a mutant swapping `neg`
+for `bitnot` moves both, the `_fail` one inverting.
+
+Default path byte-identical on 226 C sources. Suites: `esbmc` 1857/1857,
+`cstd` 142/142, `floats` 106/106, `cbmc` 307/307, `goto-coverage` 144/144.
+
+### 125.3 Next
+## 119. §118.6's unsound row closed — the literal's type is a pre-padding copy
+## (2026-08-23)
+
+(§119: PRs #7266, #7271, #7274 and #7275 are in flight against this file and
+claim §115-§118.)
+
+§118.3 named `github_2335_4` — FAILED by default, SUCCESSFUL under the flag —
+as the highest-value row left, being the only one unsound rather than merely
+wrong. It is `clang_c_adjust::adjust_struct`, which this pass never had.
+
+### 119.1 The missing arm, and why the obvious port does not work
+
+The legacy arm inserts a zero operand at each synthetic padding member so a
+literal's operand list matches its padded type
+(`clang_c_adjust_expr.cpp:202-226`). Ported directly it does nothing: the
+literal's own type reports two members where the tag reports three.
+
+The reason is that the value's type is an **inline copy the converter recorded
+before `add_padding` ran**. `pad_type_symbol` pads the *type symbols*, and the
+legacy arm needs no more than that because there the value's type is a
+`symbol_typet` — `ns.follow` resolves it to the padded one. Under this flag the
+value has come through `migrate_expr`, which resolved that symbol type to a
+concrete `struct_type2t` snapshot, and `ns.follow` on a concrete type is the
+identity. The padded layout has to be read off the tag symbol by name.
+
+`pad_struct_operands` already existed for exactly this job, file-local in
+`python_adjust.cpp` (§V.3's Optional/union literals). It moves to
+`irep2_utils`, so the two frontends share one definition rather than the second
+copy §39.2 of `frontends-to-irep2.md` warns about.
+
+### 119.2 The first pair of tests did not reproduce, and why
+
+The obvious test — read a trailing member out of a padded literal — passes on
+the *pre-patch* binary. Trailing padding shifts nothing before it, so every
+declared member still resolves at its own index. §39.1's first failure mode:
+the corpus was thin, and a green mutant meant the test, not the code.
+
+What `github_2335_4` actually exercises is a dispatch through a function-pointer
+member of an array element, where the short literal changes the flow rather
+than a single read. Reduced to 21 lines:
+
+```c
+struct command { char *name; void (*function)(void); char state_needed; };
+const struct command commands[] = {{"c1", c1, 0}, {"c2", c2, 1}};
+/* parse() dispatches through commands[i].function; c1() leaks on the second call */
+```
+
+```
+$ esbmc v2.c --memory-leak-check ...                              VERIFICATION FAILED
+$ esbmc v2.c --memory-leak-check ... --clang-c-irep2-adjust-only  VERIFICATION SUCCESSFUL
+```
+
+That is the shipped `_fail` test, and it is the strongest kind available here:
+the pre-patch binary does not merely print differently, it **misses a real
+leak**. Corrupting the arm (skip the insert) returns both tests to SUCCESSFUL.
+
+### 119.3 Result
+
+Census on the pinned stride-8 list, same base: **24 → 22**, with
+`github_2335_4` and `github_578_success3` converging and nothing new. The two
+were one cause with two symptoms, as §118.3 predicted. The verdict census's
+three-row residue is now one (`github_3487`, §118.4).
+
+`irep2_utils` is shared, so the default path was measured: byte-identical on all
+226 C sources. Suites: `esbmc` 1857/1857, `cstd` 142/142, `function_contract`
+414/414, `python/list` 294/294, `python` class/struct/optional/union 110/110,
+`esbmc-cpp/cpp` 931/933 — `ch9_7` and `ch13_10` exceed the harness's 120 s cap
+locally and return their expected verdicts on master and here alike.
+
+### 119.4 Next
+
+`github_3487` — `ERROR: uncaught exception [St19bad_optional_access]` under the
+flag, SUCCESSFUL without. The last row of §118.1's three, and the only one that
+is a crash in ESBMC's own code rather than a modelling gap.
+## 116. §114.2's two three-test causes: one is a crash, one is not work
+## (2026-08-23)
+
+§114.2 deferred "the promotion at a comparison, and the decay rendered as a
+cast", three tests each, on the reading that both were spelling-level. Reduced,
+neither is what its census tag said.
+
+### 116.1 The comparison cast is §113.3's class, not a missing promotion
+## 129. The false alarm was not in the builtin's lowering (2026-08-24)
+
+(§129: PRs #7278-#7290 are in flight against this file and claim §119-§128;
+#7284 has since landed as §123.)
+
+§128.4 picked `builtin_arith_overflow` on the reasoning that it "names a builtin
+family (`__builtin_*_overflow`) whose lowering is a specific, findable arm — the
+same shape as §117 and §125, both of which were unported name-matched builtins."
+
+The family is the right place to look and the wrong place to patch. The
+builtins are lowered identically on both paths; what this pass corrupts is the
+type of the *argument* they are handed, in `expr2t::with_type` — a generic irep2
+utility with no connection to builtins. The family matters only because its
+lowering is the one consumer that reads that type.
+
+### 129.1 A trait that is structurally right and semantically wrong
+
+`c_typecastt::implicit_typecast_followed` re-attaches a pointer argument's own
+type when source and destination compare equal without being identical
+(`c_typecast.cpp:838-842` — qualifier differences). It does so through
+`expr2t::with_type`, which rebuilds a node from a new type plus its remaining
+fields, gated on `supports_with_type_v`:
+
+1. the kind's first `fields` entry is `&expr2t::type`, and
+2. the kind is constructible from `(const type2tc &, rest...)`.
+
+`address_of2t` passes both — and means something else by the type it accepts.
+Its primary constructor takes the **pointee** type and builds
+`pointer_type2tc(subtype)` itself, a signature its own comment already calls
+"slightly unintuitive". Handed a pointer type it wraps it a second time, so
+`&y` on an `int` acquires type `int **`.
+
+Gate 2 is what makes this the only such kind. Forty-one kinds synthesise their
+own type in the constructor and still list `&expr2t::type` first; a compiled
+fold of both gates over `expr_kinds.inc` counts 106 passing gate 1, 66 passing
+both, so 40 are excluded by gate 2 alone. Representative rows:
+
+| kind | constructor's first parameter | gate 2 |
+|---|---|---|
+| `constant_bool2t` | `bool value` | rejects |
+| `constant_fixedbv2t` | `const fixedbvt &` | rejects |
+| `constant_floatbv2t` | `const ieee_floatt &` | rejects |
+| `same_object2t` | `const expr2tc &v1` | rejects |
+| `overflow2t`, `overflow_cast2t`, `overflow_neg2t` | `const expr2tc &operand` | rejects |
+| **`address_of2t`** | **`const type2tc &subtype`** | **accepts** |
+
+All forty are excluded because their constructor will not take a leading
+`type2tc` at all — the case the trait's comment was written for. `address_of2t`
+takes one and means the subtype by it, which no structural test can see. That
+it is the only kind to do so is exhaustive, not sampled: every `expr2t(...)`
+base initializer lives in `irep2_expr.h`, and tallying them by first argument
+gives `type` x43, `get_empty_type()` x20, `get_bool_type()` x11, `t` x5,
+`value.spec.get_type()` x2, `size_type2()` x1, `get_int32_type()` x1, and
+`pointer_type2tc(subtype)` x1.
+
+The trait is left alone: the callers do want the rebuild, they want it built
+from `to_pointer_type(new_type).subtype`. The override is an explicit
+specialization of `rebuild_with_type<address_of2t>` rather than an early return
+in `with_type`, because the trait still admits the kind — an early return leaves
+the dispatcher expanding a `case address_of_id:` arm that performs the very
+double-wrap being fixed, dead only by virtue of being shadowed. Specialising
+puts the exception on the generic mechanism it overrides, and any future
+reordering that would have resurrected the bug now has nothing to resurrect.
+
+One field does not survive the rebuild. `pointer_type2t` carries
+`carry_provenance` beside `subtype`, and `address_of2t`'s constructor rebuilds
+the pointer with that parameter's `false` default, so `with_type(T)` returns a
+node whose type is not `T` when `T` carries provenance. The drop is inherited,
+not introduced — `migrate.cpp:1609` builds address-of nodes through the same
+constructor — and it is unobservable today: `can_carry_provenance` is set only
+under `ESBMC_CHERI_CLANG`, and every `with_type` caller derives its new type
+from `expr->type`, which for an address-of is already `false`. Closing it
+properly means an `address_of2t` constructor overload taking the full pointer
+type, which is a separate change with `migrate.cpp` in its blast radius.
+
+### 129.2 Why only a builtin reproduces it
+
+An ordinary call masks the widening completely. Measured on the pre-patch
+binary, under the flag:
+
+| shape | verdict |
+|---|---|
+| `void store(int *p) { *p = 4; } store(&y);` | SUCCESSFUL |
+| the same with no body | SUCCESSFUL |
+| `memcpy(&y, &s, sizeof(int))` | SUCCESSFUL |
+| `*(&y) = 4;` | SUCCESSFUL |
+| `__builtin_sadd_overflow(2, x, &y)` | **FAILED** — spurious out-of-bounds |
+
+Binding an argument to a parameter discards the argument's type: the callee
+dereferences `p`, whose type is its own and correct. The overflow builtins have
+no body, so nothing binds. `goto_symext::run_builtin` synthesises the store
+itself, and sizes it from the argument:
+
+```cpp
+symex_assign(code_assign2tc(
+  dereference2tc(
+    to_pointer_type(func_call.operands[2]->type).subtype,
+    func_call.operands[2]),
+  op));
+```
+
+`operands[2]->type`, not `func_type.arguments[2]` — which the assert at
+`run_builtin.cpp:113`, thirty lines up, has already established is a pointer. With the argument widened, the subtype
+is `int *`, so the store writes eight bytes into a four-byte object and
+`dereferencet` reports the out-of-bounds. That asymmetry is why the four probes
+above are silent: this is the only consumer in the corpus that reads an
+argument's own type where a parameter type exists.
+
+The lesson for the census is narrower than "read the verdict". A defect can be
+one node deep and still surface in exactly one test, because only one consumer
+looks at the field it corrupted. The reduced test is not the minimal program
+exhibiting the wrong type — every probe above carries the wrong type too — it is
+the minimal program with a consumer that reads it.
+
+### 129.3 The default path never reaches the arm
+
+`with_type` is shared — `base_type`, `goto_symex_state`, `symex_main`,
+`smt_solver` and `python_adjust` all call it — so the patch was measured for
+reach rather than argued safe. A counter in the new arm, over the pinned
+226-source corpus:
+
+| path | tests firing | firings |
+|---|---:|---:|
+| default | **0** | **0** |
+| `--clang-c-irep2-adjust-only` | 138 | 937 |
+
+Zero on the default path over the whole corpus, and zero on a 40-test Python
+and a 24-test C++ sample. The default path is unchanged by construction, which
+is a stronger statement than the byte-identity diff the earlier sections take.
+
+### 129.4 Result
+
+Whole-suite verdict residue **5 → 4**; `builtin_arith_overflow` is `SUCCESSFUL`
+on both paths. Both new tests reproduce the false alarm on the pre-patch binary.
+The pinned 233-test sample carries three divergences — `github_2335_4`,
+`github_3487`, `memset-const-2` — and all three were re-measured on the same
+tree with the patch reverted and are unchanged by it. Suites, rebased onto
+master: `esbmc` 1891/1891, unit 713/713.
+
+Four tests pin the fix, and all four fail when the specialization is removed:
+the two regression directories, plus an `address_of2t` row in
+`unit/irep2/with_type.test.cpp`'s supported-kinds table and a case asserting one
+level of indirection, an unchanged `ptr_obj`, a preserved `implicit`, and
+`irep2_cast_error` on a non-pointer `new_type`. The unit case is what pins
+`implicit`: it is `false` on every call site that reaches the arm, so a mutant
+dropping it survives both regression tests.
+
+The `_fail` test pins the violated property (`^  assertion uy == 5$`) rather
+than the verdict alone: the pre-patch binary also fails that program, on the
+spurious out-of-bounds, so a bare `VERIFICATION FAILED` regex would have
+measured nothing. A negative test against a false *alarm* has to name which
+property fails, not that one does.
+
+### 129.5 Next
+
+| test | signature |
+|---|---|
+| `github_2174` | false alarm SUCCESSFUL → FAILED |
+| `github_301` | `ERROR: Bitwuzla error encountered` |
+| `32_floppy` | SIGSEGV, no verdict |
+| `complex_25` | §88.2 binding |
+
+`github_2174` is the last false alarm and was expected to share this cause. It
+does not: with the address-of correctly typed, `atomic_init(&a, 10)` followed by
+`atomic_load(&a)` still returns something other than 10 under the flag, so the
+`__c11_atomic_*` lowering is a separate arm. It is the one to take next — and
+being body-less builtins reading their arguments' types, they are the same
+family of consumer §129.2 describes.
+
+## 122. The largest cluster was one line, and it is not a frontend bug
+## (2026-08-23)
+
+(§122: PRs #7266, #7271, #7274, #7275, #7278, #7280 and #7282 are in flight
+against this file and claim §115-§121.)
+
+§121.4 named the seven-test `to_struct_type() called on type whose type_id is
+union` cluster as the next target, on the reasoning that its signature named the
+defect precisely and that a `union_bitfield` and a `struct_bitfields` test
+sitting together pointed at the bitfield lowering. The signature was right; the
+guess about *where* was wrong.
+
+### 122.1 The site is `value_sett::assign`, not the frontend
+
+```
+#3  to_struct_type (t=...) at type_kinds.inc:23
+#4  is_subclass_of (subclass=..., superclass=..., ns=...) at base_type.cpp:445
+#5  value_sett::assign (...) at pointer-analysis/value_set.cpp:1299
+```
+
+`value_sett::assign` opens its aggregate branch with
+`if (is_struct_type(lhs_type) || is_union_type(lhs_type))` — unions included —
+and then, for a concrete rhs whose type is not `base_type_eq` to the lhs, asks
+`is_subclass_of(lhs_type, rhs->type, ns)`. That helper is struct-only: it opens
+by casting *both* operands with `to_struct_type`. Handed a union it throws, and
+nothing catches it.
+
+Inheritance has no union analogue, so a union pair that is not `base_type_eq` is
+simply incompatible — exactly the case the branch already drops two lines above
+for a mismatched `type_id`. Guarding the `is_subclass_of` call on both types
+being structs closes all seven:
+
+| test | before | after |
+|---|---|---|
+| `github_162`, `github_162_fail` | abort | SUCCESSFUL, both paths |
+| `github_571_{1,2,3}` | abort | SUCCESSFUL, both paths |
+| `struct_bitfields_16` | abort | SUCCESSFUL, both paths |
+| `union_bitfield_0` | abort | SUCCESSFUL, both paths |
+
+Reduced, the trigger is two lines:
+
+```c
+union a { int : 5; };
+int main(void) { union a x = {}; return 0; }
+```
+
+### 122.2 Why the printers could not see it
+
+The symbol table **and** the goto program are byte-identical between the two
+paths for that reducer, and the flag still aborts while the default path
+verifies. Whatever makes the two union types structurally unequal is a property
+`--show-symbol-table` and `--goto-functions-only` both elide. This is the
+sharpest instance yet of §121's lesson: neither printer is an oracle for
+behaviour, and a census that reads one is measuring the printer.
+
+### 122.3 A note on scope
+
+The defect is in `pointer-analysis`, shared by every frontend, and the fix is
+not flag-gated. Several probes for a default-path reproducer — mismatched union
+tags through a cast, a union returned from an uninterpreted function, a
+self-assignment through a `char *` round trip — did **not** find one, so the only
+known trigger remains `--clang-c-irep2-adjust-only`. Recorded as such rather
+than claimed as a user-facing fix: the call is wrong on its own terms
+(a struct-only helper reached with a union), and the guard is the same
+incompatibility test the branch already applies.
+
+`value_set.cpp` is shared, so the wider suites were run: `esbmc` 1857/1857,
+`cstd` 142/142, `floats` 106/106, `function_contract` 414/414, `esbmc-unix`
+435/438 — the three are `03_boundedBuffer`, `github_595` and
+`github_6480_deepening`, all exceeding the harness's 120 s cap locally and all
+returning identical verdicts on master and here. Default path byte-identical on
+226 C sources.
+
+### 122.4 Next
+
+Whole-suite verdict residue **24 → 17**. The clusters left, largest first:
+
+| tests | signature |
+|---:|---|
+| 6 | SIGSEGV in complex arithmetic (`complex_25`, `github_382_6`, `github_6713_complex_*`) |
+| 4 | false alarm SUCCESSFUL → FAILED (`builtin_arith_overflow`, `github_2174`, two `pragma_unroll`) |
+| 4 | SIGABRT on vectors / unary bool |
+| 3 | unclustered (`32_floppy`, `github_301`, `github_1934-1`) |
+
+The complex-arithmetic six is next by size, and `github_6713` names an issue
+whose own fix (#6713, the compound-assignment lowering) is already in the tree —
+so the reproducers are pinned and the divergence is in how this pass carries
+that lowering.
+## 121. The whole-suite verdict census — the sample's zero was a sampling
+## artefact (2026-08-23)
+
+(§121: PRs #7266, #7271, #7274, #7275, #7278 and #7280 are in flight against
+this file and claim §115-§120.)
+
+§120.5 asked for the verdict comparison to be widened from the pinned stride-8
+list to all of `regression/esbmc`, on the argument that any remaining live
+divergence had to come from the other seven-eighths. It does — emphatically.
+
+| | sample (226) | whole suite (1 742) |
+|---|---:|---:|
+| same verdict | 226 | 1 742 |
+| **differing verdict** | **0** | **25** |
+| skipped (`test.desc` already carries the flag) | 6 | 43 |
+
+**Zero on the sample meant nothing.** The stride-8 list is 1-in-8 of an
+alphabetical listing, and it contained not one of the 25. Every "exit criterion
+met" claim this scope has made against a stride sample should be read with that
+in mind: the sample was sized for a *goto-dump* census, where divergences were
+dense, and it was never re-sized when the instrument changed to verdicts, where
+they are rare and clustered.
+
+### 121.1 The 25, by failure mode
+
+| mode | tests |
+|---|---:|
+| SIGABRT (mostly a solver sort mismatch) | 8 |
+| uncaught `irep2_cast_error` | 7 |
+| SIGSEGV | 6 |
+| verdict flip, SUCCESSFUL → FAILED (false alarm) | 4 |
+
+Twenty-one of the 25 are crashes. Only four produce a wrong answer rather than
+no answer, and all four are false alarms rather than missed bugs — worth noting,
+though 21 aborts is not a comfortable position either.
+
+### 121.2 What this patch closes
+
+`bitvector_04`:
+
+```c
+_ExtInt(10) x = nondet_float();
+_ExtInt(10) y = nondet_int();
+_ExtInt(10) z = x + y;
+```
+
+```
+<         ASSIGN z=(signed _ExtInt(10))((signed int)x + (signed int)y);
+>         ASSIGN z=(signed int)x + (signed int)y;
+```
+
+The operands promote to `int` for the addition, and
+`clang_c_adjust::adjust_decl` ends with a `gen_typecast` of the initialiser back
+to the declared type (`clang_c_adjust_code.cpp:104`). This pass had no
+`code_decl2t` arm at all, so the 10-bit object was initialised from an `int` and
+bitwuzla aborted on the mismatched sorts.
+
+Note this is *not* `adjust_assign`: the first port targeted `code_assign2t` and
+did nothing, because a declaration's initialiser rides in `code_decl2t::init`
+rather than lowering to a separate assignment.
+
+The tests need **nondet** operands. With constants the initialiser folds before
+the mismatch can reach the encoder, and a constant-initialised pair passes on
+the unfixed binary — §39.1's first failure mode again, and the second time in
+three sittings that the first test written was the thin one.
+
+Census 24 → 24 on the pinned sample (which does not contain `bitvector_04`) with
+nothing new, and 25 → 24 on the whole-suite verdict census. Default path
+byte-identical on all 226 C sources of the sample. Suites: `esbmc` 1857/1857,
+`cstd` 142/142, `floats` 106/106, `function_contract` 414/414, `goto-coverage`
+144/144.
+
+### 121.3 The residue of 24, clustered
+
+Ordered by cluster size, since these are a handful of causes rather than 24:
+
+| tests | signature | members |
+|---:|---|---|
+| 7 | `to_struct_type() called on type whose type_id is union` | `github_162{,_fail}`, `github_571_{1,2,3}`, `struct_bitfields_16`, `union_bitfield_0` |
+| 6 | SIGSEGV in complex arithmetic | `complex_25`, `github_382_6`, `github_6713_complex_{compound,div_nondet}{,_fail}` |
+| 4 | SIGABRT on vectors / unary bool | `gcc_vector_float_{arith,scalar_mul}`, `github_4078_unary_bool{,_fail}` |
+| 4 | false alarm, SUCCESSFUL → FAILED | `builtin_arith_overflow`, `github_2174`, `github_4715_irep2_bodies_pragma_unroll_01`, `pragma_unroll_nested_dowhile_true` |
+| 3 | unclustered | `32_floppy`, `github_301`, `github_1934-1` |
+
+All reproduce on **master** as well as on the six-PR branch — checked directly
+for the `to_struct_type` cluster — so none is a regression from the series.
+
+### 121.4 Next
+
+The `to_struct_type()`-on-a-union cluster, at seven tests the largest. Its
+signature names the defect precisely: something in the pass assumes a struct
+where the type is a union, and both a `union_bitfield` and a `struct_bitfields`
+test are in it, so the bitfield lowering is where to look.
+
+The methodological point stands on its own: **census on the whole suite, not a
+stride sample**. The sample was calibrated for a denser instrument and silently
+under-reported by a factor of infinity once the instrument changed.
+
+## 128. The array-typed expression statement (2026-08-23)
+
+(§128: PRs #7267-#7288 are in flight against this file and claim §116-§127.)
+
+§127.4 picked `github_1934-1` as the most precisely signposted of the six
+remaining rows. Its message —
+
+```
+ERROR: Can't construct rvalue reference to array type during dereference
+```
+
+— names the consumer, and the producer is a nine-line program:
+
+```c
+struct Base { int ss[128]; };
+int main() { struct Base x, *y = &x; y->ss; }
+```
+
+### 128.1 A statement whose value is an array
+
+`clang_c_adjust::adjust_code` rewrites an array-typed expression statement to
+`&y->ss[0]` (`clang_c_adjust_code.cpp:57-74`), with its own comment explaining
+why: the dereference code does not assume such an object exists, and the
+statement's value is unused, so taking the first element's address is free.
+This pass had no `code_expression2t` arm — the only place it touches that kind
+is `declare_implicit_callee`, which reads the operand and does not rewrite it —
+so the bare array reached `dereferencet`.
+
+Ported with the same shape, extended to `vector` as well as `array` because
+`is_array_like` (the legacy predicate) covers both.
+
+### 128.2 The assignment exemption, which nothing reaches
+
+The legacy arm exempts an assignment operand (`op.statement() != "assign"`):
+there the array is the assignment target, not a discarded value. Mirrored here,
+and **no input found reaches it**. The probes:
+
+| probe | result |
+|---|---|
+| `struct` assignment (`b = a` with an array member) | struct-typed, so the array guard already excludes it |
+| array-to-pointer assignment (`q = p`) | pointer-typed, excluded |
+| **vector** assignment (`b = a`, `v4f`) — legal in C, and vector-typed | reaches the arm as a `code_assign2t` statement, not wrapped in `code_expression2t` |
+
+Removing the exemption leaves all three byte-identical to the default path.
+
+This is **not** §94.1's case, where a ported guard *undid* a rewrite the legacy
+pass also performed and so added behaviour that had to be justified. Here the
+guard makes this pass's condition identical to legacy's; dropping it would be
+the deviation, and could only be justified by an input showing legacy's own
+guard is dead. Kept, and recorded as untested rather than left to look tested.
+
+### 128.3 Result
+
+Whole-suite verdict residue **6 → 5**. Both tests abort on the pre-patch binary
+and return SUCCESSFUL / FAILED after. Default path byte-identical on 226 C
+sources. Suites: `esbmc` 1854/1857, `cstd` 142/142, `cbmc` 307/307,
+`extensions` 201/201 — the three are `github_302`, `github_2335_1` and
+`github_4634`, all exceeding the harness's 120 s cap locally and all returning
+their expected verdict on master and here alike.
+
+### 128.4 Next
+
+| test | signature |
+|---|---|
+| `github_301` | `ERROR: Bitwuzla error encountered` |
+| `32_floppy` | SIGSEGV, no verdict |
+| `builtin_arith_overflow`, `github_2174` | false alarm SUCCESSFUL → FAILED |
+| `complex_25` | §88.2 binding |
+
+The two false alarms are next: they are the only rows producing a wrong answer
+rather than no answer, and `builtin_arith_overflow` names a builtin family
+(`__builtin_*_overflow`) whose lowering is a specific, findable arm — the same
+shape as §117 and §125, both of which were unported name-matched builtins.
+## 127. The "unclustered four" were four causes (2026-08-23)
+
+(§127: PRs #7266-#7287 are in flight against this file and claim §115-§126.)
+
+§126.4 said "unclustered" meant only that nobody had read them. Read, the four
+are four distinct causes — no two share a signature:
+
+| test | `-only` outcome |
+|---|---|
+| `github_382_6` | `ERROR: Unexpected type in int/ptr typecast` — fixed here |
+| `github_301` | `ERROR: Bitwuzla error encountered` |
+| `github_1934-1` | `ERROR: Can't construct rvalue reference to array type during dereference` |
+| `32_floppy` | no verdict (SIGSEGV) |
+
+That closes the question §123.2 opened: grouping by signal number produced one
+four-test "cluster" containing four unrelated defects, and the two earlier
+splits were not bad luck.
+
+### 127.1 `*main`, and a missing arm rather than a wrong one
+## 124. A field excluded from equality, dropped by four rebuilds (2026-08-23)
+
+(§124: PRs #7266, #7271, #7274, #7275, #7278, #7280, #7282, #7283 and #7284 are
+in flight against this file and claim §115-§123.)
+
+§123.5 named the four false-alarm rows as next, on the grounds that they were
+the only ones left producing a wrong *answer* rather than no answer, and that
+two naming `pragma_unroll` were probably one cause. They were.
+
+### 124.1 The mechanism, which the test's own comment predicted
+
+`github_4715_irep2_bodies_pragma_unroll_01` documents its failure mode in
+advance:
+
+> If the count were dropped on the round-trip the loop would run to its natural
+> bound of 8, writing a[3..7] out of the 3-element array: a spurious
+> array-bounds violation seen only under the flag.
+
+Which is exactly what happens — though not on the round-trip. `migrate_expr`
+carries `#pragma_unroll` onto the IREP2 loop and `migrate_expr_back` writes it
+out again; both halves are correct. What drops it is this pass. Four sites
+rebuild a loop node, and every one of them omitted the count:
+
+| site | node |
+|---|---|
+| `adjust_statement_condition` | `code_while2tc(cond, body, loc)` |
+| `adjust_statement_condition` | `code_dowhile2tc(cond, body, loc)` |
+| `adjust_statement_condition` | `code_for2tc(init, cond, iter, body, loc)` |
+| `hoist_for_init` | `code_for2tc(nil, cond, iter, body, loc)` |
+
+The constructor's last parameter defaults to `0`, and `0` means "no pragma".
+
+### 124.2 Why nothing caught it
+
+`pragma_unroll_count` is deliberately **excluded** from the loop kinds' `fields`
+tuple (`irep2_expr.h:2258-2264`, alongside `location`), so it takes no part in
+`operator==`. This pass writes a symbol's value back only when it changed —
+
+```cpp
+if (value != before)
+  s->set_value(value);
+```
+
+— and a rebuilt loop that dropped the count compares **equal** to the original
+that had it. The guard cannot see the loss, the A/B census cannot see it
+(`--goto-functions-only` prints the unrolled program, not the annotation), and
+only a verdict differs.
+
+That is a general hazard, not a one-off: any excluded-from-`fields` member is
+invisible to both the change guard and structural equality, so every rebuild has
+to carry it by hand. `location` is the other one, and §115 was the same bug in
+that field.
+
+### 124.3 Result
+
+Closes `github_4715_irep2_bodies_pragma_unroll_01` and
+`pragma_unroll_nested_dowhile_true`; the other two false alarms
+(`builtin_arith_overflow`, `github_2174`) are unaffected and are a different
+cause. Whole-suite verdict residue **13 → 11**.
+
+The `_fail` test earns its place with an under-unroll mutant rather than the
+absent patch: forcing the carried count to `1` truncates the loop before the
+out-of-bounds write and turns FAILED into SUCCESSFUL. The positive test moves
+against the unfixed binary directly (FAILED → SUCCESSFUL). Both loop shapes are
+covered — a `while` for the condition-rebuild sites and a `for` for the hoist.
+
+Default path byte-identical on 226 C sources. Suites: `esbmc` 1857/1857,
+`cstd` 142/142, `goto-coverage` 144/144, `k-induction` 122/122,
+`loop-invariants` 81/81.
+
+### 124.4 Next
+
+| tests | signature |
+|---:|---|
+| 4 | SIGABRT on vectors / unary bool (`gcc_vector_float_{arith,scalar_mul}`, `github_4078_unary_bool{,_fail}`) |
+## 123. The complex cluster was four, not six — and a decline that crashes
+## (2026-08-23)
+
+(§123: PRs #7266, #7271, #7274, #7275, #7278, #7280, #7282 and #7283 are in
+flight against this file and claim §115-§122.)
+
+§122.4 grouped six SIGSEGVs as "complex arithmetic". Read individually, that
+grouping was wrong in one place and incomplete in another.
+
+### 123.1 The four that share a cause
+
+`adjust_compound_assignment` *declines* a complex operand, with a comment
+deferring to `clang_c_adjust::lower_complex_compound_assignment` — an arm that
+does not run under `--clang-c-irep2-adjust-only`, because the flag replaces the
+legacy pass rather than shadowing it. Nobody performs the lowering, and #6713's
+own comment says what happens next: `goto_convert`'s `remove_assignment`
+rebuilds `a op b` long after adjustment, so the SMT layer is handed a raw
+complex operator. Bitwuzla faults inside `mk_bvadd`:
+
+```
+#0  bitwuzla_mk_term2 ()
+#1  bitwuzla_convt::mk_bvadd (...) at bitwuzla_conv.cpp:107
+#2  smt_solver_baset::convert_ast_node (...) at smt_solver.cpp:745
+```
+
+The port is small because the decomposition already exists here: rewrite
+`a op= b` to `a = a op b` and hand the binary node to `adjust_complex_arith`.
+Closes `github_6713_complex_{compound,div_nondet}{,_fail}` — all four agree on
+both paths after.
+
+**A decline is not free.** §88.2 justified leaving these nodes alone with
+"declining only leaves the node where this mode already had it", which was true
+of the *shape* and false of the *outcome*: what this mode already had was a
+segfault. A decline that hands the backend a node it cannot encode is a crash
+with extra steps, and the other declines in this file should be re-read with
+that in mind rather than assumed safe.
+
+### 123.2 `github_382_6` is not a complex test at all
+
+```c
+int main(void) { global_var3 = *main; assert(global_var3 == *main); return 0; }
+```
+
+```
+<         ASSIGN global_var3=(unsigned int)(&(*(&main)));
+>         ASSIGN global_var3=*(&main);
+```
+
+C11 6.3.2.1p4: dereferencing a pointer to a function yields a function
+designator, which converts straight back to a pointer — `*f` is `f`, and
+`******f` too. `clang_c_adjust::adjust_dereference` re-takes the address for
+exactly this case (`clang_c_adjust_expr.cpp:918-927`, its comment says
+"allowing ******...*p"). This pass had **no dereference arm at all**, so the
+code-typed dereference reached a consumer wanting a pointer.
+
+Only that arm is ported. The array (`*a` → `a[0]`) and pointer-subtype arms
+above it retype a node migration already builds with the right type, and no
+corpus input distinguishes them — porting them would be §94.1's guard again, an
+arm nothing executes.
+
+### 127.2 A mutant that was an alternative implementation
+
+Replacing `address_of2tc(type, expr, true)` with `to_dereference2t(expr).value`
+— strip the dereference instead of re-addressing it — left both tests passing.
+That is not §39.1's "unreachable by construction": `*(&f)` and `&f` denote the
+same pointer, so the mutation is a *semantically equivalent rewrite*, and no
+test can distinguish them because there is nothing to distinguish. It is a
+sixth way for a mutant to sit still, and the useful response is to note the
+arm has an equally valid alternative form rather than to hunt for a test.
+
+The discriminating mutant is the absent patch, which the base binary supplies:
+both tests abort there and return SUCCESSFUL / FAILED here. The `_fail` test
+needed `***f` rather than `*f` to reach that state — with a single dereference
+it failed identically on both binaries and measured nothing.
+
+### 127.3 Result
+
+Whole-suite verdict residue **7 → 6**. Default path byte-identical on 226 C
+sources. Suites: `esbmc` 1857/1857, `cstd` 142/142, `cbmc` 307/307, `floats`
+106/106, `extensions` 201/201.
+
+### 127.4 Next
+
+| test | signature |
+|---|---|
+| `github_301` | bitwuzla error |
+| `github_1934-1` | rvalue reference to array during dereference |
+| `32_floppy` | SIGSEGV |
+| `builtin_arith_overflow`, `github_2174` | false alarm SUCCESSFUL → FAILED |
+| `complex_25` | §88.2 binding |
+
+Six rows, six causes, and no grouping left to exploit — each is now its own
+investigation. `github_1934-1`'s message names a specific construction site
+(`dereference` on an array-typed rvalue reference) and is the most precisely
+signposted, so it is next.
+Dereferencing a function. It was grouped with the others only because the
+census records a signal number, and `SIGSEGV` is not a cause. Moved to the
+unclustered rows.
+
+### 123.3 `complex_25` is the §88.2 decline, and it is the real one
+
+```c
+_Complex double f(void) { calls++; return 1.0 + 2.0i; }
+```
+
+`adjust_complex_arith` reads each operand twice, once per component, so it
+declines any operand carrying a side effect rather than evaluating it twice —
+and `complex_25` is built entirely from side-effecting complex calls. The
+decline is correct as far as it goes; the consequence is §123.1's, a node the
+backend faults on.
+
+Closing it needs the binding `clang_c_adjust` does first — a context temporary
+plus a statement expression — which §88.2 records as separate work and this
+patch does not attempt. It is now the *only* known input where the decline is
+reachable, which makes it the concrete justification for doing that port.
+
+### 123.4 Result
+
+Whole-suite verdict residue **17 → 13**. Default path byte-identical on 226 C
+sources. Suites: `esbmc` 1857/1857, `floats` 106/106, `floats-regression`
+65/65, `cstd` 142/142.
+
+Both new tests produce **no verdict at all** on the pre-patch binary — it
+segfaults — and SUCCESSFUL / FAILED after. A mutant lowering `*=` as `+=` moves
+both, the `_fail` one inverting.
+
+### 123.5 Next
+
+| tests | signature |
+|---:|---|
+| 4 | false alarm SUCCESSFUL → FAILED (`builtin_arith_overflow`, `github_2174`, `github_4715_irep2_bodies_pragma_unroll_01`, `pragma_unroll_nested_dowhile_true`) |
+| 4 | SIGABRT on vectors / unary bool (`gcc_vector_float_{arith,scalar_mul}`, `github_4078_unary_bool{,_fail}`) |
+| 4 | unclustered (`32_floppy`, `github_301`, `github_1934-1`, `github_382_6`) |
+| 1 | `complex_25`, the §88.2 binding |
+
+The false-alarm four are next. They are the only rows left that produce a wrong
+*answer* rather than no answer, and two of them name `pragma_unroll`, so that
+pair is likely one cause.
+
+## 126. Vector float arithmetic — the half clang does not lower itself
+## (2026-08-23)
+
+(§126: PRs #7266-#7286 are in flight against this file and claim §115-§125.)
+
+§125.3 named the `gcc_vector_float_{arith,scalar_mul}` pair and predicted the
+cause would be §123.1's again — a deliberate decline that hands the backend an
+unencodable node. It is a *missing* arm rather than a decline, but the shape of
+the consequence is identical.
+
+### 126.1 Why the scalar case never showed this
+
+Under the flag a scalar `float a + b` is byte-identical between the two paths:
+
+```
+ASSIGN s=IEEE_ADD(a, b);
+```
+
+on both. Nothing in this pass promotes it — **clang emits `ieee_add` itself**
+for scalar float arithmetic, and `migrate_ieee_arith_2op` carries it across. So
+the pass never needed a float-promotion arm and the gap was invisible.
+
+For a vector of float clang hands over the plain operator, and
+`clang_c_adjust::adjust_float_arith` promotes it
+(`clang_c_adjust_expr.cpp:796-817`, the `t.is_vector()` widening). That pass
+does not run under this flag:
+
+```
+<         ASSIGN s=IEEE_ADD(a, b);
+>         ASSIGN s=a + b;
+```
+
+and the backend aborts on a bitvector operator over a floating-point vector.
+
+### 126.2 The rounding mode the legacy arm does not attach
+
+`adjust_float_arith` returns *before* setting `rounding_mode` when the type is a
+vector, with the comment "BUG: setting rounding_mode breaks migration". The
+attribute-less legacy node then reaches `migrate_rounding_mode`, which
+synthesises the default `c:@__ESBMC_rounding_mode` symbol for it. So the node
+the default path actually produces carries that symbol, and the arm here builds
+the same one — the goto dumps are byte-identical after the patch, which is what
+confirms the reasoning rather than an argument from the comment.
+
+### 126.3 Result
+
+Closes both. Whole-suite verdict residue **9 → 7**. Default path byte-identical
+on 226 C sources. Suites: `esbmc` 1857/1857, `floats` 106/106,
+`floats-regression` 65/65, `cstd` 142/142, `cbmc` 307/307, `extensions`
+201/201.
+
+A note on the test rather than the code: the first version of the positive test
+carried `+/-/*//` in its block comment, and the `*/` inside it closed the
+comment early — `PARSING ERROR` on *all three* binaries, including the default
+path. A test that fails identically everywhere is not measuring anything, and
+the three-way comparison is what caught it.
+
+### 126.4 Next
+
+| tests | signature |
+|---:|---|
+| 4 | unclustered (`32_floppy`, `github_301`, `github_1934-1`, `github_382_6`) |
+| 2 | vector float arithmetic (`gcc_vector_float_{arith,scalar_mul}`) |
+| 2 | false alarm (`builtin_arith_overflow`, `github_2174`) |
+| 1 | `complex_25`, the §88.2 binding |
+
+The vector pair is the next coherent cause: `adjust_complex_arith` declines a
+vector operand deliberately (`§88` records that the legacy pass "returns before
+attaching a rounding mode for them"), and §123.1's finding applies — a decline
+that hands the backend an unencodable node is a crash, not a no-op. Check
+whether the same reasoning that closed the complex compound assignment closes
+these.
+| 2 | false alarm (`builtin_arith_overflow`, `github_2174`) |
+| 1 | `complex_25`, the §88.2 binding |
+
+The vector/unary-bool four are next by size. `github_4078_unary_bool` names an
+issue whose fix is the integer promotion of a boolean operand under `unary-`
+(`clang_c_adjust_expr.cpp:150-160`) — an arm this pass may not have ported, and
+a cheap thing to check first.
+No cluster larger than the unclustered four, and "unclustered" now means only
+that nobody has read them — they were grouped by signal number and §123.2/§125.2
+both show that is not a grouping. The next step is to read those four
+individually, starting with `github_382_6` (`global_var3 = *main`, a function
+dereference), which is the smallest input of the seven.
+## 118. The census re-run through verdicts, not goto dumps — and what it saw
+## (2026-08-23)
+
+(§118: PRs #7266, #7271 and #7274 are in flight against this file and claim
+§115-§117.)
+
+§117.4 asked for this: two of the previous three causes had been mis-tagged as
+spellings when they were programs the flag cannot verify, because
+`--goto-functions-only` stops before the encoder. Re-run reading each test's
+**verdict** under its own `test.desc` flags, default path against
+`--clang-c-irep2-adjust-only`, on the same pinned stride-8 list, at a build with
+those three PRs merged locally.
+
+For reference the goto census at that same build is **9 differing, 217 same** —
+down from 24, better than any of the three alone, because several tests carried
+more than one cause.
+
+### 118.1 What the verdict census found
+
+| | tests |
+|---|---:|
+| same verdict | **217** |
+| differing verdict | **3** |
+| skipped (`test.desc` already carries the flag) | 6 |
+
+Three, and none of them is a spelling:
+
+| test | default | `-only` | |
+|---|---|---|---|
+| `github_2572_2` | SUCCESSFUL | **FAILED** | §118.2, fixed here |
+| `github_2335_4` | FAILED | **SUCCESSFUL** | §118.3, the unsound direction |
+| `github_3487` | SUCCESSFUL | **uncaught `bad_optional_access`** | §118.4 |
+
+The goto census ranked the second of these as "struct padding in an aggregate
+initialiser" and did not see the third at all. That is the whole argument for
+this instrument: a `diff` row says the printers disagree, and says nothing about
+whether the verifier still works.
+
+### 118.2 `__builtin_isinf_sign` — the one fixed here
+
+`do_special_functions` spells it exactly, and deliberately: the neighbouring
+`isinf` arm matches a *base* name a program may reuse (`is_name_matched_builtin`,
+#6904), whereas `__builtin_isinf_sign` is reserved. This pass mirrored the base-
+name arm and not the exact one, so the call survived — and the symbol is
+bodyless, which makes the result nondet rather than differently shaped:
+
+```c
+assert(__builtin_isinf_sign(1.0) == 0);   /* SUCCESSFUL by default, FAILED under the flag */
+```
+
+Ported as the same nested conditional the legacy arm builds,
+`isinf ? (signbit ? -1 : 1) : 0`. `github_2572_2` agrees on both paths after it,
+and both new tests move under a sign-swap mutant — the `_fail` one inverts,
+which is the stronger signal of the pair.
+
+### 118.3 `github_2335_4` is the unsound direction, and it is next
+
+A test that FAILS by default SUCCEEDS under the flag. The goto diff is a missing
+`anon_pad#3` in an aggregate initialiser for an array of structs, so the
+initialiser is being built without the padding member the layout carries. A
+frame that verifies because a member vanished is exactly the shape §110.2 warns
+about read in the opposite direction, and it is the highest-value row left.
+
+`github_578_success3` shows the same missing-padding spelling
+(`anon_bit_field_pad#1`, `anon_pad#2`) without a verdict change, so the two are
+one cause with two symptoms and should be taken together.
+
+### 118.4 `github_3487` aborts in an optional
+
+`ERROR: uncaught exception [St19bad_optional_access]: bad optional access` under
+the flag, SUCCESSFUL without. Not diagnosed here beyond the reproduction; an
+unhandled `std::optional` access is a defect wherever it is, and it is the only
+row of the three that is a crash in ESBMC's own code rather than a modelling
+gap.
+
+### 118.5 A harness note worth keeping
+
+Running a test with its own `test.desc` flags from its source directory writes
+that test's output artefacts into the *source tree* —
+`cwe_dead_code_dead_store_sarif` takes `--sarif-output out.sarif`, and the stale
+file a census run left behind then failed the real `ctest` run of that test on a
+later invocation. The census must either run in a copy or clean up after itself;
+a suite failure immediately following a census run should be checked against
+`git status` before it is believed.
+
+### 118.6 Next
+
+`github_2335_4` / `github_578_success3` — the missing padding member in an
+aggregate initialiser, the one row in the residue that is unsound rather than
+merely wrong.
+## 117. The `POINTER_OFFSET` group is a third abort, and `offsetof` was fatal
+## (2026-08-23)
+
+(§117 rather than §115: PRs #7266 and #7271 are in flight against this file and
+claim §115 and §116.)
+
+The `POINTER_OFFSET` spelling was the largest remaining group in §114's table,
+at three tests. It is five, and it is not a spelling — the second time in two
+sittings that a row tagged `diff` turned out to be a program the flag cannot
+verify at all.
+
+### 117.1 The three intrinsics matched by name, not by prefix
+
+`do_special_functions` selects most of its lowerings by a reserved
+`__builtin_` prefix, and this pass mirrors those. Three it selects by the
+`__ESBMC_` name instead — `POINTER_OFFSET`, `POINTER_OBJECT`, `same_object` —
+and none had been ported. Each lowers to a node the backend evaluates in place
+(`pointer_offset2t`, `pointer_object2t`, `same_object2t`, all long-standing).
+
+Left as calls the symbols are bodyless, and `goto_check` refuses them:
+
+```c
+#include <stddef.h>
+struct s { int x; int y; };
+int main(void) { assert(offsetof(struct s, y) == 4); return 0; }
+```
+
+```
+$ esbmc pv.c                              # VERIFICATION SUCCESSFUL
+$ esbmc pv.c --clang-c-irep2-adjust-only
+ERROR: Function call to non-intrinsic prefixed with __ESBMC (fatal)
+```
+
+`offsetof` is the reachable one: `clang_c_language.cpp:705` defines the macro
+as `((size_t)__ESBMC_POINTER_OFFSET(&((type*)0)->member))`, so *every* use of
+`<stddef.h>`'s `offsetof` was fatal under this flag. The census saw `&0->y` in
+an `ASSIGN` on one side and a `FUNCTION_CALL` to a temporary on the other, and
+recorded a spelling difference.
+
+### 117.2 Result
+
+Census on the stride-8 list pinned to a file before the A/B (233 entries, 226
+with a `.c` source), same base:
+
+| goto program | before | after |
+|---|---:|---:|
+| same | 202 | **207** |
+| diff | **24** | **19** |
+
+Five converge — `github_2512_8`, `github_2512_12`, `github_426_2`,
+`github_1064-3-32`, `pointer-offset2` — against the three §114 tagged; two
+carried the cause under another tag. None diverges that did not before, and the
+default path is byte-identical on all 226 C sources (the arm is reached only
+from `adjust_special_functions`, which the flag gates, but it was measured
+rather than argued). Suites: `esbmc` 1857/1857, `cstd` 142/142, `floats`
+106/106, `function_contract` 414/414, `goto-coverage` 144/144.
+
+### 117.3 Mutants, and the one that did not move
+
+Per §39.1 of `frontends-to-irep2.md`, each arm was corrupted rather than
+deleted:
+
+| mutation | ok-test |
+|---|---|
+| `pointer_offset` → `pointer_object` | FAILED ✓ |
+| `same_object(a, b)` → `same_object(a, a)` | FAILED ✓ |
+| `pointer_object` → `pointer_offset` | **SUCCESSFUL ✗** |
+
+The third is §39.1's *first* failure mode, not its second: the test asserted
+`POINTER_OBJECT(&a) == POINTER_OBJECT(&a)`, which holds whatever the intrinsic
+lowers to. Rewritten against two distinct globals — where every intrinsic here
+yields offset 0, so only the object id separates them — the mutant moves. The
+arm was fine; the test was not.
+
+### 117.4 Next
+
+The residue is 19: temporary numbering (`tmp$3` vs `tmp$4`, 2 tests), struct
+padding in an aggregate initialiser (`github_578_success3`), and the untagged
+remainder. The identity-cast class stays closed as non-work.
+
+A re-census is now worth more than another slice. Two of the last three causes
+were mis-tagged because `--goto-functions-only` stops before the encoder, and
+the residue is small enough to read every row through a full verification run
+instead of a goto dump.
+## 115. §114.2's dominant cause closed — the hoist's wrapper block had no close
+## (2026-08-23)
+
+§114.1 diagnosed the 14-test `DEAD` divergence as `hoist_for_init`'s
+provenance and named `convert_block`'s `unwind_destructor_stack` as the site
+that reads it. The mechanism is one step earlier than that, and it is not a
+provenance choice at all.
+
+### 115.1 A default-constructed `locationt` is not nil
+
+`hoist_for_init` builds the wrapper block's close location as
+
+```cpp
+locationt end_location;
+if (!is_nil_expr(f.body) && is_code_block2t(f.body))
+  end_location = to_code_block2t(f.body).end_location;
+```
+
+and hands it to `code_block2tc`. When the loop body is not a block the variable
+is left default-constructed — and `irept::is_nil()` is `id() == "nil"`, so a
+default-constructed `locationt` (id `""`) is *empty but not nil*.
+`migrate_expr_back` guards only on nil:
+
+```cpp
+if (ref2.end_location.is_not_nil())
+  block.end_location(ref2.end_location);
+```
+
+so it wrote an empty `#end_location` onto the legacy block. `convert_block`
+then stamped that empty location on every destructor it unwound, and
+`goto_programt::output` renders an empty location as blank where it renders a
+nil one as `no location`. The legacy hoist never calls `end_location(...)` at
+all on this shape, which is why the two disagreed.
+
+`goto_convert_functions.cpp:1834-1839` already spells the correct idiom for the
+same question about the same field, with the same `else end_location.make_nil()`
+arm. Mirroring it is the whole patch.
+
+### 115.2 Result
+
+Reproducer (§114.1's, unchanged), `--no-irep2-native-body` on both sides:
+
+```
+<         // 48 no location
+>         // 48
+```
+
+is byte-identical after the patch, and a block-bodied control
+(`for (...) { s = s + i; }`) was byte-identical before and after — the shape
+the legacy hoist does set the close location on.
+
+Two-stage census re-run on a stride-8 list of `regression/esbmc` (233 entries,
+226 with a `.c` source), `--clang-c-irep2-adjust-only` against the legacy pass,
+blank lines and timing lines ignored:
+
+| goto program | before | after |
+|---|---:|---:|
+| same | 202 | **210** |
+| diff | **24** | **16** |
+| crash | 0 | 0 |
+
+Eight tests converge; none diverges that did not before. The 24 matches §114's
+count on the same suite, so the samples are comparable. Ten of those 24 carried
+a `no location` line in their diff; the eight that converged are the ones where
+it was the *only* cause, and the two that remain
+(`00_aiob_4_true-unreach-call`, `github_2572_2`) show it only as instruction
+renumbering downstream of a different divergence, not as a location mismatch of
+their own.
+
+The residue of 16 is the §114 tail, unmoved and untouched by this patch:
+integer promotion missing at a comparison, array decay rendered as a cast
+rather than `&a[0]`, the function-pointer identity cast §113.3 rules a
+"do not mirror", struct padding in an aggregate initialiser, and
+`POINTER_OFFSET` spelling.
+
+### 115.3 The gate, and what pins it
+
+`regression/esbmc/irep2_only_for_hoist_dead_location` asserts the `no location`
+line adjacent to the loop variable's `DEAD` under
+`--goto-functions-only --clang-c-irep2-adjust-only`. It is a positive regex, so
+it is mutation-checked the only way that means anything here: run it against
+the pre-patch binary, where the line reads `// 48` and the regex does not
+match. §39.1's fifth failure mode does not apply — the mutation is the absence
+of the patch, and the printer is exactly what the test reads.
+
+### 115.4 Next
+
+The two three-test causes §114.2 deferred. The first reduces to two lines, and
+the trigger is not the comparison:
+
+```c
+__attribute__((aligned)) int g = 42;
+int main(void) { int p = 1; if (g == 42) p = 2; return p; }
+```
+
+Legacy emits `(signed int)g == 42`; the hop-off emits `g == 42`. Dropping the
+attribute makes the pair byte-identical, so the operand needs no promotion —
+`g` is already `int`. What legacy emits is an identity cast, and it emits it
+because the *legacy* types differ on an alignment attribute.
+
+`signedbv_type2t` has exactly one field, `width`
+(`src/irep2/irep2_type.h:209-221`). `__attribute__((aligned)) int` and plain
+`int` are therefore not merely observed-equal after `migrate_type`, they are the
+same node by construction, and the symbol tables are byte-identical on both
+paths. No pass reading IREP2 can know the cast is owed — §113.3's argument
+verbatim, reached from a different node.
+
+**Do not mirror.** Three of the 24 close as non-work, on the same footing as
+`atexit`'s function-pointer cast.
+
+### 116.2 The array decay is not a spelling difference at all
+
+The other cause reduces to six lines:
+
+```c
+char a[4];
+char b[4];
+int main(int argc, char **argv) { char *c = argc == 1 ? a : b; return c[0]; }
+```
+
+```
+<         ASSIGN c=argc == 1 ? &a[0] : &b[0];
+>         ASSIGN c=argc == 1 ? (signed char *)a : (signed char *)b;
+```
+
+The same conversion through an `if` statement (`if (argc == 1) c = a; else c =
+b;`) and through a plain initialiser is byte-identical, so it is the ternary
+that is special — and the site is not in the adjuster.
+
+`migrate_expr`'s `if` arm coerces any branch whose `type_id` differs from the
+node's, by construction a typecast (`migrate.cpp:1186`). It was added for the C
+`assert` idiom `cond ? 0 : __assert_fail()`, whose branches diverge from a void
+result, and its comment claims "well-typed ternaries already have matching
+branch types". That premise is false: a well-typed conditional yielding a
+pointer from array operands has branch `type_id` `array` against a node
+`pointer`, so the coercion fires on the common path and wins the race against
+the adjuster, which never sees an array to decay.
+
+The consequence is worse than a spelling. `typecast(array, pointer)` is not a
+form the SMT backend accepts:
+
+```
+$ esbmc v.c --clang-c-irep2-adjust-only
+ERROR: Unexpected type in int/ptr typecast
+```
+
+on a nine-line program that verifies on the default path. The census could not
+see it: `--goto-functions-only` stops before the encoder, so the row read
+`diff`, not `crash`.
+
+The fix gives that pair its C conversion (C11 6.3.2.1p3) rather than a cast —
+`&a[0]`, exactly what `c_typecastt::do_typecast` already spells for the same
+pair on both of its copies — and falls through to the typecast for every other
+divergent pair, so the `assert` idiom the arm was written for is untouched.
+
+### 116.3 Result
+
+`regression/esbmc/irep2_only_ternary_array_decay{,_fail}` pin the verdict rather
+than the printer: both abort with `Unexpected type in int/ptr typecast` before
+the patch, and return SUCCESSFUL / FAILED-with-`array bounds violated` after.
+That is the strongest mutant this scope has had — the pre-patch binary does not
+merely print differently, it produces no verdict at all.
+
+Census on a stride-8 list of `regression/esbmc` pinned to a file before the A/B
+(233 entries, 226 with a `.c` source), against the same base:
+
+| goto program | before | after |
+|---|---:|---:|
+| same | 202 | **204** |
+| diff | **24** | **22** |
+
+`github_6966_fail` and `memset-const-2` converge; none diverges that did not
+before. §114 tagged this cause at three tests — the third carries a second
+cause and stays.
+
+`migrate_expr` is shared, so the default path was measured separately: over the
+same 226 C sources, `--goto-functions-only` with no `-only` flag is
+**byte-identical on all 226** between master and the patch. Suites:
+`esbmc` 1857/1857, `cstd` 142/142, `floats` 106/106, `function_contract`
+414/414, `goto-coverage` 144/144, `python/list` 294/294, `esbmc-cpp/cpp`
+931/933 — `ch9_7` and `ch13_10` exceed the harness's 120 s cap locally and
+`ch9_7` takes 2 m 04 s on master against 2 m 01 s here, so neither is this
+patch.
+
+### 116.4 Next
+
+The residue is 22, and the named causes left are the temporary numbering
+(`tmp$3` vs `tmp$4`, 2 tests), struct padding in an aggregate initialiser
+(`github_578_success3`), and `POINTER_OFFSET` spelling in an `offsetof`
+lowering (`github_2512_8`, `github_426_2`, `github_2512_12`) — the largest
+remaining group and the one to reduce first. Three tests are untagged.
+```
+<         IF !((signed int)g == 42) THEN GOTO 1
+>         IF !(g == 42) THEN GOTO 1
+```
+
+Dropping the attribute makes the pair byte-identical, so what legacy emits is
+an *identity* cast: the alignment attribute leaves `g`'s type unequal to plain
+`signed int` in ESBMC's type model, and `gen_typecast_arithmetic` casts on that
+inequality. That puts it in §113.3's class rather than the promotion class it
+was tagged as — decide whether to mirror it before writing a slice.
+
+The array decay rendered as a cast rather than `&a[0]` (`github_6966_fail`,
+`memset-const-2`) has not been reduced yet.
+
+
+## 114. The two-stage census §113.4 asked for — the residue is 24, not 133
+## (2026-08-22)
+
+Every census in this scope so far has read one stage. §113.1 showed why that is
+not enough: a symbol-table difference can be a `goto_convert` crash, and a
+symbol-table difference can equally be nothing at all. Re-run reading both, on
+the test list pinned to `595f52b025` (230 tests, stride 8), at the tip of
+§111.1 + §112 + §113.1:
+
+| symbol table | goto program | tests |
+|---|---|---:|
+| same | same | 95 |
+| **diff** | same | **109** |
+| diff | diff | **24** |
+| — | crash | **0** |
+
+Three things follow.
+
+**The abort classes are gone.** Zero crashes in the sample, against three
+distinct ones at the start of the day (§111.1, §112, §113.1). That is the whole
+value of those three patches; the same-count moved by 5.
+
+**109 of the 133 differences do not reach the goto program.** They are the class
+§110.2 established with `(void)0`: the adjuster writes a value back only when it
+changed it, and the un-written-back legacy value is what the symbol-table
+printer shows, while `goto_convert` re-migrates from the same legacy value and
+lands in the same place. Chasing them is chasing a printer.
+
+**The residue that matters is 24.** Causes, read rather than tallied:
+
+| cause | tests | note |
+|---|---:|---|
+| `DEAD` location: `no location` vs blank | **14** | §114.1 |
+| integer promotion missing at a comparison | 3 | |
+| array decay rendered as a cast, not `&a[0]` | 3 | |
+| temporary numbering (`tmp$3` vs `tmp$4`) | 2 | |
+| function-pointer identity cast | 1 | not work, §113.3 |
+| untagged | 3 | |
+
+(Tags overlap; four tests carry two.)
+
+### 114.1 The dominant cause is the for-init hoist, and it is one line of provenance
+
+```c
+int main(void) { int s = 0; for (int i = 0; i < 3; i++) s = s + i; return s; }
+```
+
+```
+<         // 48 no location
+>         // 48
+```
+
+The `DEAD` for the loop-scoped `i`. Legacy leaves its location nil, which
+`goto_programt::output` renders `no location`; the hop-off gives it an
+empty-but-not-nil one, which renders blank. `goto_convert_functions.cpp`'s
+`emitted_location` already documents this exact asymmetry — in the other
+direction, where reproducing *blank* was the correct choice.
+
+The mechanism is §105's `hoist_for_init`. Rewriting `code_for2t` into a block
+moves the loop from `convert_for` to `convert_block`, and `convert_block` stamps
+the block's `end_location` on every destructor it unwinds
+(`unwind_destructor_stack`, goto_convert.cpp:2215) whereas `convert_for` leaves
+it nil. `migrate_expr_back` is not the culprit — it already guards
+`if (ref2.end_location.is_not_nil())`.
+
+Reproduced with `--no-irep2-native-body` on both sides, so this is the legacy
+converter's own asymmetry and not the W1 dispatcher's.
+
+### 114.2 Next
+
+`hoist_for_init`'s destructor-location provenance, which is 14 of the 24. The
+other live causes — the promotion at a comparison, and the decay rendered as a
+cast — are three tests each and worth a census of their own once the dominant
+one is out of the way.
+second cause and not a second symptom. §80 records that the VLA `sizeof`
+operand is computed in migration; that is the place to look first.
+
+That is the next target: it is the only remaining input in the censused C
+corpus on which the pass produces nothing at all.
+## 110. The census re-run after the sixteen PRs landed (2026-08-22)
+
+§104 closed the census with "every measured divergence is owned by an open PR".
+Those PRs are merged, so the question is what the symbol-table gap looks like
+now. Re-measured on master at `595f52b025` over `regression/esbmc`,
+`--clang-c-irep2-adjust-only` versus the legacy pass, blank-line differences
+ignored:
+
+| | tests |
+|---|---:|
+| whole suite | **693 same, 1147 differing, 1 skipped** |
+| stride-8 sample | 90 same, 138 differing |
+
+The suite figure is the first one taken; §101's 78-of-120 was a prefix of the
+same suite before any of the sixteen landed, so the two are not comparable and
+neither is offered as a delta. The stride sample is what the causes below are
+counted on.
+
+### 110.1 The dominant cause does not reach the goto program
+
+| cause | tests | note |
+|---|---:|---|
+| `(void)0` vs `0` in a conditional arm | 89 | §110.2 |
+| untagged residue | 22 | §110.4 |
+| implicit callee has no location | 13 | §110.3, fixed here |
+| indentation only | 11 | printer, from the §105 for-init hoist |
+| `migrate_expr` renaming warning | 4 | |
+| `volatile` dropped from a DECL statement | 1 | symbol keeps it; the statement does not |
+| padding | 1 | |
+
+### 110.2 `(void)0` is a legacy artefact, and mirroring it would be wrong
+
+Reduced:
+
+```c
+void f(void);
+int main() { int x = 1; x ? f() : (void)0; return 0; }
+```
+
+Legacy prints `(_Bool)x ? f() : 0;`, the hop-off `(_Bool)x ? f() : (void)0;`.
+The source says `(void)0`, so the hop-off is the faithful one. `adjust_if`
+compares whole `typet` ireps and casts *both* arms when *either* differs, so an
+attribute-only difference between the conditional's type and an arm's is enough
+to fire it; `do_typecast` then folds the cast into the constant. `adjust_if_expr`
+compares interned `type2tc`, which are equal, and leaves the arm alone.
+
+`--goto-functions-only` on the reduction is byte-identical between the two
+paths: `goto_convert` drops the void arm either way. So this is §39.1's "a
+caller downstream re-does the work" row of the parent document — 64 % of the
+remaining symbol-table gap is a difference that no consumer sees, and the arm
+that would close it does not get written.
+
+### 110.3 The implicit callee's location, which is a real loss
+
+`declare_implicit_callee` synthesises the symbol for a callee with no visible
+declaration. It read the location off `code_function_call2t::location`, and
+took none at all in the other branch: `sideeffect2t` has no location field, so
+a bare `assert(x == 1);` — which is a `sideeffect2t` of kind `function_call`
+under a `code_expression2t`, not a `code_function_call2t` — produced a symbol
+with an empty `Location`. 13 of the 138 differing tests are only this.
+
+The statement's location is the call's **only when the call is the whole
+statement**, so that is the one position it is taken from: `adjust_expr`
+declares the callee from `code_expression2t` before recursing, passing the
+statement's location, and the generic arm keeps declaring the rest unlocated.
+The narrower shapes — `a = f();`, `if (f())`, `return f();` — keep the call's
+own column in the legacy pass and are left as they were rather than given the
+statement's column, which would be the right line and the wrong one. Closing
+those needs a `locationt` on `sideeffect2t`, on the pattern the `code_*2t`
+kinds already use; that is a separate change and is not made here.
+
+Result on the stride sample: **106 same, 123 differing**, and no test acquires a
+divergence it did not have.
+
+| mutant | killed by |
+|---|---|
+| location not passed (master) | `..._implicit_callee_location` |
+| location not passed, nested statement | `..._implicit_callee_location_stmt` |
+
+Both tests were run against the unpatched arm and fail there. The second one
+exists because the first would also pass if the location were taken from the
+enclosing function rather than the statement.
+
+### 110.4 The untagged residue names four more causes
+
+Read rather than tallied, per §104.2:
+
+- **A cast lost at a call argument** — `atexit((void (*)())(&free_g2))` legacy
+  versus `atexit(&free_g2)`. The conversion #7091 ported does not cover a
+  function-pointer parameter.
+- **The hop-off aborts outright** on `builtin_memcpy` and `cwe_uninit_array_vla`
+  — the whole symbol table is missing. This is the by-name union tag the header
+  comment on `clang_c_adjust_irep2` already documents.
+- **`(signed int)b += a` versus `b += a`** — the coupled arith-assign
+  conversion, `scope-coupled-arith-assign-conversion.md`.
+- **Printer-only**: `+1` versus `1`, and the float literal suffix
+  (`1.175494e-38f` versus `1.175494e-38`).
+
+The abort is the one worth taking next: it is not a spelling difference but a
+hard stop, and it puts two tests beyond measurement rather than merely differing.
+
+## 130. The polymorphic builtins were never declared on the hop-off (2026-08-28)
+
+clang hands the GCC `__sync_*` / `__atomic_*` and the C11 `__c11_atomic_*`
+builtins over as declarations with no body; the concrete instance is synthesised
+by the frontend. That synthesis lives in one arm of
+`clang_c_adjust::adjust_side_effect_function_call`, and
+`--clang-c-irep2-adjust-only` *replaces* `clang_c_adjust` rather than shadowing
+it, so on the hop-off the arm was simply absent.
+
+The consequence is not a spelling difference. With the declaration body-less,
+symex has nothing to execute: an atomic load returns nondet, a store is dropped,
+and the memory-safety obligations of the access the builtin performs — the null
+check, the alignment check — are never generated. A program whose only
+dereference is inside an atomic verifies clean.
+
+### 130.1 The arm is a symbol-table side effect, so it ports on its own
+
+`declare_gcc_polymorphic_builtin` is lifted out of the legacy arm into a public
+`static` member of `clang_c_adjust` that both adjusters call. This is the same
+shape as `declare_implicit_callee` (§110.3): the work is an insertion into
+`contextt` plus a repointed callee, not an expression rewrite, so it does not
+wait on the rest of that arm being ported.
+
+The two helpers it calls become `static` for the same reason — neither reads
+member state beyond `context`, which is now a parameter — but keep their
+`clang_c_adjust::` qualification. Making them free functions is the obvious
+move and is wrong for a measurable reason: `ccn_report.py` keys a function on
+its qualified name, so dropping the class name presents two 49- and 68-CCN
+functions as *new* and fails the complexity gate on a rename. The repo-wide
+count says otherwise — `core` 564 → 564 — but the gate reads the per-function
+table, not the total. Keeping the qualification also keeps the machinery under
+the class that owns it, and costs nothing.
+
+### 130.2 The seam carries types, and it is lossy
+
+The IREP2 caller must hand the matcher legacy `exprt` arguments. It hands it
+`nil` operands carrying only the migrated type. No arm reads a value: across
+the matcher's 283 lines the parameter is touched only as `arguments.front()`,
+bound 16 times to a `const exprt &ptr_arg`, and all 37 uses of `ptr_arg` are
+`ptr_arg.type()` — no arm reads a value, an index other than the first, or the
+argument count. The choice is deliberately fragile in the safe direction: an
+arm added later that reads a *value* gets `nil` and fails where it can be seen.
+
+That is necessary and **not sufficient**, and an earlier draft of this section
+claimed otherwise. The type is not merely a selector. `type2name` of the first
+parameter becomes the instance's mangled name, the name is the memoisation key
+(`context.find_symbol(identifier_with_type)`), and the parameter types become
+the synthesised body's. So the obligation is that the type *round-trips*, and
+across this seam it does not: IREP2 has no representation for the C qualifiers,
+so `migrate_type_back` drops `const`, `volatile` and `_Atomic`. This is not
+specific to the builtins — `dead_store_analysis.cpp:157` already records that
+`migrate_type`/`get_type2()` lose `#volatile`.
+
+The visible consequence is that qualified and unqualified call sites collapse
+onto one instance where `clang_c_adjust` builds two:
+
+```c
+volatile int vi; int pi;
+__sync_fetch_and_add(&vi, 1);
+__sync_fetch_and_add(&pi, 1);
+```
+
+| path | instances |
+|---|---|
+| `clang_c_adjust` | `__sync_fetch_and_add_4_vS32` **and** `..._4_S32` |
+| `--clang-c-irep2-adjust-only` | `..._4_S32` only |
+
+No verdict or claim-set difference follows from it on anything measured — the
+`_Atomic` body split lives inside the builtin's own `ATOMIC_BEGIN`/`ATOMIC_END`,
+so no extra interleaving is admitted — and `irep2_only_polymorphic_builtin_qualified`
+pins that the shared instance still performs each call site's own arithmetic.
+It is recorded here as a known residual of the hop-off, in the same class as the
+357 symbol-table lines of §130.4, not as a discharged obligation. Recovering the
+qualifiers needs them to survive `migrate_type`, which is not this section's
+work.
+
+### 130.3 The call's location, which §110.3 left open in a second place
+
+`sideeffect2t` carries no location, so a builtin call appearing as a bare
+statement had none to give the symbol it declares. §110.3 settled the position
+for `declare_implicit_callee`: the statement's location is the call's when the
+call is the whole statement, and that is the one place it may be taken from.
+The same rule applies here, so `adjust_expr` now tracks the innermost enclosing
+statement's location in `enclosing_location` and the `sideeffect2t` branch reads
+it. §110.3's conclusion is unchanged: closing the narrower shapes needs a
+`locationt` field on `sideeffect2t`, and that is still not done here.
+
+### 130.4 Result
+
+Over the 30 corpus tests that call one of these builtins, the symbol table the
+hop-off produces and the one `clang_c_adjust` produces differ by **1991 lines
+before the port and 357 after** — 82 % closed. Eleven tests move; none acquires
+a difference it did not have.
+
+| test | before | after |
+|---|---:|---:|
+| `esbmc/github_2174` | 616 | 112 |
+| `esbmc-unix/github_4435_atomic_fetch_add` | 323 | 61 |
+| `esbmc-unix/github_4436` | 207 | 53 |
+| `esbmc-unix/github_2174` | 152 | 18 |
+| `esbmc-unix/github_2174_fail`, `esbmc/github_2174_fail` | 139 | 18 |
+| `clang_builtins/atomic_load` | 99 | 12 |
+| `clang_builtins/atomic_store` | 96 | 12 |
+| `esbmc/github_2142` | 83 | 10 |
+| `clang_builtins/sync_fetch_and_add_0_{true,false}` | 53 | 6 |
+
+### 130.5 The mutants
+
+| mutant | killed by |
+|---|---|
+| `declare_polymorphic_builtin` not called | all three (SUCCESSFUL → FAILED, and both `_fail` → SUCCESSFUL) |
+| same, on the safety obligation | `irep2_only_polymorphic_builtin_fail` (FAILED → SUCCESSFUL, 0 VCCs) |
+| `enclosing_location` not read — `loc = locationt()` | both `_fail` tests (line 9 → line 0) |
+| `code_dowhile_id` and `code_switch_id` arms dropped from `statement_location` | `..._dowhile_fail` and `..._switch_fail`, and only those two |
+
+The negative tests are the ones that matter. A `_fail` descriptor pinning only
+`^VERIFICATION FAILED$` pins nothing — every mutant fails too, just on another
+property — so both name the claim: `__c11_atomic_store.null-pointer-dereference.1`
+and `__c11_atomic_load.null-pointer-dereference.1`. Unported, the first is not
+merely satisfied but never generated — the run reports 0 VCCs.
+
+Each names a *line* as well, which is what makes them the gate on §130.3 rather
+than on §130.1 alone: with `enclosing_location` left unread the claim still
+fires, but at line 0 with no file. They differ in the statement kind that
+supplies that location — `code_expression2t` for the bare call in `..._fail`,
+`code_while2t` for the loop condition in `..._cond_fail`, `code_dowhile2t` and
+`code_switch2t` for `..._dowhile_fail` and `..._switch_fail` — so each pins a
+different arm of `statement_location`, and dropping a single arm reddens only
+its own test. `..._stmt_kinds` is their passing counterpart: it puts a call in
+a do-while condition and a switch selector in one program and asserts the
+arithmetic, which a location mutant cannot reach but §130.1's can.
+
+`..._cond_fail`'s loop is unbounded, and its descriptor carries
+`--incremental-bmc` for that reason: the violation is found at k = 1 in 0.5 s,
+where the default flags never terminate and CI's 120 s per-test cap would score
+the test as a timeout rather than a verdict.
+
+### 130.6 `symtab_sweep.sh` cannot sweep an `irep2_only_*` test
+
+The sweep appends the hop-off flag to whatever line 3 of `test.desc` already
+carries, and an `irep2_only_*` descriptor carries it by construction. esbmc
+rejects the duplicate (`option '--clang-c-irep2-adjust-only' cannot be specified
+more than once`, exit 64), the "on" dump comes back empty, and the pair scores
+as a difference the size of the whole symbol table. The two tests added here
+read 6388 and 6336 lines of difference for that reason alone and are excluded
+from §130.4's figures. Any corpus handed to the sweep must exclude them.
+
+### 130.7 A crash the extraction exposed, and fixes
+
+Lifting the arm out surfaced a defect that predates it. `is_gcc_polymorphic_builtin`
+matches on a name *prefix* — `has_prefix(identifier, "c:@F@__sync_fetch_and_add")`
+and twelve siblings — and every arm it selects immediately binds
+`arguments.front()`. The prefix is not reserved to the builtin: an ordinary
+user function called `__sync_fetch_and_add_mine` matches it, and called with no
+arguments there is no `front()` to bind. The extracted
+`declare_gcc_polymorphic_builtin` therefore guards on `arguments.empty()`
+before the matcher runs, which is the only place the check can go and still
+cover both callers.
+
+A non-pointer first argument is the same defect one step along: the thirteen
+arms that destructure the pointer trip `to_pointer_type`'s assertion, and the
+three that only copy `ptr_arg.type()` build an instance around a type no arm
+meant to accept. Under `NDEBUG` — the configuration CI builds — the assertion
+is gone and the cast proceeds instead, which is worse than the abort. The guard
+therefore covers both shapes, and declining leaves the body-less declaration,
+which is what a non-builtin of that name should have had all along.
+
+The fix is on the legacy path as much as the hop-off, so
+`polymorphic_builtin_prefix_{no_args,nonptr}{,_fail}` pin it with a blank flags
+line rather than `--clang-c-irep2-adjust-only`, and
+`polymorphic_builtin_prefix_irep2_only` pins the second caller. Dropping the
+whole guard kills all five; dropping only the pointer half kills the three that
+exercise it, so each half is separately load-bearing. This is the same family as §110's
+base-name defect: the matcher's name test is a prefix where it means an exact
+name, and each shape that reaches it wrongly has to be closed as it is found.
+
+
+## 131. The reference parameter migrate_type cannot carry (2026-08-29)
+
+A two-stage census over a stride-7 sample of `regression/esbmc` (282 tests, 13
+excluded per §131.0, 269 measured) at `0df6f40f57`:
+
+| symbol table | goto program | tests |
+|---|---|---:|
+| same | same | 113 |
+| diff | same | 145 |
+| diff | diff | **11** |
+
+The 145 are §110.2's class again -- 93 % of the symbol-table gap is a printer
+difference no consumer sees, and reading one stage would have scored the
+residue at 156. The 11 that matter, by cause:
+
+| cause | tests |
+|---|---:|
+| va_list bound by value, not by address | **4** |
+| array decay rendered `&a` vs `&a[0]` | 2 |
+| function-pointer identity cast (§113.3, not work) | 2 |
+| attribute-only self-cast (§110.2 family, hop-off faithful) | 1 |
+| integer promotion missing before a shift | 1 |
+| temporary elision on a complex return | 1 |
+
+Two of those tags took a second look to earn. `aligned_attr_fail` and
+`github_301` first read as one cause, "integer promotion missing at a
+comparison". They are not:
+
+```c
+__attribute__((aligned)) int g = 42;
+__ESBMC_assert(g == 42, "g");
+```
+
+Legacy emits `ASSERT (signed int)g == 42`, the hop-off `ASSERT g == 42`. `g` is
+already `int`; the cast is legacy's, inserted because the alignment attribute
+makes the two `typet`s compare unequal while the interned `type2tc`s are equal
+-- §110.2's mechanism exactly, and the hop-off is the faithful side. Drop the
+same attribute and the cast goes with it. `github_301` is the real one:
+`found = (j > nc_B - 1) << i` needs the `_Bool` promoted to `int` before the
+shift (C11 6.5.7p3), and the hop-off does not promote it.
+
+### 131.0 §130.6's exclusion is by flag, not by name
+
+§130.6 records that the sweep cannot measure a test whose descriptor already
+carries `--clang-c-irep2-adjust-only`: the flag is appended to line 3, esbmc
+rejects the duplicate (exit 64), the "on" dump comes back empty and the pair
+scores as a difference the size of the whole file. It gave that rule as a rule
+about `irep2_only_*` tests, and a corpus filtered on that *name* still admits
+`128_pointer_arith`, which carries the flag without carrying the prefix.
+
+It was the largest entry in the first run of this census -- 953 symbol-table
+lines and 129 goto lines, more than every genuine cause put together -- and it
+is not a divergence at all. Filter the corpus on line 3 of `test.desc`
+containing the flag; the sample above holds 13 such tests, only 12 of which the
+name test would have caught.
+
+
+### 131.1 The dominant cause is a bit the IREP2 types cannot carry -- but the
+### symbol table still can
+
+clang types `__builtin_va_start`, `__builtin_va_copy` and `__builtin_va_end`
+with a `__builtin_va_list &` parameter, which `clang_c_convertert::get_type`
+lowers to a pointer carrying `#reference` (clang_c_convert.cpp:1325). The
+legacy conversion reads that bit: `c_typecastt::implicit_typecast_followed`
+binds the argument -- `&ap` -- rather than converting its value.
+
+`pointer_type2t` has two fields, `subtype` and `carry_provenance`. There is no
+third, so `migrate_type` drops `#reference` and the rule cannot be stated
+against the IREP2 *types*. Restoring it there means a new field entering
+`fields`, which changes equality and hashing for every pointer in the program:
+`T &` would stop comparing equal to `T *` everywhere, including in the C++
+frontend, which is not yet on IREP2 and builds references pervasively. That is
+a Phase 7 decision, not a Phase 6 one.
+
+It does not follow that the bit is gone. `symbolt` keeps a legacy `typet`
+alongside the IREP2 one (symbol.h, "permanent on-demand caches"), and the
+callee's declared type still carries `#reference` there. `declare_implicit_callee`
+does not clobber it: it only runs when `context.find_symbol` misses, and for
+these builtins it does not. So the predicate is one lookup away, and the port
+reads it -- the same route the implicit-callee arm at
+clang_c_adjust_irep2.cpp:486 already takes to recover a base name.
+
+### 131.1a Why a name test was the wrong answer, and how it nearly shipped
+
+The first port keyed on the three linkage identifiers instead, on the strength
+of a probe that said the symbol lookup returned no reference bit. **The probe
+was reading a stale binary** -- a `make esbmc` issued after a `cd` to the
+repository root, which is a no-op there and leaves the previous binary in
+place. Rebuilt properly, the lookup reports `ref=1` for all three builtins and
+`ref=0` for user functions and `__ESBMC_va_arg`. The rule was never
+unstateable; it was measured through a binary that predated the code being
+measured.
+
+Two defects followed from the name test, both of which the bit closes for free:
+
+**It is incomplete.** Under `--std c23` clang lowers `va_start` to
+`__builtin_c23_va_start`, a fourth name no list in this tree knows --
+`grep -rn c23_va_start src/` is empty, so `builtin_functions.cpp`,
+`goto_inline.cpp` and `run_builtin.cpp` miss it too. The name-keyed port left
+`__builtin_c23_va_start((signed char **)ap, n)` exactly as it found it.
+
+**It is not target-portable, and this is the serious half.** Whether these
+parameters are references is a property of the target, not of the callee.
+clang's `A` builtin-type code decodes to an lvalue reference where
+`__builtin_va_list` is a pointer or a struct, and to an *already-decayed
+pointer* where it is an array:
+
+| target | `__builtin_va_list` | `__builtin_va_start` parameter |
+|---|---|---|
+| `arm64-apple-darwin` | `char *` | `__builtin_va_list &` |
+| `aarch64-unknown-linux-gnu` | `struct __va_list` | `__builtin_va_list &` |
+| **`x86_64-unknown-linux-gnu`** | `struct __va_list_tag[1]` | **`struct __va_list_tag *`** |
+
+On x86-64 Linux -- CI's target -- there is no reference to reproduce, and
+legacy takes its ordinary array-decay path to `&ap[0] : struct __va_list_tag *`.
+A name test fires anyway and builds `&ap : struct __va_list_tag (*)[1]`, so the
+patch would have *introduced* a divergence on the one target it was never run
+on, in the pass whose stated bar is being identical to legacy. Reading the bit
+cannot do this: where legacy's arm does not fire, neither does the port.
+
+This census was taken on aarch64-darwin and measured one of those three
+shapes. It is not a statement about CI.
+
+### 131.2 The precondition is legacy's, kept whole
+
+An intermediate version dropped legacy's shape guard (destination a pointer,
+source a different type of the same kind) as dead, on the argument that for an
+ordinary call clang has already inserted the ImplicitCastExpr, so the
+argument's type equals the parameter's by the time the adjuster runs. That
+observation is true and it is why a shape guard cannot substitute for the
+reference bit. It is not a reason to drop the guard: the point of this port is
+that the hop-off applies *legacy's* rule, and legacy's rule is the conjunction.
+The guard is kept as legacy spells it, plus `!is_address_of2t(arg)`, which is
+also a precondition of `address_of2tc` -- it asserts its operand is not another
+address_of.
+
+### 131.3 Result, and what the tests can pin
+
+Four tests move; the residue is 7 -- of which 3 are no work -- and the
+diverging goto lines 54 -> 44.
+
+| test | before | after |
+|---|---:|---:|
+| `vasprintf_valist_vacopy_launder_fail` | 4 | 0 |
+| `github_584`, `github_2194`, `vasprintf_unbounded_s_no_overflow` | 2 | 0 |
+
+No verdict moves, and none can. `va_list_base` (va_arg.cpp:15) strips
+typecasts *and* address_of before resolving the l1 record, and `make_va_list`
+(builtin_functions.cpp:835) does the same before goto_convert reads the
+argument, so symex was already tolerating both spellings -- the divergence was
+being absorbed downstream rather than causing a wrong answer. The tests
+consequently pin the symbol table, which is the stage the adjuster writes
+(§100.1), and not a verification result.
+
+Four tests, three roles. `irep2_only_va_binds_by_reference` and
+`irep2_only_va_copy_binds_by_reference` both redden when the predicate is
+stubbed to decline. `irep2_only_va_binds_by_reference_c23` is the one that
+separates reading the bit from listing the names: it passes here and fails
+against a binary carrying the name-keyed port. `va_binds_by_reference` runs the
+same program on the legacy path and pins the spelling the hop-off has to match;
+it does not discriminate this patch, by construction -- it is the reference.
+
+Every regex spells the va_list `&ap(\[0\])?`, the idiom
+`regression/esbmc/irep2_only_va_arg/test.desc` already uses. Without it the
+legacy-path test goes red on x86-64 Linux, where the rendering is `&ap[0]` --
+and, worse, the two `irep2_only_*` tests would have gone *green* there while
+pinning the divergent form.
+
+### 131.4 Next
+
+The array decay, which is the largest genuine cause left at 2 tests
+(`github_1210-1-struct`, `github_169`) and which §116.2 already established is
+not a spelling difference. `github_169` reduces to `ASSIGN b[0]=...` against
+`ASSIGN *b=...`, which puts a starting point in the tree: the comment on
+`clang_c_adjust_irep2::adjust_dereference` says the array and pointer-subtype
+arms above the code-typed one were left unported because "no corpus input
+distinguishes them". One does.
+
+Of the other four, two are §113.3's function-pointer identity cast (disposed
+of), one is the attribute-only self-cast above (no work), and one is
+`github_301`'s shift promotion.
+
+Three tags dissolved on inspection in this one iteration -- `128_pointer_arith`
+(the sweep's artefact), `aligned_attr_fail` (legacy's own spurious cast), and
+"the bit is unreadable" (a stale binary). All three dissolved in the same
+direction: something scored as the hop-off's defect was not. Read the
+reduction, and rebuild before believing a probe.
+## 132. The unported dereference arm was an encoder abort (2026-08-29)
+
+§131.4 named the array decay as the next cause, on the strength of two tests
+sharing a tag. They do not share a mechanism, and they point in opposite
+directions:
+
+| test | legacy | hop-off |
+|---|---|---|
+| `github_169` | `ASSIGN b[0]=…` | `ASSIGN *b=…` |
+| `github_1210-1-struct` | `memcpy(&JJ, …)` | `memcpy(&JJ[0], …)` |
+
+The first is the hop-off failing to decay, the second is the hop-off decaying
+where legacy does not. `github_1210-1-struct` declares `extern struct
+incomplete JJ;`, so it is a question about following a symbol type to an
+incomplete one, not about decay at all. It keeps its own slice. This section is
+`github_169`.
+
+### 132.1 The comment was wrong, and not by a spelling
+
+`clang_c_adjust::adjust_dereference` has three arms: rewrite `*a` to `a[0]`
+when the operand `is_array_like`, retype to the pointer's subtype otherwise,
+and re-take the address when the result is code-typed.
+`clang_c_adjust_irep2::adjust_dereference` ported only the third, above a
+comment saying the other two "retype a node the migration already builds with
+the right type, so no corpus input distinguishes them".
+
+`github_169` distinguishes them, and reducing it shows the difference is not a
+rendering. It has three symptoms, not one:
+
+| symptom | shapes |
+|---|---|
+| `ERROR: Unexpected type in int/ptr typecast`, exit 134 | 1-D, VLA, 2-D, struct and union member, typedef, compound literal, `extern`/`static`/`const` array, and `github_169`'s own `char *b[argc]` |
+| `ERROR: Can't construct rvalue reference to array type during dereference`, exit 134 | `*p->v` through a struct pointer, `**a` on an array-typed parameter |
+| `VERIFICATION FAILED` -- a **wrong verdict, no crash** | `*"abc"`, `&*a` |
+
+The loud one first:
+
+```c
+int main(void) { int a[3]; *a = 7; __ESBMC_assert(a[0] == 7, "x"); }
+```
+
+Under `--clang-c-irep2-adjust-only` on master this **aborts**:
+
+```
+Generated 6 VCC(s), 4 remaining after simplification
+ERROR: Unexpected type in int/ptr typecast          (exit 134)
+```
+
+The dereference reaches the encoder as a pointer built from an array rather
+than a named element. A VLA -- `github_169`'s own shape, `char *b[argc]` --
+aborts the same way. The goto-level census scored this as two diverging lines;
+it is a crash.
+
+### 132.2 The vector half is not reproduced
+
+Legacy's guard is `is_array_like`, which is `vector || array ||
+incomplete_array`. Only the array half is ported:
+
+- **vector** -- clang rejects `*v` on one: `indirection requires pointer
+  operand ('v4' (vector of 4 'int' values) invalid)`. No accepted C input
+  reaches the arm, so reproducing it would be dead instrumentation. Measured,
+  not assumed.
+- **incomplete_array** -- needs no arm of its own: `migrate_type` turns it into
+  `array_type2t` with `size_is_infinite` (`util/irep/migrate.cpp`'s
+  `incomplete_array` arm), which
+  `is_array_type` already admits.
+
+### 132.3 Result
+
+The stride-7 residue goes 11 -> 10. Three tests, each failing on a master
+control binary built from this same tree:
+
+| test | pins |
+|---|---|
+| `irep2_only_deref_array` | the rewrite on a fixed-size array |
+| `irep2_only_deref_array_fail` | `*a` writes `a[0]`, not `a[1]` -- names the property |
+| `irep2_only_deref_array_vla` | the variably-modified shape `github_169` reduced to |
+| `irep2_only_deref_array_strlit` | the **wrong-verdict** class, which the other three cannot reach |
+
+The first three all fail on the control the same way -- the process aborts --
+so together they distinguish only "crashes" from "does not crash". That is not
+enough: `char c = *"abc"; assert(c == 'a');` is `SUCCESSFUL` on legacy and
+`FAILED` on the unpatched hop-off, with no crash at all. A regression that
+reintroduced only the quiet half would pass all three. `..._strlit` is the one
+that guards it, and it is the test this section nearly shipped without --
+the first draft asserted the arm "aborted rather than diverging quietly",
+which the reduction above refutes.
+
+The divergence is always in the safe direction: the unpatched hop-off reports
+`FAILED` where legacy reports `SUCCESSFUL`, never the reverse, so the cost was
+precision rather than soundness.
+
+### 132.4 Next
+
+`github_1210-1-struct`, split out above. Reduced and confirmed rather than
+inferred this time:
+
+```c
+struct incomplete;
+extern struct incomplete JJ;
+void take(void *p);
+int main(void) { take(&JJ); }
+```
+
+```
+legacy:  FUNCTION_CALL:  take((void *)(&JJ))
+hop-off: FUNCTION_CALL:  take((void *)(&JJ[0]))
+```
+
+The suspect is that legacy's `adjust_address_of` tests
+`is_array_like(op.type())` on the *unfollowed* type, so a symbol type naming an
+incomplete struct does not match, while the migration resolves it and the
+IREP2 arm decays. Which of the two is right is the open question -- unlike
+§132, the hop-off is the side doing more work here, so the answer may be to
+stop decaying rather than to port an arm.
+
+Four tags have now dissolved on inspection in this scope, and every one of them
+was read from a census table rather than from a reduction. Reduce first.
+
+## 133. The incomplete tag is an array only after migration (2026-09-05)
+
+§132.4 left `github_1210-1-struct` with a suspect and an open question: legacy
+tests `is_array_like` on the *unfollowed* operand type, the hop-off on
+`ns.follow`'s resolution of it, and which of the two is right was undecided
+because the hop-off is the side doing more work.
+
+The reduction settles it:
+
+```c
+struct incomplete;
+extern struct incomplete JJ;
+void take(void *p);
+int main(void) { take(&JJ); }
+```
+
+```
+legacy:  FUNCTION_CALL:  take((void *)(&JJ))
+hop-off: FUNCTION_CALL:  take((void *)(&JJ[0]))
+```
+
+### 133.1 The array is manufactured by migrate_type, not present in the source
+
+`JJ`'s type is a `symbol_type2t` naming `tag-struct incomplete`, whose symbol
+carries an `incomplete_struct` legacy type. `migrate_type`'s
+`incomplete_struct` / `incomplete_union` arm (`src/util/irep/migrate.cpp`)
+lowers that to `array_type2tc(uint8, nil, /*infinite=*/true)` — "the most
+permissive approach to something that shouldn't happen", by its own comment.
+So `ns.follow` on the IREP2 side *always* reports an incomplete tag as an
+array, and `adjust_address_of` decayed every address of one.
+
+Legacy, testing the operand's own type, never reaches the array arm for a tag
+symbol, so the two paths cannot agree while the follow is there — and parity
+with legacy is the bar. The independent reason to prefer legacy's side is that
+there is no element to index: C11 6.5.3.2p3 gives `&JJ` the type "pointer to
+`struct incomplete`", and the array it would be indexing was invented by
+`migrate_type` two stages later. That clause does not by itself license the
+`&Q[0]` decay ESBMC keeps for real arrays either — read straight it says index
+nothing, since `&Q` is `int (*)[3]` — so it is corroboration here, not the
+ground.
+
+The fix is one predicate: test `a.ptr_obj->type`, not `ns.follow(...)` of it.
+The set this changes is exactly the set where a symbol type resolves to an
+array, and `clang::Type::Record` is the only `get_type` arm that builds a
+`symbol_typet` (`clang_c_convert.cpp`; the `Enum` arm builds the underlying
+integer type instead) — so the incomplete tag is the whole of it. `int Q[3]`
+is unaffected: a genuine array symbol carries `array_type2t` directly, and
+`extern int a[]` migrates through the `incomplete_array` arm to the same, both
+still decaying.
+
+The completeness argument is a case analysis, not a sample. Legacy's
+`is_array_like` (`src/util/irep/type.cpp`) admits exactly three ids; their
+images under `migrate_type` are:
+
+| legacy typet | `is_array_like` | migrates to | `is_array_type` | agree |
+|---|---|---|---|---|
+| `array` | yes | `array_type2t` | yes | yes |
+| `incomplete_array` | yes | `array_type2t(…, infinite)` | yes | yes |
+| `vector` | yes | `vector_type2t` | **no** | **no** |
+
+So the decays this predicate can miss relative to legacy are exactly the
+vectors, and it missed them before the patch too — `ns.follow` returns a
+non-symbol type unchanged, so `is_array_type(ns.follow(v))` was already false.
+That row is §133.3's third residue.
+
+### 133.2 Result
+
+`regression/esbmc/irep2_only_addrof_incomplete_tag` covers the struct and the
+union — both diverged, since `migrate_type` shares the arm — and fails on a
+control binary built from this tree, where the goto text reads `&JJ[0]` and
+`&UU[0]`.
+
+The divergence closes outright, on the reductions and on the corpus tests that
+carry the cause. Diff lines, legacy against the hop-off, on a control binary
+built from this tree and on the patched one:
+
+| input | instrument | control | patched |
+|---|---|---:|---:|
+| the four-line reduction above | symbol table | 3 | **0** |
+| the same plus a second `memcpy` | symbol table | 6 | **0** |
+| `github_1210-1-struct` | goto program | 4 | **0** |
+| `github_1210-1-union` | goto program | 4 | **0** |
+
+The two corpus tests flip SAME at the goto level — the program that reaches
+symex. Their *symbol tables* still differ, by 8 lines each and on two causes
+that are not this one (§133.3). Worth stating plainly: §100.1 makes the symbol
+table the instrument for adjuster questions, §116.3 scores its census on the
+goto program, and on this patch the two disagree about whether
+`github_1210-1-struct` is finished. Name the instrument with the number.
+
+The 94 descriptors pinning `--clang-c-irep2-adjust`* all pass, the new one
+included. Note that `ctest` will not see the new test until CMake is
+re-configured: a stale build directory runs 91 `irep2_only_*` tests and reports
+them green while omitting it.
+
+The default path cannot move: `clang_c_adjust_irep2` is constructed at one
+site, under those two flags (`clang_c_language.cpp`). Measured anyway — over a
+stride-16 list of `regression/esbmc` (131 descriptors), the symbol table each
+descriptor's own flags produce is byte-identical between the two binaries,
+131/131.
+
+The same 131 run as an A/B against the hop-off — 5 pin the flag themselves and
+are excluded, leaving 126 scored — moves no test in either direction on the
+symbol table: 41 SAME / 85 DIFF on both binaries. The sample carries no
+incomplete tag, so it measures only that nothing regressed; the movement is the
+four rows above. §134 tags that 85 and gives the goto-level figure, which an
+earlier draft of this section quoted from a harness that was silently
+discarding the hop-off flag (§134.1).
+
+### 133.3 Next
+
+`github_1210-1-struct`'s goto program is done; its *symbol table* still carries
+two causes, both invisible to a goto-level A/B — check the instrument before
+concluding either way.
+
+The first is the `const` qualifier on an argument cast, and it is **not** an
+adjuster arm. It reduces to five lines with no `assert`, no `memcpy` and no
+incomplete tag:
+
+```c
+void snk(const void *p);
+int main(void) { int k = 0; snk(&k); return __builtin_expect(k, 0); }
+```
+
+```
+$ esbmc r.c --symbol-table-only
+legacy:  snk((const void *)(&k));
+hop-off: snk((void *)(&k));
+```
+
+Delete the `__builtin_expect` and both paths spell `(const void *)`. It is not
+the builtin either: `adjust()` writes a symbol's value back only when the walk
+changed it (`if (value != before) s->set_value(value)`), and `set_value` is a
+whole-body `migrate_expr_back`. **Any** adjustment anywhere in a function
+therefore round-trips every cast in that function, and `migrate_type_back`
+drops `const`, `volatile` and `_Atomic` because IREP2 has no representation for
+them — §130.2, and R9 in `irep2-migration.md`. The builtin is only what makes
+the body dirty; on Darwin `assert(e)` expands through `__builtin_expect`, which
+is why `github_1210-1-struct` shows it and why an earlier draft of this section
+blamed `<assert.h>`.
+
+So this residue is one instance of the recorded qualifier-carriage gap, not a
+new defect, and closing it is R9's job rather than a per-arm port. It is a
+*floor* on the symbol-table census: no amount of arm-porting reduces it, and
+porting more arms makes it worse by dirtying more bodies.
+
+It is also **not the lever**. Stripping `const ` and `volatile ` from both
+sides of the stride-16 A/B closes **0 of the 85** DIFFs — every one carries
+some other cause as well — so R9 would not move a single test in this sample.
+And it is soundness-neutral on what is measured: the `const`-write checks
+(`dereference.cpp`, `memory_ops.cpp`) read the *symbol's* type, which
+`set_value` never rewrites, so `const int C; *(int *)&C = 6;` reports
+`dereference failure: write access to const object 'C'` on both paths, with a
+dirty body and without.
+
+The second residual is the `0` / `(void)0` ternary arm §110.2 already records
+as the hop-off being the faithful one.
+
+A third cause fell out of the same predicate and is *not* fixed here, because
+it is a different one: legacy's `is_array_like` accepts `vector` alongside
+`array` and `incomplete_array`, and the IREP2 arm tests `is_array_type` only.
+
+```c
+typedef int v4si __attribute__((vector_size(16)));
+v4si V;
+void take(void *p);
+int main(void) { take(&V); }
+```
+
+```
+legacy:  take((void *)(&V[0]))
+hop-off: take((void *)(&V))
+```
+
+The control binary diverges here identically, so this predates §133 and the
+follow was never what carried it — `V`'s type is a `vector_type2t` either way.
+It is the smaller half of the same arm and wants its own test, since §90.4's
+trap is an arm no test executes.
+
+## 134. The cause census §113.4 asked for — and the harness bug it found first
+## (2026-09-05)
+
+§113.4 stopped further arm-writing until a fresh cause census: "the old one is
+stale, and §113.1 shows it was reading the wrong stage." This is that census,
+over a stride-16 list of `regression/esbmc` (131 descriptors, 5 of which pin
+the hop-off themselves and are excluded, leaving 126 scored), legacy against
+`--clang-c-irep2-adjust-only` on one binary.
+
+### 134.1 `irep2_goto_dump` accepted a fourth argument and dropped it
+
+The first run reported **126 SAME / 0 DIFF** at the goto level. That number was
+manufactured. `irep2_symtab_dump` takes an optional `$4` extra flag;
+`irep2_goto_dump`, its sibling three lines above in the same file, did not —
+and bash discards a surplus positional silently. Every "hop-off" run in that
+sweep was therefore the *default* path, compared with itself.
+
+A sweep that compares a thing with itself does not fail, it passes: the failure
+mode is a clean, plausible, completely converged result. Nothing in the output
+distinguished it from real convergence, and the number was written into §133.2
+before a single-test spot check contradicted it —
+`regression/esbmc/atexit-1` diverges at the goto level under its own flags, but
+the helper scored it SAME.
+
+`irep2_goto_dump` now takes the same `$4`, with the argv guard its sibling
+already had. The check that catches this class: run the A/B on one test where
+the divergence is known by hand, and confirm the harness reports DIFF, before
+trusting the sweep's totals.
+
+### 134.2 The goto program is at 124 / 126, and both residuals are recorded
+
+Re-run with the fixed helper:
+
+| instrument | SAME | DIFF |
+|---|---:|---:|
+| goto program | **124** | 2 |
+| symbol table | 41 | 85 |
+
+Both goto residuals are the same cause, and it is §113.3's:
+
+```
+legacy:  FUNCTION_CALL:  atexit((void (*)())(&free_g2))
+hop-off: FUNCTION_CALL:  atexit(&free_g2)
+```
+
+`arg->type == params[i]` holds in IREP2 — `migrate_type` maps `void (*)(void)`
+and `void (*)()` to the same `code_type2t` — so the legacy cast is the identity
+and no pass reading IREP2 can know it is owed. §113.3 argued that emitting it
+to match the legacy printer is §110.2's mistake with a different node, and
+closing it for real needs `code_type2t` to carry the prototyped/unprototyped
+distinction. That argument stands; what is new is that this is now the *only*
+goto-level cause left on the sample.
+
+### 134.3 The symbol-table residue is 85, and 73 of it is already argued
+
+Tagging each of the 85, with leading/trailing whitespace and empty lines
+normalised away first:
+
+| class | tests | status |
+|---|---:|---|
+| whitespace / blank-line only | 24 | printer artefact; `symtab_sweep.sh` already diffs with `-B` |
+| `(void)0` vs `0` | 40 | §110.2 — the hop-off is the faithful side |
+| qualifier only (`const`/`volatile`) | 9 | §133.3 / R9 — no representation to carry it |
+| everything else | **12** | below |
+
+Those 24 split 16 blank-line-only and 8 indentation-only, and they are the
+reason a census must state its normalisation. One run, three defensible
+numbers: **85** by string equality, **69** under `diff -B` (what
+`symtab_sweep.sh` actually does — it ignores blank lines, not indentation), and
+**61** ignoring leading whitespace as well. None is wrong; quoting one without
+the rule is.
+
+Of the 12, four are the printer set §113.4 already named — the float literal
+suffix (`1.175494e-38` vs `1.175494e-38f`, `3.000000` vs `3.000000l`) and the
+`#cformat` / `#cpp_type` attributes the round-trip drops — and two are §134.2's
+`atexit`. That leaves **six** unclassified out of 126, and they are six
+distinct causes, not one:
+
+| test | divergence |
+|---|---|
+| `memset-const` | an array in a ternary arm is left undecayed (§134.4) |
+| `github_1590` | the same, in a binary `-` |
+| `builtin_memcpy` | a `char` array literal prints as integers, not characters |
+| `github_6966` | a symbol's `Location` is empty where legacy has one |
+| `cwe_excessive_alloc_vla_pass` | a VLA size prints as the full symbol id, not the base name |
+| `union-ptr-arith-bug` | an anonymous padding member appears in a union initialiser |
+
+### 134.4 The ternary decay, reduced — and why it does not reach symex
+
+```c
+#include <string.h>
+const char b[] = "abc";
+int main(int argc, char **argv)
+{
+  char a[2];
+  char *c = argc == 1 ? a : b;
+  memset(c, 0, 1);
+}
+```
+
+```
+legacy:  signed char * c=argc == 1 ? &a[0] : &b[0];
+hop-off: signed char * c=argc == 1 ? &a[0] : b;
+```
+
+The hop-off leaves an `array` -typed arm inside a pointer-typed `if2t`. Drop
+the `memset` and both paths print `&b[0]`: the value is written back only when
+the walk changed something (§133.3), so a clean body keeps the converter's own
+decayed form and the gap is invisible. That is the general shape of this
+residue — an unported conversion shows up only in functions that are dirty for
+some other reason.
+
+It does not reach symex today. `migrate_expr`'s `if` arm gives an array branch
+of a pointer-typed conditional its C conversion (§116.2), so the round-trip
+re-decays it and the goto programs are byte-identical. The obligation is real
+all the same: the ill-typed node is what a native `goto_convert` would receive
+once the round-trip is deleted, which is B-3. It is the next arm.
+
+## 135. The symbol-table A/B shows the converter's tree, not the pass's
+## (2026-09-05)
+
+§134.3 left six unclassified causes and named the ternary array decay as the
+next arm. Two of the six are not arms, and the reason generalises to the
+instrument itself.
+
+### 135.1 The reduction, and what instrumenting it said
+
+```c
+char b[4]; char *d;
+void snk(void *);
+int main(int argc, char **argv) { char *c; c = argc==1 ? b : d; snk(c); }
+```
+
+```
+legacy:   c = argc == 1 ? &b[0] : d;
+hop-off:  c = argc == 1 ? b : d;
+```
+
+Read off the dump, that is a missing array-to-pointer decay in a conditional
+arm. It is not. Instrumented, `adjust_if_expr` receives the `if2t` with **all
+three types already `pointer`** — `migrate_expr`'s `coerce_ternary_branch`
+(§116.2) decayed the branch on the way in — and the pass has nothing to do.
+
+Replace `snk(c);` with `return c[0];` and the same program prints `&b[0]` under
+the hop-off. The instrumented difference between the two is one line:
+
+| last statement | `value != before` | printed |
+|---|---|---|
+| `return c[0];` | true | `&b[0]` |
+| `snk(c);` | **false** | `b` |
+
+`adjust()` refreshes a symbol's legacy value only when the walk changed
+something (§133.3's other half). When it changed nothing, `symbolt` keeps the
+**converter's** tree — and the converter does not decay an array in a ternary
+arm; `clang_c_adjust::adjust_if` does. So the dump is showing legacy's input
+where the hop-off's output was wanted. `memset-const`'s `main` reports
+`changed=false`, which is the whole of that test's remaining divergence.
+
+### 135.2 The instrument shows two different things
+
+This is worth stating plainly because §100.1 makes the symbol table *the*
+instrument for adjuster questions, and it is:
+
+- the **pass's** output for a body the pass changed, and
+- the **converter's** output for a body it did not,
+
+with nothing in the dump to say which. The two differ wherever `migrate_expr`
+normalises — the ternary decay above, and every other coercion its arms apply.
+So a symbol-table A/B systematically reports work as unported when the only
+thing missing is a write-back nobody wanted.
+
+`--clang-c-irep2-adjust-writeback-all` defeats the gate for diagnosis. It is
+not a mode to verify in: forcing the write-back makes every body pay
+`migrate_expr_back`'s losses, and over the same stride-16 sample it takes the
+residue the wrong way, 85 DIFF to 114. Its use is per-cause, one test at a
+time — does *this* line come back when the value is refreshed?
+
+Nothing downstream is affected. `goto_convert_functions.cpp` reads a body
+through `get_value2()` (the IREP2 value, always the pass's own); the remaining
+`get_value()` uses there are `is_nil` / `is_code` / `has_operands` predicates,
+which agree either way. That is why §134.2's goto census is 124/126 while the
+symbol table reads 85 DIFF.
+
+### 135.3 The six, re-scored
+
+| test | line under `--...-writeback-all` | verdict |
+|---|---|---|
+| `memset-const` | `? &b[0] :` — matches legacy | **artefact** |
+| `github_1590` | `- &buffer[0]` — matches legacy | **artefact** |
+| `builtin_memcpy` | unchanged | real, printer |
+| `cwe_excessive_alloc_vla_pass` | unchanged | real, printer |
+| `union-ptr-arith-bug` | unchanged | real |
+| `github_6966` | unchanged | **real** |
+
+`builtin_memcpy` is a representation difference the printer exposes: legacy
+keeps `const signed char [9] src={ 't', 'e', … }`, the hop-off prints
+`signed char [9] src={ 116, 101, … }` — `migrate_expr` turns the string
+constant into a `constant_array` of integers, and the qualifier goes with
+§133.3. `cwe_excessive_alloc_vla_pass` prints a VLA's size symbol by base name
+where legacy prints its full id; the hop-off is the more readable of the two
+and neither reaches symex.
+
+### 135.4 Next
+
+`github_6966` — a symbol whose `Location` is empty under the hop-off where
+legacy has `file main.c line 13 column 14 function log_msg`. It survives
+`--clang-c-irep2-adjust-writeback-all`, so it is the pass's own output, and it
+is the only one of the six that loses information a user sees: a location is
+what a counterexample step and a witness are printed from. §110.3 and §130.3
+each closed one place a location was dropped and each recorded that the general
+fix needs `sideeffect2t` to carry a `locationt`. This is the third; take it
+next, and check first whether it is that same missing field.
+
+## 136. sideeffect2t carries a location (2026-09-05)
+
+§135.4 named `github_6966` as the one remaining cause that loses information a
+user sees. It is §110.3's and §130.3's open item, and this closes it.
+
+### 136.1 The reduction, and why the obvious patch is wrong
+
+```c
+int main(void) { int x = undeclared_fn(1); return x; }
+```
+
+```
+legacy:  Location....: file w1.c line 1 column 26 function main
+hop-off: Location....:
+```
+
+Three shapes split cleanly. A call with no visible declaration makes
+`declare_implicit_callee` create a symbol, and that symbol's location is:
+
+| statement | before |
+|---|---|
+| `undeclared_fn(1);` | correct — `adjust_expr` passes the statement's own location before the recursion |
+| `int x = undeclared_fn(1);` | **empty** |
+| `x = undeclared_fn(1);` | **empty** |
+
+The general call site passes the parameter's default `locationt()`. Passing
+`enclosing_location` there instead would give the right file and line and the
+**wrong column**: legacy reports column 26, where `undeclared_fn` starts; the
+statement starts at column 18. §110.3 already stated the rule — the statement's
+location is the call's only when the call is the whole statement — so the
+fallback is not a fix, and a fabricated column in a counterexample is worse
+than an empty one.
+
+### 136.2 The field, and why it does not disturb value identity
+
+`sideeffect2t` now carries a `locationt`, following the pattern `code_assign2t`
+and the V.4 structured-CF kinds already use: the member is **not** listed in
+`fields`, and `excluded_field_bytes` tells `fields_cover_class` to stop counting
+it as missed. So it takes no part in `cmp`/`crc`/`hash`/`tostring`, and two side
+effects differing only in position still compare equal — which the cross-run VCC
+cache and every consumer keyed on value identity depend on. The constructor
+parameter is defaulted, so no construction site changes.
+
+`declare_implicit_callee` and `declare_polymorphic_builtin` now read the node's
+own location, falling back to the statement's only for a `sideeffect2t` built
+without one. All three shapes match legacy, column included.
+
+`irep2_only_implicit_callee_location{_init,_assign}` pin the two shapes that
+were empty; both fail on a mutant that ignores the new field, while #7242's
+`irep2_only_implicit_callee_location{,_stmt}` keep passing on it — the
+pre-recursion path still covers the whole-statement case they test.
+
+### 136.3 The half that is not done here, and the number that decides it
+
+The first version of this patch also restored the location in
+`migrate_expr_back`. Measured against a master control over a stride-16 list of
+`regression/esbmc`, that moved **126 of 131** default-path goto programs:
+`goto_convert` falls back to the enclosing statement for a side effect carrying
+no location, so restoring one shifts the instruction's column corpus-wide.
+
+```
+- // file /esbmc-vfs/libc/library/io.c line 106 column 3 function fopen
++ // file /esbmc-vfs/libc/library/io.c line 106 column 13 function fopen
+```
+
+That is very likely the more faithful column — it is the call's, not the
+statement's — but it is a user-visible change to counterexamples and witnesses
+on the **default** path, so it needs its own PR and an SV-COMP run rather than
+riding along with a hop-off fix. The carriage here is forward-only. Re-measured
+with the back-arm dropped: **130 of 131 identical**, the one exception being
+`irep2_only_polymorphic_builtin_dowhile_fail`, which pins the hop-off flag in
+its own descriptor — §136.4.
+
+### 136.4 A test that pinned the fallback, not the behaviour
+
+`irep2_only_polymorphic_builtin_dowhile_fail` expected
+`line 9 ... dereference failure: NULL pointer`. Line 9 is the `do`; line 11 is
+the `atomic_load` call. Measured on three binaries:
+
+| path | property line |
+|---|---|
+| default | **11** |
+| hop-off, pre-patch | 9 |
+| hop-off, patched | **11** |
+
+So the test was pinning §130.3's enclosing-statement fallback, which the default
+path does not produce. Its expectation is updated to legacy's line, and its
+comment now says which line is whose. This is why the descriptor names the
+property line rather than only `^VERIFICATION FAILED$`: the divergence showed
+up as a red test, not as one more row in a dump nobody re-reads.
+
+### 136.5 A dead-code candidate, stated because the first answer was wrong
+
+With the field in place, the pre-recursion path in `adjust_expr` — the one that
+passes `stmt.location` for a bare `f(x);` — looks redundant: the whole hop-off
+corpus is **96/96** without it.
+
+An earlier run of this same experiment reported it as live, on one failing test.
+That run was contaminated: the test was `..._dowhile_fail`, which was failing on
+§136.4's stale expectation whatever the mutant did. Two tests had already passed
+without the branch, and it would have been easy to stop there and delete it on
+that evidence; it would have been equally easy to keep the wrong "it is live"
+conclusion. Neither is a measurement. **Removing it is not done here** — a
+branch deletion wants its own PR and a Mode C (C-Dead) proof per the
+dead-code rule, not a corpus that happens to be quiet.

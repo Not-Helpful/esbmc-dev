@@ -2010,9 +2010,9 @@ bool clang_c_convertert::get_bitfield_type(
 // converted once and each of its non-bitfield fields is pushed as a
 // member_exprt, keeping types aligned without duplication.
 //
-// Note: get_base_components_methods uses an alphabetically-ordered base_map,
-// so for multiple-inheritance the component order may not match declaration
-// order.  Single-inheritance (the common case) is unaffected.
+// Note: get_base_components_methods walks the base_map ancestors first, so for
+// multiple inheritance the component order interleaves each base's ancestors
+// ahead of it. Single inheritance (the common case) is unaffected.
 bool clang_c_convertert::get_base_flattened_inits(
   const clang::InitListExpr &init,
   std::vector<exprt> &flat)
@@ -4032,8 +4032,27 @@ bool clang_c_convertert::get_cast_expr(
     }
 
     if (routed)
+    {
       expr = cur;
-    else if (cast.getCastKind() == clang::CK_DerivedToBase)
+      break;
+    }
+
+    // No @base@ path: the hierarchy kept the legacy flattened layout, where a
+    // non-primary base's members sit at a non-zero displacement inside the
+    // derived object. Left unadjusted, `this` in a base method addresses the
+    // derived object's leading storage instead (#7025). Padding is not in
+    // place until the adjust pass, so only mark the conversion here;
+    // clang_c_adjust::adjust_derived_to_base resolves the displacement and
+    // leaves the expression untouched when there is none.
+    // A chain of unchecked casts overwrites the marker on the same node rather
+    // than nesting, which is what we want: the unchecked fallback leaves the
+    // expression's type alone, so the surviving outermost marker names the
+    // final base and the displacement is computed in one hop.
+    const typet &base_t = type.is_pointer() ? type.subtype() : type;
+    if (base_t.id() == "symbol")
+      expr.set("#derived_to_base", base_t.identifier());
+
+    if (cast.getCastKind() == clang::CK_DerivedToBase)
       // Preserve prior fallback: CK_DerivedToBase always typecast;
       // CK_UncheckedDerivedToBase was a no-op.
       gen_typecast(ns, expr, type);
@@ -4928,13 +4947,48 @@ void clang_c_convertert::get_decl_name(
        * symex assigns a nondet return and the verdict is silently wrong
        * (esbmc/esbmc#6969). Qualify with the enclosing specialisation, which
        * is what clang's own USRs for the closure's methods already carry. */
-      const auto *parent =
-        llvm::dyn_cast_or_null<clang::FunctionDecl>(rd.getDeclContext());
-      if (parent && parent->getTemplateSpecializationArgs())
+      /* The same collision arises one level out: a lambda in a member function
+       * of a *class* template is a distinct type per instantiation, but the
+       * member carries no specialisation args -- the class does (#7528). A
+       * nested lambda adds a third shape: its context is the enclosing
+       * lambda's operator(), which carries none either (#7529). So walk out
+       * until a specialised context is found rather than testing only the
+       * immediate parent. */
+      const clang::FunctionDecl *qualifier = nullptr;
+      for (const clang::DeclContext *dc = rd.getDeclContext(); dc;
+           dc = dc->getParent())
+      {
+        const auto *fn = llvm::dyn_cast<clang::FunctionDecl>(dc);
+        if (!fn)
+          continue;
+        const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(fn);
+        if (
+          fn->getTemplateSpecializationArgs() ||
+          (method && llvm::isa<clang::ClassTemplateSpecializationDecl>(
+                       method->getParent())))
+        {
+          qualifier = fn;
+          break;
+        }
+      }
+
+      if (qualifier)
       {
         std::string parent_name, parent_id;
-        get_decl_name(*parent, parent_name, parent_id);
+        get_decl_name(*qualifier, parent_name, parent_id);
         name += "_" + parent_id;
+      }
+
+      /* Everything a macro expands reports the expansion location, so two
+       * lambdas in one macro body share a file, line and column and the second
+       * reuses the first's record (esbmc/esbmc#7530). Their spelling locations
+       * inside the macro body differ, so add that offset. Clang's lambda
+       * mangling number does not help: it is 0 for both. */
+      const clang::SourceLocation dloc = rd.getLocation();
+      if (dloc.isMacroID() && sm)
+      {
+        const clang::SourceLocation spelling = sm->getSpellingLoc(dloc);
+        name += "_m" + std::to_string(sm->getFileOffset(spelling));
       }
 
       std::replace(name.begin(), name.end(), '.', '_');

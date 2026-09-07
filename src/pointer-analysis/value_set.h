@@ -1,7 +1,10 @@
 #ifndef CPROVER_POINTER_ANALYSIS_VALUE_SET_H
 #define CPROVER_POINTER_ANALYSIS_VALUE_SET_H
 
+#include <tuple>
+#include <map>
 #include <pointer-analysis/value_sets.h>
+#include <optional>
 #include <set>
 #include <irep2/irep2.h>
 #include <util/arith/mp_arith.h>
@@ -58,6 +61,8 @@ public:
   {
   }
 
+  /* rec_cache is deliberately not copied: it points into the stack frame of an
+   * in-progress query, and a copy can only be taken between queries. */
   value_sett(const value_sett &ref)
     : location_number(ref.location_number),
       values(ref.values),
@@ -77,7 +82,8 @@ public:
     return *this;
   }
 
-  //*********************************** Types ************************************
+  //*********************************** Types
+  //************************************
 
   /** A type for a set of expressions */
   typedef std::set<expr2tc> expr_sett;
@@ -554,6 +560,12 @@ public:
    *         pointer set for lhs. Otherwise, overwrite it. Used for the static
    *         analysis. */
   void assign(const expr2tc &lhs, const expr2tc &rhs, bool add_to_sets = false);
+  /** assign()'s struct/union arm, split out to keep assign() one dispatch. */
+  void assign_struct_union(
+    const expr2tc &lhs,
+    const expr2tc &rhs,
+    const type2tc &lhs_type,
+    bool add_to_sets);
 
   /** Interpret a function call during static analysis. Looks up the given
    *  function, and simulates the assignment of all the arguments to the
@@ -621,16 +633,73 @@ public:
     object_mapt &op1_set,
     object_mapt &dest) const;
 
-  void get_value_set_rec(
+  /** The entry point for the recursive value-set walk: memoises, then calls
+   *  get_value_set_rec. Call this rather than the recursion itself -- a
+   *  propagated multi-dimensional array reaches here as a DAG, and walking it
+   *  unmemoised costs paths exponential in the number of stores it carries.
+   *  The recursion is private so that cannot be bypassed. */
+  void get_value_set_rec_cached(
     const expr2tc &expr,
     object_mapt &dest,
     const std::string &suffix,
     const type2tc &original_type,
     bool under_deref = true) const;
 
+private:
+  /** What one get_value_set_rec_cached query contributed, keyed by its
+   * arguments. Shared subexpressions make a value query a DAG walk, so without
+   * this the walk costs paths exponential in the number of stores a propagated
+   * array carries. The key's expr and type are held alongside the result so a
+   * freed node's address cannot be recycled into a false hit. */
+  using rec_cache_keyt =
+    std::tuple<const expr2t *, std::string, const type2t *, bool>;
+  using rec_cachet =
+    std::map<rec_cache_keyt, std::tuple<expr2tc, type2tc, object_mapt>>;
+
+  /** Owned by the outermost get_value_set_rec_cached call, and null outside
+   * one, so nothing is carried across queries that `values` may have changed
+   *  between. */
+  mutable rec_cachet *rec_cache = nullptr;
+
+  /** One step of the walk. Its own recursive calls go through
+   *  get_value_set_rec_cached, which is what makes the memo effective. */
+  void get_value_set_rec(
+    const expr2tc &expr,
+    object_mapt &dest,
+    const std::string &suffix,
+    const type2tc &original_type,
+    bool under_deref) const;
+
 protected:
-  /** The constant cases of get_value_set_rec: what a value reaches this code as
-   *  once constant propagation has substituted it. */
+  /** The byte offset a constant operand of pointer arithmetic contributes,
+   *  already signed by @p subtracting; nullopt when the operand is not a
+   *  compile-time constant or its element size is not statically known. */
+  std::optional<BigInt> constant_pointer_arith_offset(
+    const expr2tc &non_ptr_op,
+    const type2tc &subtype,
+    bool subtracting) const;
+
+  /** Fold @p total_offs into every object of @p pointer_expr_set, tracking
+   *  alignment where the offset or the object's own offset is nondet, and
+   *  store the results into @p dest. */
+  void offset_pointer_arith_objects(
+    const object_mapt &pointer_expr_set,
+    const expr2tc &ptr_op,
+    const std::optional<BigInt> &total_offs,
+    object_mapt &dest) const;
+
+  /** What @p sym points at: the values keyed under the path the read spells,
+   *  falling back to the paths a union arm it crosses aliases. Returns whether
+   *  anything was found. */
+  bool get_symbol_value_set(
+    const symbol2t &sym,
+    const expr2tc &expr,
+    const std::string &suffix,
+    const type2tc &original_type,
+    object_mapt &dest) const;
+
+  /** The constant cases of get_value_set_rec: what a value reaches this code
+   *  as once constant propagation has substituted it. */
   void get_constant_value_set(
     const expr2tc &expr,
     object_mapt &dest,
@@ -685,7 +754,7 @@ protected:
    *  @param values_rhs The value set of the right hand side of the assignment,
    *         i.e. all the things the rhs points at.
    *  @param suffix Accumulated suffix of the lhs up to this point. See docs for
-   *         @ref entryt and @get_value_set_rec.
+   *         @ref entryt and @get_value_set_rec_cached.
    *  @param add_to_sets See @ref assign. */
   void assign_rec(
     const expr2tc &lhs,
@@ -711,7 +780,8 @@ protected:
   static void obj_numbering_deref(unsigned int num);
 
 public:
-  //********************************** Members ***********************************
+  //********************************** Members
+  //***********************************
   /** Location number of the instruction this value set is attached to;
    *  used to identify allocation sites for dynamic objects. */
   unsigned location_number;

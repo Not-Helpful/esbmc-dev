@@ -1,4 +1,6 @@
+#include <clang-c-frontend/clang_c_adjust.h>
 #include <clang-c-frontend/clang_c_adjust_irep2.h>
+#include <clang-c-frontend/padding.h>
 #include <clang-c-frontend/builtin_names.h>
 #include <util/irep/migrate.h>
 #include <util/lang/c_typecast.h>
@@ -7,6 +9,8 @@
 #include <util/config/config.h>
 #include <util/symtab/namespace.h>
 #include <util/symtab/pretty.h>
+#include <util/symtab/cprover_prefix.h>
+#include <optional>
 #include <utility>
 
 bool clang_c_adjust_irep2::adjust()
@@ -26,8 +30,22 @@ bool clang_c_adjust_irep2::adjust()
   context.Foreach_operand_in_order(
     [&symbol_list](symbolt &s) { symbol_list.push_back(&s); });
 
+  // Types first, in a pass of their own: a value's initialiser is built from
+  // its type, so padding a type after a value that uses it leaves the value
+  // short a component. clang_c_adjust::adjust() splits the walk for the same
+  // reason ("so that symbolic-type resolution always receives fixed up types").
+  if (sole_adjuster)
+    for (symbolt *s : symbol_list)
+      if (s->is_type)
+        pad_type_symbol(*s);
+
   for (symbolt *s : symbol_list)
   {
+    if (
+      sole_adjuster && s->get_type().is_code() &&
+      has_prefix(s->id.as_string(), "c:@F@main"))
+      declare_argc_argv(context, *s);
+
     if (!s->is_type && s->get_value().is_not_nil())
     {
       const expr2tc before = s->get_value2();
@@ -36,13 +54,31 @@ bool clang_c_adjust_irep2::adjust()
       // Only write back a value this pass actually changed, so symbols it does
       // not touch never make the round trip (python_adjust takes the same care,
       // for the bitfield and alignment losses migrate_type cannot carry).
-      if (value != before)
+      // writeback_all defeats the gate for diagnosis only: an unchanged body
+      // otherwise keeps its converter tree, which is not what this pass built
+      // (§135).
+      if (writeback_all || value != before)
         s->set_value(value);
     }
   }
 
   migrate_namespace_lookup = old_ns;
   return false;
+}
+
+/// add_padding on a complete struct or union, which is the half of
+/// clang_c_adjust::adjust_type that the corpus shows is load-bearing here. The
+/// function is shared (clang-c-frontend/padding.h) and idempotent --
+/// adjust_type asserts that re-padding is a no-op -- so this reuses it rather
+/// than reimplementing a layout algorithm over type2tc.
+void clang_c_adjust_irep2::pad_type_symbol(symbolt &symbol)
+{
+  typet t = symbol.get_type();
+  if ((!t.is_struct() && !t.is_union()) || t.incomplete())
+    return;
+
+  add_padding(t, ns);
+  symbol.set_type(std::move(t));
 }
 
 /// The operators C admits over a complex operand: `mod` and the bitwise ones
@@ -66,6 +102,15 @@ static bool is_arith_or_bitwise(const expr2tc &expr)
          is_bitor2t(expr) || is_bitxor2t(expr);
 }
 
+/// The shifts clang_c_adjust routes through adjust_expr_shifts. They are not
+/// in is_arith_or_bitwise: C11 6.5.7p3 promotes each operand on its own and
+/// takes the result type from the left, where the usual arithmetic conversions
+/// would bring the two to a common type.
+static bool is_shift(const expr2tc &expr)
+{
+  return is_shl2t(expr) || is_ashr2t(expr) || is_lshr2t(expr);
+}
+
 /// The statements whose controlling expression clang_c_adjust converts to bool
 /// (adjust_ifthenelse, adjust_while, adjust_for). `switch` is not among them:
 /// its selector is an integer.
@@ -84,10 +129,159 @@ static bool is_relational(const expr2tc &expr)
          is_greaterthanequal2t(expr);
 }
 
+/// The short-circuit operators, whose operands goto_convert's lowering rejects
+/// unless they are boolean.
+static bool is_short_circuit(const expr2tc &expr)
+{
+  return is_and2t(expr) || is_or2t(expr) || is_not2t(expr);
+}
+
+/// Both spellings of a call: a bare `f(x);` statement is a sideeffect2t of kind
+/// function_call rather than a code_function_call2t.
+static bool is_call_site(const expr2tc &expr)
+{
+  return is_code_function_call2t(expr) || is_sideeffect2t(expr);
+}
+
+namespace
+{
+/// A call decoded to interior pointers into the live node. IREP2 spells a call
+/// two ways -- a code_function_call2t (callee in `.function`, arguments in
+/// `.operands`) and a sideeffect2t of kind function_call (callee in `.operand`,
+/// arguments in `.arguments`) -- and this is the one place that knows which.
+/// The pointers give a caller both a read and an in-place write of the callee
+/// (`*callee = x`) and of the argument vector, from a single decode.
+///
+/// It deliberately carries no location: a code_function_call2t has its own, a
+/// sideeffect2t borrows the enclosing statement's, and the two are recovered
+/// inconsistently per site, so that stays with each caller.
+///
+/// A borrow: the pointers are valid only while `expr` keeps its current node. A
+/// callee write-back keeps them valid -- it reassigns the member, not the node;
+/// rebinding the whole node (`expr = <other>`) invalidates them. No caller here
+/// does the latter while a view is live.
+struct call_view
+{
+  expr2tc *callee;
+  std::vector<expr2tc> *arguments;
+};
+
+struct const_call_view
+{
+  const expr2tc *callee;
+  const std::vector<expr2tc> *arguments;
+};
+
+/// nullopt when `expr` is not a call -- a sideeffect2t of any other kind, or a
+/// node of neither shape. The per-site is_nil_expr / is_symbol2t checks on the
+/// callee stay with the callers.
+std::optional<call_view> as_call(expr2tc &expr)
+{
+  if (is_code_function_call2t(expr))
+  {
+    code_function_call2t &c = to_code_function_call2t(expr);
+    return call_view{&c.function, &c.operands};
+  }
+  if (is_sideeffect2t(expr))
+  {
+    sideeffect2t &s = to_sideeffect2t(expr);
+    if (s.kind == sideeffect_allockind::function_call)
+      return call_view{&s.operand, &s.arguments};
+  }
+  return std::nullopt;
+}
+
+/// The const overload for a read-only caller. It uses the non-detaching const
+/// accessor, so a site holding a `const expr2tc &` stays read-only and pays no
+/// copy-on-write clone.
+std::optional<const_call_view> as_call(const expr2tc &expr)
+{
+  if (is_code_function_call2t(expr))
+  {
+    const code_function_call2t &c = to_code_function_call2t(expr);
+    return const_call_view{&c.function, &c.operands};
+  }
+  if (is_sideeffect2t(expr))
+  {
+    const sideeffect2t &s = to_sideeffect2t(expr);
+    if (s.kind == sideeffect_allockind::function_call)
+      return const_call_view{&s.operand, &s.arguments};
+  }
+  return std::nullopt;
+}
+} // namespace
+
+/// The unary operators promote_unary_bool_operand claims: the complement of
+/// is_complex_unary within the family. The chain spelled this exclusion as the
+/// `else` of is_complex_unary, which is a strict subset of the same family;
+/// stating it as a predicate holds in both the rewriting and the declining case
+/// for the same reason, rather than relying on the first arm having mutated the
+/// node out of the second's reach.
+static bool is_promotable_unary(const expr2tc &expr)
+{
+  return (is_neg2t(expr) || is_bitnot2t(expr)) && !is_complex_type(expr->type);
+}
+
+/// The source location of `expr` when it is a statement that can hold a call
+/// in a sub-expression, empty otherwise. sideeffect2t carries none of its own,
+/// so a call in one takes the enclosing statement's -- which is what
+/// clang_c_adjust reads off the side_effect_expr_function_callt it is handed
+/// (§130.3). Every kind whose operands can be an expression is listed: a
+/// condition is as much a call site as an assignment's right-hand side, and
+/// omitting one leaves the counterexample with no file and line 0.
+static locationt statement_location(const expr2tc &expr)
+{
+  switch (expr->expr_id)
+  {
+  case expr2t::code_expression_id:
+    return to_code_expression2t(expr).location;
+  case expr2t::code_assign_id:
+    return to_code_assign2t(expr).location;
+  case expr2t::code_decl_id:
+    return to_code_decl2t(expr).location;
+  case expr2t::code_return_id:
+    return to_code_return2t(expr).location;
+  case expr2t::code_function_call_id:
+    return to_code_function_call2t(expr).location;
+  case expr2t::code_ifthenelse_id:
+    return to_code_ifthenelse2t(expr).location;
+  case expr2t::code_while_id:
+    return to_code_while2t(expr).location;
+  case expr2t::code_dowhile_id:
+    return to_code_dowhile2t(expr).location;
+  case expr2t::code_for_id:
+    return to_code_for2t(expr).location;
+  case expr2t::code_switch_id:
+    return to_code_switch2t(expr).location;
+  case expr2t::code_assert_id:
+    return to_code_assert2t(expr).location;
+  case expr2t::code_assume_id:
+    return to_code_assume2t(expr).location;
+  case expr2t::code_printf_id:
+    return to_code_printf2t(expr).location;
+  default:
+    return locationt();
+  }
+}
+
 void clang_c_adjust_irep2::adjust_expr(expr2tc &expr)
 {
   if (is_nil_expr(expr))
     return;
+
+  // Before the recursion, so the located spelling wins over the unlocated one
+  // the walk would otherwise reach first.
+  if (sole_adjuster && is_code_expression2t(expr))
+  {
+    const code_expression2t &stmt = to_code_expression2t(expr);
+    declare_implicit_callee(stmt.operand, stmt.location);
+  }
+
+  // A call reached below a statement takes that statement's location; a
+  // sideeffect2t has none of its own.
+  const locationt saved_location = enclosing_location;
+  if (const locationt l = statement_location(expr); !l.get_line().empty())
+    enclosing_location = l;
 
   expr->Foreach_operand([this](expr2tc &op) { adjust_expr(op); });
 
@@ -95,57 +289,91 @@ void clang_c_adjust_irep2::adjust_expr(expr2tc &expr)
     adjust_index(expr);
   else if (is_member2t(expr))
     adjust_member(expr);
-  else if (
-    sole_adjuster && (is_code_function_call2t(expr) || is_sideeffect2t(expr)))
+  else if (sole_adjuster && is_call_site(expr))
+  {
+    // Before declare_implicit_callee: the polymorphic name is repointed at the
+    // concrete instance here, and it is that symbol the callee check must see.
+    // Before adjust_function_designators too, which wraps a code-typed callee
+    // in an address_of2t that the symbol test below would then reject.
+    declare_polymorphic_builtin(expr);
     declare_implicit_callee(expr);
+  }
 
   if (sole_adjuster)
     adjust_sole_arms(expr);
 
-  if (sole_adjuster && is_address_of2t(expr))
-    adjust_address_of(expr);
+  enclosing_location = saved_location;
 }
 
-/// The arms that only run when this pass is the sole adjuster, gathered behind
-/// one test so adjust_expr does not repeat it per arm.
+void clang_c_adjust_irep2::adjust_comma_type(expr2tc &expr)
+{
+  const code_comma2t &c = to_code_comma2t(expr);
+  if (expr->type != c.side_2->type)
+    expr = code_comma2tc(c.side_2->type, c.side_1, c.side_2);
+}
+
+/// Name and member from one token, so the string the ordering test matches on
+/// and the member it names cannot drift apart.
+#define ARM(member) #member, &clang_c_adjust_irep2::member
+
+/// The arms that run when this pass is the sole adjuster, in application order.
+///
+/// The order is load-bearing wherever a comment below says so; everywhere else
+/// the guards are disjoint by expr_id and the row order is free. Each guard is
+/// re-evaluated against the current node, so an arm that rewrites a node into
+/// another kind hands it to that kind's arm below -- which is how
+/// adjust_index's `p[i]` becomes a dereference the dereference arm then sees.
+const clang_c_adjust_irep2::arm clang_c_adjust_irep2::arms[] = {
+  // First: the sugar has to be in place before adjust_call_callee decides
+  // whether this call is direct, since that is what it reads. It is offered
+  // every node and guards itself on an address_of2t.
+  {ARM(adjust_function_designators), nullptr},
+  {ARM(adjust_boolean_operands), is_short_circuit},
+  {ARM(adjust_call_callee), is_call_site},
+  {ARM(adjust_call_arguments), is_call_site},
+  {ARM(adjust_if_expr), is_if2t},
+  {ARM(adjust_complex_arith), is_binary_arith},
+  {ARM(adjust_vector_float_arith), is_binary_arith},
+  /* Before the hoist: hoist_for_init rewrites a code_for2t into a block, and a
+   * block is not a statement-with-condition, so the loop's guard would never
+   * reach the conversion. */
+  {ARM(adjust_statement_condition), is_statement_with_condition},
+  {ARM(hoist_for_init), is_code_for2t},
+  {ARM(adjust_expression_statement), is_code_expression2t},
+  {ARM(adjust_comma_type), is_code_comma2t},
+  {ARM(adjust_struct), is_constant_struct2t},
+  {ARM(adjust_array_subtype), is_constant_array2t},
+  {ARM(adjust_decl_init), is_code_decl2t},
+  {ARM(adjust_dereference), is_dereference2t},
+  {ARM(adjust_complex_unary), is_complex_unary},
+  {ARM(promote_unary_bool_operand), is_promotable_unary},
+  {ARM(adjust_relational), is_relational},
+  {ARM(adjust_special_functions), is_sideeffect2t},
+  {ARM(adjust_binary_arith_operands), is_arith_or_bitwise},
+  {ARM(adjust_shift_operands), is_shift},
+  {ARM(adjust_plain_assignment), is_sideeffect_assign2t},
+  {ARM(adjust_compound_assignment), is_sideeffect_assign2t},
+  // Ran after the chain returned; as the last row it runs at the same point,
+  // and under !sole_adjuster the table is never entered either way.
+  {ARM(adjust_address_of), is_address_of2t},
+};
+
+#undef ARM
+
+std::vector<clang_c_adjust_irep2::arm_info> clang_c_adjust_irep2::arm_order()
+{
+  std::vector<arm_info> order;
+  order.reserve(std::size(arms));
+  for (const arm &a : arms)
+    order.push_back({a.name, a.when});
+  return order;
+}
+
 void clang_c_adjust_irep2::adjust_sole_arms(expr2tc &expr)
 {
-  // First: the sugar has to be in place before adjust_call_callee decides
-  // whether this call is direct, since that is what it reads.
-  adjust_function_designators(expr);
-
-  if (is_and2t(expr) || is_or2t(expr) || is_not2t(expr))
-    adjust_boolean_operands(expr);
-
-  if (is_code_function_call2t(expr) || is_sideeffect2t(expr))
-  {
-    adjust_call_callee(expr);
-    adjust_call_arguments(expr);
-  }
-
-  if (is_if2t(expr))
-    adjust_if_expr(expr);
-
-  if (is_binary_arith(expr))
-    adjust_complex_arith(expr);
-
-  if (is_statement_with_condition(expr))
-    adjust_statement_condition(expr);
-
-  if (is_complex_unary(expr))
-    adjust_complex_unary(expr);
-
-  if (is_relational(expr))
-    adjust_relational(expr);
-
-  if (is_sideeffect2t(expr))
-    adjust_special_functions(expr);
-
-  if (is_arith_or_bitwise(expr))
-    adjust_binary_arith_operands(expr);
-
-  if (is_sideeffect_assign2t(expr))
-    adjust_plain_assignment(expr);
+  for (const arm &a : arms)
+    if (!a.when || a.when(expr))
+      (this->*a.run)(expr);
 }
 
 /// One of a family of spellings differing only by the argument's width:
@@ -197,6 +425,45 @@ fold_unary_builtin(const std::string &name, const expr2tc &arg, expr2tc &expr)
     name == "__builtin_bswap16" || name == "__builtin_bswap32" ||
     name == "__builtin_bswap64")
     expr = bswap2tc(expr->type, arg);
+}
+
+/// The three pointer intrinsics `do_special_functions` matches by their
+/// `__ESBMC_` name rather than a `__builtin_` prefix. Each lowers to a node the
+/// backend evaluates in place; left as a call the symbol is bodyless and
+/// `goto_check`'s "non-intrinsic prefixed with __ESBMC" rejects the program.
+/// Returns true when \p expr was rewritten.
+static bool fold_pointer_intrinsic(
+  const std::string &name,
+  const std::vector<expr2tc> &args,
+  expr2tc &expr)
+{
+  if (name == CPROVER_PREFIX "same_object" && args.size() == 2)
+  {
+    expr = same_object2tc(args[0], args[1]);
+    return true;
+  }
+
+  if (args.size() != 1)
+    return false;
+
+  if (name == CPROVER_PREFIX "POINTER_OBJECT")
+  {
+    expr = pointer_object2tc(expr->type, args[0]);
+    return true;
+  }
+
+  // pointer_offset2t admits only an address-width signedbv. The declared
+  // return type is __PTRDIFF_TYPE__, which is exactly that on every supported
+  // target; decline rather than assert if a target ever disagrees.
+  if (
+    name == CPROVER_PREFIX "POINTER_OFFSET" && is_signedbv_type(expr->type) &&
+    expr->type->get_width() == config.ansi_c.address_width)
+  {
+    expr = pointer_offset2tc(expr->type, args[0]);
+    return true;
+  }
+
+  return false;
 }
 
 /// The lowerings `do_special_functions` selects by base name rather than by a
@@ -255,6 +522,20 @@ bool clang_c_adjust_irep2::adjust_float_builtin(
     expr = isnormal2tc(arg);
   else if (compare_unscore_builtin(name, "signbit"))
     expr = signbit2tc(arg);
+  // Exact spelling: `isinf_sign` is reserved, and compare_unscore_builtin's
+  // "isinf" arm above matches a base name a program may reuse. Left as a call
+  // the symbol is bodyless, so the result is nondet rather than differently
+  // shaped -- the flag turns a provable comparison into an unprovable one.
+  else if (name == "__builtin_isinf_sign")
+    expr = if2tc(
+      expr->type,
+      isinf2tc(arg),
+      if2tc(
+        expr->type,
+        typecast2tc(get_bool_type(), signbit2tc(arg)),
+        constant_int2tc(expr->type, BigInt(-1)),
+        constant_int2tc(expr->type, BigInt(1))),
+      gen_zero(expr->type));
   else if (
     compare_float_suffix(name, "finite") ||
     compare_unscore_builtin(name, "isfinite") ||
@@ -315,6 +596,9 @@ void clang_c_adjust_irep2::adjust_special_functions(expr2tc &expr)
   if (adjust_float_builtin(expr, s->name, args))
     return;
 
+  if (fold_pointer_intrinsic(name, args, expr))
+    return;
+
   if (args.size() == 2)
   {
     fold_comparison_builtin(name, args[0], args[1], expr);
@@ -338,14 +622,137 @@ void clang_c_adjust_irep2::adjust_address_of(expr2tc &expr)
   if (is_nil_expr(a.ptr_obj))
     return;
 
-  const type2tc obj_type = ns.follow(a.ptr_obj->type);
-  if (!is_array_type(obj_type))
+  // Test the operand's own type rather than ns.follow's resolution of it:
+  // migrate_type lowers an incomplete struct to an infinitely sized uint8
+  // array, so following decays `&s` on an incomplete-typed object to `&s[0]`,
+  // an index legacy never builds -- and there is no element to index, C11
+  // 6.5.3.2p3 giving the address the operand's own type.
+  //
+  // Legacy's is_array_like also admits a vector, which is_array_type does not;
+  // that half is a separate divergence, tracked but not reproduced here.
+  if (!is_array_type(a.ptr_obj->type))
     return;
 
-  const type2tc &elem = to_array_type(obj_type).subtype;
+  const type2tc &elem = to_array_type(a.ptr_obj->type).subtype;
   const expr2tc idx =
     index2tc(elem, a.ptr_obj, gen_zero(migrate_type(index_type())));
   expr = address_of2tc(elem, idx, a.implicit);
+}
+
+/// IREP2 form of clang_c_adjust::adjust_struct's insertion loop. A struct
+/// literal reaches this pass with an operand per *declared* member, while
+/// add_padding has given the type its synthetic ones; unpadded, the value is
+/// short a component and a downstream member read resolves by position onto the
+/// wrong field. pad_struct_operands is the shared helper the Python adjuster
+/// already uses for the same job (irep2/irep2_utils.h).
+void clang_c_adjust_irep2::adjust_struct(expr2tc &expr)
+{
+  // The literal's own type is an inline copy the converter recorded before
+  // add_padding ran, so ns.follow leaves it short the synthetic members. The
+  // padded layout lives on the tag symbol; resolve by name to reach it. Legacy
+  // adjust_struct needs no such step -- there the value's type is a
+  // symbol_typet, which follow resolves for it.
+  const type2tc t = ns.follow(expr->type);
+  if (!is_struct_type(t))
+    return;
+
+  const symbolt *tag =
+    context.find_symbol("tag-" + to_struct_type(t).name.as_string());
+  if (tag == nullptr || !tag->is_type)
+    return;
+
+  const type2tc padded = migrate_type(tag->get_type());
+  if (!is_struct_type(padded))
+    return;
+
+  const struct_type2t &st = to_struct_type(padded);
+  std::vector<expr2tc> ops = to_constant_struct2t(expr).datatype_members;
+  if (ops.size() == st.members.size())
+    return;
+
+  ops = pad_struct_operands(st, ops);
+  // A residual mismatch is not this pass's to guess at: leave the literal as
+  // it stands rather than build one the type cannot describe.
+  if (ops.size() == st.members.size())
+    expr = constant_struct2tc(padded, ops);
+}
+
+/// adjust_struct retypes an element to its tag's padded layout, which leaves
+/// an enclosing array literal still naming the unpadded element type. The
+/// operands are walked before the node itself, so the retyped elements are
+/// already in place here; value_sett::assign's base_type_eq rejects the pair
+/// otherwise.
+void clang_c_adjust_irep2::adjust_array_subtype(expr2tc &expr)
+{
+  const constant_array2t &a = to_constant_array2t(expr);
+  if (a.datatype_members.empty())
+    return;
+
+  const array_type2t &at = to_array_type(expr->type);
+  const type2tc &elem = a.datatype_members.front()->type;
+  if (
+    !is_struct_type(at.subtype) || !is_struct_type(elem) || at.subtype == elem)
+    return;
+
+  expr = constant_array2tc(
+    array_type2tc(elem, at.array_size, at.size_is_infinite),
+    a.datatype_members);
+}
+
+/// IREP2 form of clang_c_adjust::adjust_decl's trailing `gen_typecast`: a
+/// declaration's initialiser converts to the declared type. Distinct from
+/// adjust_plain_assignment, which handles the *expression* form
+/// (`sideeffect_assign2t`). Without it a narrower declared type keeps the
+/// promoted operand type -- `_ExtInt(10) z = x + y` initialises from an `int`
+/// -- and the solver is handed mismatching sorts.
+void clang_c_adjust_irep2::adjust_decl_init(expr2tc &expr)
+{
+  const code_decl2t &d = to_code_decl2t(expr);
+  if (is_nil_expr(d.init))
+    return;
+
+  expr2tc init = d.init;
+  c_implicit_typecast(init, expr->type, ns);
+
+  if (init != d.init)
+    expr = code_decl2tc(expr->type, d.value, init, d.location);
+}
+
+void clang_c_adjust_irep2::hoist_for_init(expr2tc &expr)
+{
+  const code_for2t &f = to_code_for2t(expr);
+  if (is_nil_expr(f.init))
+    return;
+
+  // A default-constructed locationt is empty but not nil, and migrate_expr_back
+  // guards only on nil: left default it reaches convert_block, which stamps it
+  // on every destructor it unwinds. Same idiom as goto_convert_functions.cpp.
+  locationt end_location;
+  if (!is_nil_expr(f.body) && is_code_block2t(f.body))
+    end_location = to_code_block2t(f.body).end_location;
+  else
+    end_location.make_nil();
+
+  // pragma_unroll_count is excluded from code_for2t::fields, so it does not
+  // participate in equality and a rebuild that drops it compares equal to one
+  // that keeps it. Every loop rebuild in this pass has to carry it explicitly.
+  const expr2tc bare = code_for2tc(
+    expr2tc(), f.cond, f.iter, f.body, f.location, f.pragma_unroll_count);
+
+  // Splice a block-shaped init rather than nesting it: an inner block would end
+  // the declaration's scope at its own closing brace, so the variable would be
+  // DEAD before the loop that reads it. clang_c_adjust moves the init operand
+  // itself, which is why the legacy hoist puts the declaration directly in the
+  // wrapper.
+  std::vector<expr2tc> ops;
+  if (is_code_block2t(f.init))
+    for (const expr2tc &op : to_code_block2t(f.init).operands)
+      ops.push_back(op);
+  else
+    ops.push_back(f.init);
+  ops.push_back(bare);
+
+  expr = code_block2tc(ops, f.location, end_location);
 }
 
 void clang_c_adjust_irep2::adjust_binary_arith_operands(expr2tc &expr)
@@ -379,6 +786,39 @@ void clang_c_adjust_irep2::adjust_binary_arith_operands(expr2tc &expr)
     expr = expr->with_type(op0->type);
 }
 
+/// IREP2 form of clang_c_adjust::adjust_expr_shifts. C11 6.5.7p3 performs the
+/// integer promotions on each operand separately -- not the usual arithmetic
+/// conversions -- and 6.5.7p4 gives the result the promoted left operand's
+/// type. A `_Bool` left operand left unpromoted reaches bitwuzla as a
+/// one-bit sort where the shift wants a bitvector, and aborts it.
+///
+/// The `shr` to `lshr`/`ashr` selection legacy also does here has no IREP2
+/// counterpart: there is no `shr2t`, so the migration has already chosen.
+void clang_c_adjust_irep2::adjust_shift_operands(expr2tc &expr)
+{
+  expr2tc op0 = *expr->get_sub_expr(0);
+  expr2tc op1 = *expr->get_sub_expr(1);
+  if (is_nil_expr(op0) || is_nil_expr(op1))
+    return;
+
+  const expr2tc before0 = op0, before1 = op1;
+  c_typecastt c_typecast(ns);
+  c_typecast.implicit_typecast_arithmetic(op0);
+  c_typecast.implicit_typecast_arithmetic(op1);
+
+  if (op0 != before0 || op1 != before1)
+  {
+    unsigned i = 0;
+    expr->Foreach_operand(
+      [&i, &op0, &op1](expr2tc &o) { o = i++ ? op1 : op0; });
+  }
+
+  if (
+    is_number_type(op0->type) && is_number_type(op1->type) &&
+    expr->type != op0->type)
+    expr = expr->with_type(op0->type);
+}
+
 /// IREP2 form of clang_c_adjust::adjust_side_effect_assignment's "assign" case:
 /// the node takes the target's type and the source converts to it. The compound
 /// operators ("assign+", ...) are a larger arm carrying a complex lowering of
@@ -395,6 +835,36 @@ void clang_c_adjust_irep2::adjust_plain_assignment(expr2tc &expr)
 
   if (rhs != a.rhs || expr->type != target)
     expr = sideeffect_assign2tc(target, a.op, a.lhs, rhs, a.location);
+}
+
+/// The shift spellings clang_c_adjust returns early on: it promotes only the
+/// right operand there, which the corpus shows is already the migrated shape.
+static bool is_shift_assignment(const irep_idt &op)
+{
+  return op == "assign_shl" || op == "assign_shr" || op == "assign_lshr" ||
+         op == "assign_ashr";
+}
+
+void clang_c_adjust_irep2::adjust_compound_assignment(expr2tc &expr)
+{
+  const sideeffect_assign2t &a = to_sideeffect_assign2t(expr);
+  if (a.op == "assign" || is_shift_assignment(a.op))
+    return;
+  if (is_nil_expr(a.lhs) || is_nil_expr(a.rhs))
+    return;
+
+  if (is_complex_type(a.lhs->type) || is_complex_type(a.rhs->type))
+  {
+    lower_complex_compound_assignment(expr);
+    return;
+  }
+
+  const type2tc target = a.lhs->type;
+  expr2tc lhs = a.lhs, rhs = a.rhs;
+  c_implicit_typecast_arithmetic(lhs, rhs, ns);
+
+  if (lhs != a.lhs || rhs != a.rhs || expr->type != target)
+    expr = sideeffect_assign2tc(target, a.op, lhs, rhs, a.location);
 }
 
 /// IREP2 form of the `gen_typecast_bool` each of adjust_ifthenelse,
@@ -430,17 +900,18 @@ void clang_c_adjust_irep2::adjust_statement_condition(expr2tc &expr)
   else if (is_code_while2t(expr))
   {
     const code_while2t &w = to_code_while2t(expr);
-    expr = code_while2tc(cond, w.body, w.location);
+    expr = code_while2tc(cond, w.body, w.location, w.pragma_unroll_count);
   }
   else if (is_code_dowhile2t(expr))
   {
     const code_dowhile2t &w = to_code_dowhile2t(expr);
-    expr = code_dowhile2tc(cond, w.body, w.location);
+    expr = code_dowhile2tc(cond, w.body, w.location, w.pragma_unroll_count);
   }
   else
   {
     const code_for2t &f = to_code_for2t(expr);
-    expr = code_for2tc(f.init, cond, f.iter, f.body, f.location);
+    expr = code_for2tc(
+      f.init, cond, f.iter, f.body, f.location, f.pragma_unroll_count);
   }
 }
 
@@ -497,17 +968,13 @@ void clang_c_adjust_irep2::adjust_function_designators(expr2tc &expr)
 
 void clang_c_adjust_irep2::adjust_call_callee(expr2tc &expr)
 {
-  expr2tc callee;
-  if (is_code_function_call2t(expr))
-    callee = to_code_function_call2t(expr).function;
-  else
-  {
-    const sideeffect2t &se = to_sideeffect2t(expr);
-    if (se.kind != sideeffect_allockind::function_call)
-      return;
-    callee = se.operand;
-  }
+  const std::optional<call_view> call = as_call(expr);
+  if (!call)
+    return;
 
+  // A local copy of the callee, as the original kept, independent of the slot
+  // the write-backs below overwrite.
+  const expr2tc callee = *call->callee;
   if (is_nil_expr(callee))
     return;
 
@@ -516,47 +983,75 @@ void clang_c_adjust_irep2::adjust_call_callee(expr2tc &expr)
   // carries the same shape and is told apart only by the implicit bit (§100).
   if (is_address_of2t(callee) && to_address_of2t(callee).implicit)
   {
-    const expr2tc target = to_address_of2t(callee).ptr_obj;
-    if (is_code_function_call2t(expr))
-      to_code_function_call2t(expr).function = target;
-    else
-      to_sideeffect2t(expr).operand = target;
+    *call->callee = to_address_of2t(callee).ptr_obj;
     return;
   }
 
   if (!is_pointer_type(callee->type))
     return;
 
-  const expr2tc deref =
-    dereference2tc(to_pointer_type(callee->type).subtype, callee);
+  *call->callee = dereference2tc(to_pointer_type(callee->type).subtype, callee);
+}
 
-  if (is_code_function_call2t(expr))
-    to_code_function_call2t(expr).function = deref;
-  else
-    to_sideeffect2t(expr).operand = deref;
+/// True when \p arg is bound to parameter \p i of \p callee rather than
+/// converted to its type -- `va_start(ap, n)` hands the callee `&ap`.
+///
+/// `pointer_type2t` has no field for the `#reference` bit
+/// `clang_c_convertert::get_type` sets, so `migrate_type` drops it and the rule
+/// `c_typecastt::implicit_typecast_followed` applies on the legacy path cannot
+/// be stated against the IREP2 types. It survives on the symbol's legacy
+/// `typet`, which is what this reads -- the same route the implicit-callee arm
+/// above already takes to recover a base name. The rest of the conjunction is
+/// legacy's own precondition, kept whole so the two paths decide alike.
+///
+/// Whether a parameter is a reference is a property of the target, not of the
+/// callee's name: clang's `A` builtin-type code is an lvalue reference where
+/// `__builtin_va_list` is a pointer or a struct, and an already-decayed
+/// pointer where it is an array (x86-64 Linux). Reading the bit follows the
+/// target; a name test would take the address on both.
+static bool binds_by_reference(
+  const expr2tc &callee,
+  const expr2tc &arg,
+  const type2tc &param,
+  std::size_t i,
+  const contextt &context,
+  const namespacet &ns)
+{
+  // address_of2t asserts its operand is not another address_of, so a caller
+  // that already took the address is left alone.
+  if (is_address_of2t(arg) || !is_pointer_type(param) || arg->type == param)
+    return false;
+
+  // Both sides are followed: a `struct __va_list` va_list (aarch64) reaches
+  // here as a symbol type on the argument and a struct type under the
+  // parameter, and comparing them unfollowed misses the binding.
+  if (
+    ns.follow(to_pointer_type(param).subtype)->type_id !=
+    ns.follow(arg->type)->type_id)
+    return false;
+
+  if (!is_symbol2t(callee))
+    return false;
+
+  const symbolt *s = context.find_symbol(to_symbol2t(callee).thename);
+  if (s == nullptr || !s->get_type().is_code())
+    return false;
+
+  const code_typet::argumentst &decl = to_code_type(s->get_type()).arguments();
+  return i < decl.size() && is_lvalue_or_rvalue_reference(decl[i].type());
 }
 
 void clang_c_adjust_irep2::adjust_call_arguments(expr2tc &expr)
 {
-  expr2tc callee;
-  std::vector<expr2tc> *args;
-  if (is_code_function_call2t(expr))
-  {
-    code_function_call2t &call = to_code_function_call2t(expr);
-    callee = call.function;
-    args = &call.operands;
-  }
-  else
-  {
-    sideeffect2t &se = to_sideeffect2t(expr);
-    if (se.kind != sideeffect_allockind::function_call)
-      return;
-    callee = se.operand;
-    args = &se.arguments;
-  }
+  const std::optional<call_view> call = as_call(expr);
+  if (!call)
+    return;
 
+  const expr2tc &callee = *call->callee;
   if (is_nil_expr(callee))
     return;
+
+  std::vector<expr2tc> &args = *call->arguments;
 
   type2tc ct = callee->type;
   if (is_pointer_type(ct))
@@ -566,9 +1061,9 @@ void clang_c_adjust_irep2::adjust_call_arguments(expr2tc &expr)
 
   const std::vector<type2tc> &params = to_code_type(ct).arguments;
 
-  for (std::size_t i = 0; i < args->size(); i++)
+  for (std::size_t i = 0; i < args.size(); i++)
   {
-    expr2tc &arg = (*args)[i];
+    expr2tc &arg = args[i];
     if (is_nil_expr(arg))
       continue;
 
@@ -579,6 +1074,15 @@ void clang_c_adjust_irep2::adjust_call_arguments(expr2tc &expr)
       // conversion (§100.1).
       if (same_function_pointer_ignoring_argument_names(arg->type, params[i]))
         continue;
+
+      // Converted instead of bound, `va_start` gets the va_list's own value
+      // and the callee initialises whatever that value happens to point at.
+      if (binds_by_reference(callee, arg, params[i], i, context, ns))
+      {
+        arg = address_of2tc(arg->type, arg);
+        continue;
+      }
+
       c_implicit_typecast(arg, params[i], ns);
     }
     else if (is_array_type(ns.follow(arg->type)))
@@ -607,6 +1111,148 @@ static bool contains_sideeffect(const expr2tc &expr)
   expr->foreach_operand(
     [&found](const expr2tc &op) { found = found || contains_sideeffect(op); });
   return found;
+}
+
+/// An expression statement whose value has array type -- `y->ss;` where `y`
+/// points at a struct with an array member -- is rewritten to `&y->ss[0]`.
+/// clang_c_adjust does this because the dereference code does not assume such
+/// an object exists; the statement's value is unused, so taking the first
+/// element's address is free (clang_c_adjust_code.cpp:57-74).
+///
+/// An assignment operand is exempt there and here: the array is the assignment
+/// target, not a value being discarded.
+void clang_c_adjust_irep2::adjust_expression_statement(expr2tc &expr)
+{
+  const code_expression2t &stmt = to_code_expression2t(expr);
+  const expr2tc &op = stmt.operand;
+  if (is_nil_expr(op) || is_sideeffect_assign2t(op) || is_code_assign2t(op))
+    return;
+
+  const type2tc t = ns.follow(op->type);
+  if (!is_array_type(t) && !is_vector_type(t))
+    return;
+
+  const type2tc &elem =
+    is_array_type(t) ? to_array_type(t).subtype : to_vector_type(t).subtype;
+  expr = code_expression2tc(
+    address_of2tc(
+      elem, index2tc(elem, op, gen_zero(migrate_type(index_type())))),
+    stmt.location);
+}
+
+/// `*a` on an array is `a[0]` (C11 6.5.3.2p4 through the 6.3.2.1p3 decay), and
+/// clang_c_adjust::adjust_dereference rewrites it to that index. Left as a
+/// dereference the node reaches the encoder as a pointer built from an array
+/// rather than a named element, and it aborts there: `Unexpected type in
+/// int/ptr typecast`.
+///
+/// Legacy tests `is_array_like`, which also admits a vector; clang rejects
+/// `*v` on one ("indirection requires pointer operand"), so no input reaches
+/// that half and it is not reproduced here. Incomplete arrays need no arm of
+/// their own -- migrate_type gives them array_type2t with size_is_infinite.
+/// Not every shape aborts: `*"abc"` returned a wrong verdict instead.
+///
+/// Then: dereferencing a pointer to a function yields a function designator,
+/// which converts straight back to a pointer (C11 6.3.2.1p4) -- so `*f` is `f`,
+/// and `******f` too. Left bare, the code-typed dereference reaches a consumer
+/// that wants a pointer.
+///
+/// Legacy's remaining arm retypes the node to the pointer's subtype; the
+/// migration already builds that type, so no corpus input distinguishes it.
+void clang_c_adjust_irep2::adjust_dereference(expr2tc &expr)
+{
+  const expr2tc pointer = to_dereference2t(expr).value;
+  const type2tc op_type = ns.follow(pointer->type);
+
+  if (is_array_type(op_type))
+    expr = index2tc(
+      to_array_type(op_type).subtype,
+      pointer,
+      gen_zero(migrate_type(index_type())));
+
+  if (!is_code_type(expr->type))
+    return;
+
+  expr = address_of2tc(expr->type, expr, true);
+}
+
+/// IREP2 form of clang_c_adjust::lower_complex_compound_assignment. `a op= b`
+/// over a complex operand becomes `a = a op b`, with the binary node handed to
+/// adjust_complex_arith for the component-level decomposition. goto_convert's
+/// remove_assignment rebuilds the compound form long after adjustment, so a
+/// node left here reaches the SMT layer as a raw complex operator and the
+/// backend faults on it (#6713).
+void clang_c_adjust_irep2::lower_complex_compound_assignment(expr2tc &expr)
+{
+  const sideeffect_assign2t &a = to_sideeffect_assign2t(expr);
+
+  // adjust_complex_arith reads each operand twice, once per component, so a
+  // side-effecting target would be evaluated twice. Same decline as there.
+  if (contains_sideeffect(a.lhs))
+    return;
+
+  const type2tc &ct = a.lhs->type;
+
+  // `a *= 2.0f` leaves the scalar as-is, and the arithmetic node's consistency
+  // check rejects an operand narrower than its type before adjust_complex_arith
+  // gets to promote it. Promote here, the same way that function does.
+  expr2tc rhs = a.rhs;
+  if (!is_complex_type(rhs->type))
+    rhs = constant_struct2tc(
+      ct, std::vector<expr2tc>{rhs, gen_zero(to_complex_type(ct).subtype)});
+
+  expr2tc binop;
+  if (a.op == "assign+")
+    binop = add2tc(ct, a.lhs, rhs);
+  else if (a.op == "assign-")
+    binop = sub2tc(ct, a.lhs, rhs);
+  else if (a.op == "assign*")
+    binop = mul2tc(ct, a.lhs, rhs);
+  else if (a.op == "assign_div")
+    binop = div2tc(ct, a.lhs, rhs);
+  else
+    return;
+
+  const expr2tc before = binop;
+  adjust_complex_arith(binop);
+  // It declines on a side-effecting operand; leave the node rather than emit a
+  // plain assignment of an undecomposed complex operator.
+  if (binop == before)
+    return;
+
+  expr = sideeffect_assign2tc(ct, "assign", a.lhs, binop, a.location);
+}
+
+/// clang emits `ieee_*` for scalar float arithmetic itself, but hands over a
+/// plain `+`/`-`/`*`/`/` when the operands are vectors of float and leaves
+/// clang_c_adjust::adjust_float_arith to promote it. Unpromoted, the backend is
+/// handed a bitvector operator over a floating-point vector and aborts.
+///
+/// The legacy arm returns before attaching a rounding mode for a vector ("BUG:
+/// setting rounding_mode breaks migration"), and migrate_rounding_mode then
+/// synthesises the default symbol for the attribute-less node -- so the node
+/// the default path produces carries that symbol, and this builds the same one.
+void clang_c_adjust_irep2::adjust_vector_float_arith(expr2tc &expr)
+{
+  const type2tc t = ns.follow(expr->type);
+  if (!is_vector_type(t) || !is_floatbv_type(to_vector_type(t).subtype))
+    return;
+
+  const expr2tc &l = *expr->get_sub_expr(0);
+  const expr2tc &r = *expr->get_sub_expr(1);
+  if (is_nil_expr(l) || is_nil_expr(r))
+    return;
+
+  const expr2tc rm = symbol2tc(get_int32_type(), "c:@__ESBMC_rounding_mode");
+
+  if (is_add2t(expr))
+    expr = ieee_add2tc(expr->type, l, r, rm);
+  else if (is_sub2t(expr))
+    expr = ieee_sub2tc(expr->type, l, r, rm);
+  else if (is_mul2t(expr))
+    expr = ieee_mul2tc(expr->type, l, r, rm);
+  else if (is_div2t(expr))
+    expr = ieee_div2tc(expr->type, l, r, rm);
 }
 
 void clang_c_adjust_irep2::adjust_complex_arith(expr2tc &expr)
@@ -696,6 +1342,24 @@ void clang_c_adjust_irep2::adjust_complex_arith(expr2tc &expr)
   expr = constant_struct2tc(ct, std::vector<expr2tc>{re, im});
 }
 
+/// C11 6.5.3.3: the operand of unary `-` and `~` undergoes integer promotion,
+/// so a boolean one -- a comparison, `||` or `&&` -- becomes int. Left boolean
+/// it reaches the solver where a bitvector is wanted (#4078).
+void clang_c_adjust_irep2::promote_unary_bool_operand(expr2tc &expr)
+{
+  const expr2tc &op = *expr->get_sub_expr(0);
+  if (is_nil_expr(op) || !is_bool_type(op->type) || is_bool_type(expr->type))
+    return;
+
+  expr2tc promoted = op;
+  c_implicit_typecast(promoted, expr->type, ns);
+  if (promoted == op)
+    return;
+
+  expr = is_neg2t(expr) ? expr2tc(neg2tc(expr->type, promoted))
+                        : expr2tc(bitnot2tc(expr->type, promoted));
+}
+
 void clang_c_adjust_irep2::adjust_complex_unary(expr2tc &expr)
 {
   const expr2tc op = *expr->get_sub_expr(0);
@@ -717,28 +1381,79 @@ void clang_c_adjust_irep2::adjust_complex_unary(expr2tc &expr)
   expr = constant_struct2tc(ct, std::vector<expr2tc>{re, im});
 }
 
-void clang_c_adjust_irep2::declare_implicit_callee(const expr2tc &expr)
+void clang_c_adjust_irep2::declare_polymorphic_builtin(expr2tc &expr)
 {
-  // A bare `f(x);` statement is a sideeffect2t of kind function_call, not a
-  // code_function_call2t; both spellings reach here.
-  expr2tc callee;
-  locationt loc;
-  if (is_code_function_call2t(expr))
-  {
-    const code_function_call2t &call = to_code_function_call2t(expr);
-    callee = call.function;
-    loc = call.location;
-  }
-  else
-  {
-    const sideeffect2t &se = to_sideeffect2t(expr);
-    if (se.kind != sideeffect_allockind::function_call)
-      return;
-    callee = se.operand;
-  }
+  const std::optional<call_view> call = as_call(expr);
+  if (!call)
+    return;
 
+  const expr2tc callee = *call->callee;
   if (is_nil_expr(callee) || !is_symbol2t(callee))
     return;
+
+  // Location stays per site, not in the call view: both spellings carry one of
+  // their own; enclosing_location is the fallback for a sideeffect2t built
+  // without one (§136).
+  locationt loc = enclosing_location;
+  if (is_code_function_call2t(expr))
+    loc = to_code_function_call2t(expr).location;
+  else if (const locationt &l = to_sideeffect2t(expr).location; l.is_not_nil())
+    loc = l;
+
+  // Every arm of the matcher selects on argument *types* alone -- the first for
+  // the atomic/sync builtins, the last for the overflow and carry ones -- so
+  // the values need not cross the seam. A future arm that reads a value gets a
+  // nil operand and fails visibly rather than silently selecting wrong.
+  exprt::operandst arg_types;
+  arg_types.reserve(call->arguments->size());
+  for (const expr2tc &arg : *call->arguments)
+  {
+    if (is_nil_expr(arg))
+      return;
+    arg_types.emplace_back(exprt("nil", migrate_type_back(arg->type)));
+  }
+
+  const irep_idt id = to_symbol2t(callee).thename;
+
+  symbol_exprt legacy_callee(id, migrate_type_back(callee->type));
+  legacy_callee.name(get_pretty_name(id2string(id)));
+  legacy_callee.location() = loc;
+
+  const exprt poly = clang_c_adjust::declare_gcc_polymorphic_builtin(
+    legacy_callee, arg_types, loc, context);
+  if (poly.is_nil())
+    return;
+
+  expr2tc target;
+  migrate_expr(poly, target);
+  *call->callee = target;
+}
+
+void clang_c_adjust_irep2::declare_implicit_callee(
+  const expr2tc &expr,
+  const locationt &stmt_location)
+{
+  // A bare `f(x);` statement is a sideeffect2t of kind function_call, not a
+  // code_function_call2t; both spellings reach here. The const overload keeps
+  // this a read-only, non-detaching decode.
+  const std::optional<const_call_view> call = as_call(expr);
+  if (!call)
+    return;
+
+  const expr2tc &callee = *call->callee;
+  if (is_nil_expr(callee) || !is_symbol2t(callee))
+    return;
+
+  // Location stays per site. Both spellings now carry one of their own, so the
+  // caller's stmt_location is only a fallback for a sideeffect2t built without
+  // it -- and it is a lossy one: the statement names the statement, not the
+  // callee, so `int x = f(1);` would report the column of `int`, not of `f`
+  // (§110.3, §136).
+  locationt loc = stmt_location;
+  if (is_code_function_call2t(expr))
+    loc = to_code_function_call2t(expr).location;
+  else if (const locationt &l = to_sideeffect2t(expr).location; l.is_not_nil())
+    loc = l;
 
   const irep_idt id = to_symbol2t(callee).thename;
   if (context.find_symbol(id) != nullptr)

@@ -69,11 +69,19 @@ if(ESBMC_HAVE_UCHAR_H)
     list(APPEND ESBMC_TEST_CAPABILITIES uchar_h)
 endif()
 
-# --32 needs multi-arch headers whose type model agrees with the frontend's
-# under -m32. That holds on x86 hosts carrying the 32-bit headers; on aarch64
-# it does not, which is the case issue #1400 was filed about.
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|i[3-6]86)$")
+# --32 reads the bundled 32-bit libc that c2goto builds, not the host's own
+# headers, so the capability follows that build option rather than the host
+# CPU. Apple Silicon keeps it on and runs the --32 tests; the aarch64 Linux
+# build turns it off (scripts/build.sh), which is the case #1400 was filed
+# about.
+if(ESBMC_BUNDLE_LIBC AND ESBMC_BUNDLE_LIBC_32BIT)
     list(APPEND ESBMC_TEST_CAPABILITIES arch32)
+endif()
+
+# A test whose input is x86-only: clang's SSE/MMX intrinsic headers reject any
+# other target, and x86 asm register constraints do not compile there.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|i[3-6]86)$")
+    list(APPEND ESBMC_TEST_CAPABILITIES arch_x86)
 endif()
 
 if(ESBMC_BUNDLE_LIBC)
@@ -85,6 +93,25 @@ endif()
 # /esbmc-vfs libm source ever enters the goto program.
 if(NOT WIN32)
     list(APPEND ESBMC_TEST_CAPABILITIES bundled_libm)
+endif()
+
+# value_sett::to_expr materialises a descriptor's offset through the host's
+# `unsigned long` (gen_ulong), so a negative offset wraps at 32 bits on LLP64
+# and at 64 bits elsewhere. The two constants get opposite out-of-bounds
+# verdicts, so a test pinning either one holds on LP64 hosts only.
+include(CheckTypeSize)
+check_type_size("long" ESBMC_SIZEOF_LONG)
+if(ESBMC_SIZEOF_LONG EQUAL 8)
+    list(APPEND ESBMC_TEST_CAPABILITIES lp64_host)
+endif()
+
+# The per-test budget is long enough for a test that takes minutes to solve.
+# ESBMC_REGRESS_TIMEOUT is one global number, so a test needing more than a
+# short leg allows has no way to ask for more; without this it is reported as
+# a hard timeout on every PR. The PR workflow sets 120 (build-unix.yml), the
+# default is 1200.
+if(ESBMC_REGRESS_TIMEOUT GREATER_EQUAL 600)
+    list(APPEND ESBMC_TEST_CAPABILITIES long_timeout)
 endif()
 
 string(REPLACE ";" "," ESBMC_TEST_CAPABILITIES_ARG "${ESBMC_TEST_CAPABILITIES}")
@@ -208,6 +235,7 @@ endif()
 if(ENABLE_PYTHON_FRONTEND)
     set(REGRESSIONS_PYTHON python)
     set(REGRESSIONS_PYTHON_INTENSIVE python-intensive)
+    set(REGRESSIONS_CONSENSUS consensus)
     set(REGRESSIONS_MOPSA mopsa)
     set(REGRESSIONS_NUMPY numpy)
     set(REGRESSIONS_HUMANEVAL humaneval)
@@ -322,6 +350,7 @@ if(APPLE)
                     ${REGRESSIONS_CHERI}
                     ${REGRESSIONS_PYTHON}
                     ${REGRESSIONS_PYTHON_INTENSIVE}
+                    ${REGRESSIONS_CONSENSUS}
                     ${REGRESSIONS_MOPSA}
                     ${REGRESSIONS_NUMPY}
                     ${REGRESSIONS_HUMANEVAL}
@@ -397,6 +426,7 @@ else()
                     ${REGRESSIONS_CHERI}
                     ${REGRESSIONS_PYTHON}
                     ${REGRESSIONS_PYTHON_INTENSIVE}
+                    ${REGRESSIONS_CONSENSUS}
                     ${REGRESSIONS_MOPSA}
                     ${REGRESSIONS_NUMPY}
                     ${REGRESSIONS_HUMANEVAL}
@@ -588,10 +618,13 @@ set(_slow_regression_tests
     # "NameError: name 'Queue' is not defined" because aliased deque imports
     # were not resolved. With PR #5008 the alias fix and popleft/appendleft
     # support land, so ESBMC now reaches the real BFS symex (deque + set +
-    # 6-node graph), which does not converge under --incremental-bmc due to
-    # the __memcpy_impl loop in the list OM (string.c:278). These stay
-    # KNOWNBUG; the larger inner timeout lets testing_tool record the KNOWNBUG
-    # verdict instead of ctest hard-killing the run.
+    # 6-node graph). breadth_first_search still does not converge under
+    # --incremental-bmc, due to the __memcpy_impl loop in the list OM
+    # (string.c:278), and stays KNOWNBUG: the larger inner timeout lets
+    # testing_tool record the KNOWNBUG verdict instead of ctest hard-killing
+    # the run. breadth_first_search_fail is CORE since #7235 and reaches its
+    # VERIFICATION FAILED at ~123s on the DebugOpt Linux runner, so the 2x
+    # budget is what keeps it off the 120s cap -- removing it flaps the test.
     "regression/quixbugs/breadth_first_search"
     "regression/quixbugs/breadth_first_search_fail"
     # reverse_linked_list used to fast-crash with a SIGSEGV when comparing a
@@ -669,6 +702,12 @@ set(_slow_regression_tests
     # against the 120s cap and timed out on the DebugOpt Linux runner in
     # #7073 CI -- a comment-only change that cannot reach its code path.
     "regression/esbmc/github_4634"
+    # nn-tanh_5_unsafe is a single --boolector float query: 16.7s on x86_64 but
+    # over the 120s cap on aarch64, where the whole floats-regression suite runs
+    # ~3x slower while the rest of the suite matches x86 to within 5%. The
+    # Boolector aarch64 FP slowdown is tracked in #7308; the 2x budget keeps the
+    # armv8 leg green meanwhile.
+    "regression/floats-regression/nn-tanh_5_unsafe"
 )
 math(EXPR ESBMC_REGRESS_CTEST_TIMEOUT_SLOW
      "${ESBMC_REGRESS_TIMEOUT_SLOW} + 30")
