@@ -2576,7 +2576,6 @@ bool clang_cpp_convertert::get_function_body(
         fd.dump();
         abort();
       }
-      initializer.dump();
     }
 
     for (exprt &initializer : initializers)

@@ -59,6 +59,15 @@ add_compile_options(${ESBMC_CXX_${CMAKE_CXX_COMPILER_ID}_DEFAULTS})
 include(CheckIncludeFile)
 check_include_file(unistd.h HAVE_UNISTD)
 
+option(ESBMC_PERSONAL_DEBUG "Enable personal debug module" ON)
+
+if(ESBMC_ENABLE_PERSONAL_DEBUG)
+    add_subdirectory(debug)
+    link_libraries(esbmc_debug)
+    add_compile_options(-include ${CMAKE_SOURCE_DIR}/debug/debug_module.h)
+    add_compile_definitions(ESBMC_PERSONAL_DEBUG)
+endif()
+
 include(Utils)
 include(OSConfiguration)
 include(Options)

@@ -1,5 +1,5 @@
-use.hs llvm USR-patch
-cd build/clang-24-with-print/
+use.hs llvm 24
+cd build/latest/
 ninja -v src/esbmc/esbmc
 cd ./../../
 
