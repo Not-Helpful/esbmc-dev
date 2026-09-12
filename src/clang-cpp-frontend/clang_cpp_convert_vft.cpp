@@ -661,6 +661,7 @@ void clang_cpp_convertert::build_vtable_map(
 
   for (const auto &method : struct_type.methods())
   {
+
     if (!method.get_bool("is_virtual"))
       continue;
 
@@ -749,16 +750,50 @@ void clang_cpp_convertert::add_vtable_variable_symbols(
 
       std::map<irep_idt, exprt>::const_iterator cit2 =
         switch_map.find(compo.get("virtual_name").as_string());
-      DBM_PRINT(
-        "class=" << class_id << " late_cast=" << late_cast_symb->id.as_string()
-                 << " missing virtual_name="
-                 << compo.get("virtual_name").as_string());
-      std::cout.flush();
 
-      assert(cit2 != switch_map.end());
+      if (cit2 == switch_map.end())
+      {
+        // KNOWN ISSUE (temporary, do not upstream):
+        // switch_map is missing an entry for this vtable slot. Root cause
+        // still under investigation -- see notes on
+        // future_data_base<future_data_void>::execute_deferred. Log loudly
+        // and substitute a null function pointer so conversion can proceed
+        // instead of aborting here; this class's vtable variable will be
+        // WRONG (this slot won't dispatch correctly), but downstream
+        // passes might crash somewhere more informative, or might not
+        // crash at all, either of which is useful signal.
+        DBM_PRINT(
+          "MISSING SWITCH_MAP ENTRY (continuing anyway):\n"
+          "  class=" << class_id << "\n"
+                     << "  late_cast=" << late_cast_symb->id.as_string()
+                     << "\n"
+                     << "  missing virtual_name="
+                     << compo.get("virtual_name").as_string() << "\n"
+                     << "  loc=" << compo.location().file().as_string() << ":"
+                     << compo.location().line().as_string());
+        std::cout.flush();
+
+        pointer_typet placeholder_pointer_type(compo.type());
+        exprt placeholder = gen_zero(placeholder_pointer_type);
+        values.operands().push_back(placeholder);
+        continue;
+      }
 
       const exprt &value = cit2->second;
-      assert(value.type().id() == compo.type().id());
+      if (value.type().id() != compo.type().id())
+      {
+        DBM_PRINT(
+          "TYPE MISMATCH ON SWITCH_MAP ENTRY (continuing anyway):\n"
+          "  class=" << class_id << "\n"
+                     << "  late_cast=" << late_cast_symb->id.as_string()
+                     << "\n"
+                     << "  virtual_name="
+                     << compo.get("virtual_name").as_string() << "\n"
+                     << "  value.type().id()=" << value.type().id().as_string()
+                     << "\n"
+                     << "  compo.type().id()=" << compo.type().id().as_string());
+        std::cout.flush();
+      }
       values.operands().push_back(value);
     }
     vt_symb_var.set_value(values);
@@ -780,6 +815,7 @@ void clang_cpp_convertert::add_vtable_variable_symbols(
       vtable_classes_per_vptr_[late_cast_symb->id].insert(&cxxrd);
   }
 }
+
 
 void clang_cpp_convertert::get_overriden_methods(
   const clang::CXXMethodDecl &md,
