@@ -43,6 +43,9 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
   const clang::CXXRecordDecl &cxxrd,
   struct_typet &type)
 {
+  if (type.get("tag") == "struct &$&$&$&hpx::lcos::detail::future_data<void>")
+  {
+  }
   // Register cxxrd against any inherited vptr-class up front so that an
   // inline body containing dynamic_cast<cxxrd&>(base_ref) — converted by
   // the loop below — can match its own runtime type.
@@ -50,9 +53,13 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
 
   for (const auto &md : cxxrd.methods())
   {
+    if (type.get("tag") == "struct &$&$&$&hpx::lcos::detail::future_data<void>")
+    {
+      DBM_PRINT("FUTURE_DATA<VOID> METHOD:");
+      DBM_PRINT(md->getNameAsString());
+    }
     if (!md->isVirtual())
       continue;
-
     /*
      * 1. convert this virtual method and add them to class symbol type
      */
@@ -84,6 +91,9 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
     /*
      * 3. add an entry in the existing virtual table type symbol
      */
+    if (type.get("tag") == "struct &$&$&$&hpx::lcos::detail::future_data<void>")
+    {
+    }
     add_vtable_type_entry(type, comp, vtable_type_symbol);
 
     /*
@@ -661,7 +671,6 @@ void clang_cpp_convertert::build_vtable_map(
 
   for (const auto &method : struct_type.methods())
   {
-
     if (!method.get_bool("is_virtual"))
       continue;
 
@@ -764,13 +773,13 @@ void clang_cpp_convertert::add_vtable_variable_symbols(
         // crash at all, either of which is useful signal.
         DBM_PRINT(
           "MISSING SWITCH_MAP ENTRY (continuing anyway):\n"
-          "  class=" << class_id << "\n"
-                     << "  late_cast=" << late_cast_symb->id.as_string()
-                     << "\n"
-                     << "  missing virtual_name="
-                     << compo.get("virtual_name").as_string() << "\n"
-                     << "  loc=" << compo.location().file().as_string() << ":"
-                     << compo.location().line().as_string());
+          "  class="
+          << class_id << "\n"
+          << "  late_cast=" << late_cast_symb->id.as_string() << "\n"
+          << "  missing virtual_name=" << compo.get("virtual_name").as_string()
+          << "\n"
+          << "  loc=" << compo.location().file().as_string() << ":"
+          << compo.location().line().as_string());
         std::cout.flush();
 
         pointer_typet placeholder_pointer_type(compo.type());
@@ -784,14 +793,12 @@ void clang_cpp_convertert::add_vtable_variable_symbols(
       {
         DBM_PRINT(
           "TYPE MISMATCH ON SWITCH_MAP ENTRY (continuing anyway):\n"
-          "  class=" << class_id << "\n"
-                     << "  late_cast=" << late_cast_symb->id.as_string()
-                     << "\n"
-                     << "  virtual_name="
-                     << compo.get("virtual_name").as_string() << "\n"
-                     << "  value.type().id()=" << value.type().id().as_string()
-                     << "\n"
-                     << "  compo.type().id()=" << compo.type().id().as_string());
+          "  class="
+          << class_id << "\n"
+          << "  late_cast=" << late_cast_symb->id.as_string() << "\n"
+          << "  virtual_name=" << compo.get("virtual_name").as_string() << "\n"
+          << "  value.type().id()=" << value.type().id().as_string() << "\n"
+          << "  compo.type().id()=" << compo.type().id().as_string());
         std::cout.flush();
       }
       values.operands().push_back(value);
@@ -815,7 +822,6 @@ void clang_cpp_convertert::add_vtable_variable_symbols(
       vtable_classes_per_vptr_[late_cast_symb->id].insert(&cxxrd);
   }
 }
-
 
 void clang_cpp_convertert::get_overriden_methods(
   const clang::CXXMethodDecl &md,

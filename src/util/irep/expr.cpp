@@ -1,5 +1,4 @@
-#include <cassert>
-#include <cstdlib>
+#include <cassert> #include <cstdlib>
 #include <util/irep/expr.h>
 #include <util/arith/fixedbv.h>
 #include <util/arith/ieee_float.h>
