@@ -53,11 +53,6 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
 
   for (const auto &md : cxxrd.methods())
   {
-    if (type.get("tag") == "struct &$&$&$&hpx::lcos::detail::future_data<void>")
-    {
-      DBM_PRINT("FUTURE_DATA<VOID> METHOD:");
-      DBM_PRINT(md->getNameAsString());
-    }
     if (!md->isVirtual())
       continue;
     /*
@@ -91,10 +86,13 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
     /*
      * 3. add an entry in the existing virtual table type symbol
      */
-    if (type.get("tag") == "struct &$&$&$&hpx::lcos::detail::future_data<void>")
-    {
-    }
     add_vtable_type_entry(type, comp, vtable_type_symbol);
+
+    if (md->getNameAsString().find("execute_deferred") != std::string::npos)
+    {
+      DBM_PRINT("EXECUTE_DEFERRED METHOD:");
+      vtable_type_symbol->dump(); 
+    }
 
     /*
      * 4. deal with overriding method
