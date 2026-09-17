@@ -43,9 +43,8 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
   const clang::CXXRecordDecl &cxxrd,
   struct_typet &type)
 {
-  if (type.get("tag") == "struct &$&$&$&hpx::lcos::detail::future_data<void>")
-  {
-  }
+  // DBM_PRINT("LOOK HERE:");
+  // type.dump();
   // Register cxxrd against any inherited vptr-class up front so that an
   // inline body containing dynamic_cast<cxxrd&>(base_ref) — converted by
   // the loop below — can match its own runtime type.
@@ -53,6 +52,10 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
 
   for (const auto &md : cxxrd.methods())
   {
+    if (md->getNameAsString() == "func")
+    {
+
+    }      
     if (!md->isVirtual())
       continue;
     /*
@@ -88,12 +91,6 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
      */
     add_vtable_type_entry(type, comp, vtable_type_symbol);
 
-    if (md->getNameAsString().find("execute_deferred") != std::string::npos)
-    {
-      DBM_PRINT("EXECUTE_DEFERRED METHOD:");
-      vtable_type_symbol->dump(); 
-    }
-
     /*
      * 4. deal with overriding method
      */
@@ -112,6 +109,19 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
         add_thunk_method(overriden_md_entry.second, comp, type);
     }
   }
+  // if (
+  //   type.get("tag") ==
+  //   "struct &$&$&$&hpx::lcos::detail::future_data<hpx::future<void>>")
+  // {
+  //   DBM_PRINT("TEST");
+  //   type.dump();
+  //   const symbolt *v = ns.lookup(
+  //     "virtual_table::"
+  //     "tag-struct "
+  //     "&$&$&$&hpx::lcos::detail::future_data_base<hpx::traits::detail::future_"
+  //     "data_void>");
+  //   v->dump();
+  // }
 
   /*
    * Set up virtual function table(vft) variable symbols

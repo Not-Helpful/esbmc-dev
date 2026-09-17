@@ -513,6 +513,8 @@ bool clang_cpp_convertert::get_struct_union_class_methods_decls(
   const clang::RecordDecl &recordd,
   typet &type)
 {
+  DBM_PRINT("TEST2");  
+  type.dump();  
   // Note: If a struct is defined inside an extern C, it will be a RecordDecl
 
   const clang::CXXRecordDecl *cxxrd =
