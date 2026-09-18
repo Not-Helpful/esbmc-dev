@@ -281,8 +281,9 @@ void clang_cpp_convertert::get_decl_name(
      * instantiation share an id and the last body converted wins (#7499); the
      * closure's own id is already unique (#6976). Constructors take the case
      * above and need none -- their USR spells the class "(lambda at f:l:c)". */
-    if (const auto *md = llvm::dyn_cast<clang::CXXMethodDecl>(&nd);
-        md && md->getParent()->isLambda())
+    if (
+      const auto *md = llvm::dyn_cast<clang::CXXMethodDecl>(&nd);
+      md && md->getParent()->isLambda())
     {
       std::string closure_name, closure_id;
       get_decl_name(*md->getParent(), closure_name, closure_id);
@@ -480,6 +481,34 @@ bool clang_cpp_convertert::get_struct_union_class_fields(
       base_map bases;
       if (get_base_map(*cxxrd, bases))
         return true;
+
+      // Only dump when we're processing future_data<future<void>> specifically
+      // -- avoids flooding output with every other class's base_map.
+      std::string cxxrd_name = cxxrd->getNameAsString();
+      if (cxxrd_name == "future_data")
+      {
+        DBM_PRINT("BASE_MAP DUMP for future_data instantiation:");
+        for (const auto &entry : bases)
+        {
+          DBM_PRINT("  base class_id=" << entry.first);
+          const symbolt *bs = context.find_symbol(entry.first);
+          if (!bs)
+          {
+            DBM_PRINT("    (no symbol found for this base_id!)");
+            continue;
+          }
+          const struct_typet &bt = to_struct_type(bs->get_type());
+          DBM_PRINT("    methods count=" << bt.methods().size());
+          for (const auto &m : bt.methods())
+          {
+            DBM_PRINT(
+              "      method: " << m.get_name()
+                               << " virtual_name=" << m.get("virtual_name"));
+          }
+        }
+        std::cout.flush();
+      }
+
       get_base_components_methods(
         bases, type, cxxrd->getNumVBases() > 0, *cxxrd);
     }
@@ -513,8 +542,8 @@ bool clang_cpp_convertert::get_struct_union_class_methods_decls(
   const clang::RecordDecl &recordd,
   typet &type)
 {
-  DBM_PRINT("TEST2");  
-  type.dump();  
+  DBM_PRINT("TEST2");
+  type.dump();
   // Note: If a struct is defined inside an extern C, it will be a RecordDecl
 
   const clang::CXXRecordDecl *cxxrd =
@@ -2008,13 +2037,13 @@ bool clang_cpp_convertert::build_destructor_chain(
   };
 
   // Cast `this` to the base's expected pointer type and emit the call.
-  auto emit_base_dtor =
-    [&](const symbolt &sym, const clang::CXXRecordDecl *rec) {
-      exprt this_expr = base_dtor_this(*rec, deref, this_id, this_ptr_type);
-      gen_typecast(
-        ns, this_expr, to_code_type(sym.get_type()).arguments().front().type());
-      emit_dtor_call(sym, std::move(this_expr));
-    };
+  auto emit_base_dtor = [&](const symbolt &sym, const clang::CXXRecordDecl *rec)
+  {
+    exprt this_expr = base_dtor_this(*rec, deref, this_id, this_ptr_type);
+    gen_typecast(
+      ns, this_expr, to_code_type(sym.get_type()).arguments().front().type());
+    emit_dtor_call(sym, std::move(this_expr));
+  };
 
   // 1. Member subobjects, reverse declaration order (C++ [class.dtor]/9).
   llvm::SmallVector<const clang::FieldDecl *, 8> fields(parent->fields());
@@ -2386,7 +2415,6 @@ bool clang_cpp_convertert::get_function_body(
         if (wrap_bitfield_type_if_needed(*member_decl, member.type()))
           return true;
 
-
         // A member of an anonymous union/struct is not a component of the
         // enclosing class: the anonymous field is, and the member sits inside
         // it. IndirectFieldDecl::chain() runs outermost-first and ends at the
@@ -2418,7 +2446,8 @@ bool clang_cpp_convertert::get_function_body(
         else
           build_member_from_component(fd, member);
 
-        // set #member_init flag again, as it has been cleared between the first call...
+        // set #member_init flag again, as it has been cleared between the first
+        // call...
         member.set("#member_init", 1);
 
         exprt rhs;
