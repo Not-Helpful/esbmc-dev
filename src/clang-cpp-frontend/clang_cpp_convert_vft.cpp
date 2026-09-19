@@ -43,8 +43,6 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
   const clang::CXXRecordDecl &cxxrd,
   struct_typet &type)
 {
-  // DBM_PRINT("LOOK HERE:");
-  // type.dump();
   // Register cxxrd against any inherited vptr-class up front so that an
   // inline body containing dynamic_cast<cxxrd&>(base_ref) — converted by
   // the loop below — can match its own runtime type.
@@ -54,8 +52,7 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
   {
     if (md->getNameAsString() == "func")
     {
-
-    }      
+    }
     if (!md->isVirtual())
       continue;
     /*
@@ -677,8 +674,13 @@ void clang_cpp_convertert::build_vtable_map(
    * This table will be used to create the vtable variable symbols.
    */
 
+  DBM_PRINT("STRUCT_DUMP:");
+  struct_type.dump();
   for (const auto &method : struct_type.methods())
   {
+    DBM_PRINT("METHOD:");
+    DBM_PRINT(method.get_name());
+
     if (!method.get_bool("is_virtual"))
       continue;
 
@@ -709,6 +711,7 @@ void clang_cpp_convertert::build_vtable_map(
       value_map[virtual_name] = address;
     }
   }
+    DBM_PRINT("END!");
 }
 
 void clang_cpp_convertert::add_vtable_variable_symbols(
@@ -779,12 +782,14 @@ void clang_cpp_convertert::add_vtable_variable_symbols(
         // WRONG (this slot won't dispatch correctly), but downstream
         // passes might crash somewhere more informative, or might not
         // crash at all, either of which is useful signal.
+        //
         DBM_PRINT(
           "MISSING SWITCH_MAP ENTRY (continuing anyway):\n"
           "  class="
           << class_id << "\n"
           << "  late_cast=" << late_cast_symb->id.as_string() << "\n"
-          << "  missing virtual_name=" << compo.get("virtual_name").as_string()
+          << "  missing virtual_name=" <<
+          compo.get("virtual_name").as_string()
           << "\n"
           << "  loc=" << compo.location().file().as_string() << ":"
           << compo.location().line().as_string());
@@ -804,7 +809,8 @@ void clang_cpp_convertert::add_vtable_variable_symbols(
           "  class="
           << class_id << "\n"
           << "  late_cast=" << late_cast_symb->id.as_string() << "\n"
-          << "  virtual_name=" << compo.get("virtual_name").as_string() << "\n"
+          << "  virtual_name=" << compo.get("virtual_name").as_string() <<
+          "\n"
           << "  value.type().id()=" << value.type().id().as_string() << "\n"
           << "  compo.type().id()=" << compo.type().id().as_string());
         std::cout.flush();

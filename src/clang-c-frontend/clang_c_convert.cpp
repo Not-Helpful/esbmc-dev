@@ -315,6 +315,11 @@ bool clang_c_convertert::get_decl(const clang::Decl &decl, exprt &new_expr)
 
 bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
 {
+  // auto loc = rd.getLocation();
+
+  // if (loc.printToString().contains("future_data.cpp"))
+  //   rd.dump();
+
   if (rd.isInterface())
   {
     log_error("Interface is not supported");
@@ -465,9 +470,11 @@ bool clang_c_convertert::get_struct_union_class_fields(
 }
 
 bool clang_c_convertert::get_struct_union_class_methods_decls(
-  const clang::RecordDecl &,
+  const clang::RecordDecl &rd,
   typet &)
 {
+    return false;
+ 
   // We don't add methods or static members to the struct in C
   return false;
 }
