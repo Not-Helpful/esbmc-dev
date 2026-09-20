@@ -5027,12 +5027,12 @@ void clang_c_convertert::get_decl_name(
     }
     else
 #if CLANG_VERSION_MAJOR >= 22
-      name = rd.getKindName().str() + " " + "&$&$&$&" +
+      name = rd.getKindName().str() + " " +
              getFullyQualifiedName(
                ASTContext->getTypeDeclType(llvm::cast<clang::TypeDecl>(&rd)),
                *ASTContext);
 #else
-      name = "&$&$&$&" + getFullyQualifiedName(
+      name = getFullyQualifiedName(
                            ASTContext->getTagDeclType(&rd), *ASTContext);
 #endif
 
