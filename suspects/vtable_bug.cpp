@@ -27,12 +27,16 @@
 
 
 int printf(char *, ...);
+struct D
+{
+  virtual void func2();
+};
 
 template <typename T>
 struct A;  
 
 template<>
-struct A<void>
+struct A<void> : D
 {
   int one;
   virtual void func();
@@ -48,6 +52,7 @@ template <typename T>
 struct B : A<T>
 {
 };
+
 
 template <typename T>
 struct C : B<T>

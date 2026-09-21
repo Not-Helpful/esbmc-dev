@@ -337,6 +337,7 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
   // Check if the symbol is already added to the context, do nothing if it is
   // already in the context.
   symbolt *sym = context.find_symbol(id);
+
   if (!sym)
   {
     /* First put a symbol with a incomplete type into the context, then resolve
@@ -367,6 +368,25 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     // method.
 
     sym = context.move_symbol_to_context(symbol);
+    if (
+      sym->get_type().get("tag") ==
+      "struct "
+      "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
+      "void>")
+    {
+      DBM_PRINT("find_symbol FAIL");
+    }
+  }
+  else
+  {
+    if (
+      sym->get_type().get("tag") ==
+      "struct "
+      "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
+      "void>")
+    {
+      DBM_PRINT("find_symbol PASS");
+    }
   }
 
   assert(sym->is_type);
@@ -397,18 +417,17 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     sym->get_type().id() != "incomplete_struct")
     return false;
   {
+    if (
+      sym->get_type().get("tag") ==
+      "struct "
+      "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
+      "void>")
+    {
+      DBM_PRINT("SUSPECT INCOMPLETE");
+    }
     typet t = sym->get_type();
     t.remove(irept::a_incomplete);
     sym->set_type(std::move(t));
-  }
-
-  if (
-    sym->get_type().get("tag") ==
-    "struct "
-    "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
-    "void>")
-  {
-    DBM_PRINT("SUSPECT SPOTTED");
   }
 
   clang::RecordDecl *rd_def = rd.getDefinition();
