@@ -673,13 +673,10 @@ void clang_cpp_convertert::build_vtable_map(
    * This is the virtual function table for this class.
    * This table will be used to create the vtable variable symbols.
    */
-
-  DBM_PRINT("STRUCT_DUMP:");
-  struct_type.dump();
   for (const auto &method : struct_type.methods())
   {
-    DBM_PRINT("METHOD:");
-    DBM_PRINT(method.get_name());
+    // DBM_PRINT("METHOD:");
+    // DBM_PRINT(method.get_name());
 
     if (!method.get_bool("is_virtual"))
       continue;
@@ -711,7 +708,7 @@ void clang_cpp_convertert::build_vtable_map(
       value_map[virtual_name] = address;
     }
   }
-    DBM_PRINT("END!");
+    // DBM_PRINT("END!");
 }
 
 void clang_cpp_convertert::add_vtable_variable_symbols(

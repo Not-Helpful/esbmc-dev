@@ -345,6 +345,8 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     t.location() = location_begin;
     t.incomplete(true); /* for now just a declaration */
     t.tag(name);
+    // DBM_PRINT("ADDING INCOMPLETE SYM:");
+    // DBM_PRINT("NAME: " << name);
 
     symbolt symbol;
     get_default_symbol(
@@ -368,6 +370,10 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
   }
 
   assert(sym->is_type);
+
+  // DBM_COMMENT:
+  // CHASING:
+  // hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_void>
 
   // TODO: Fix me when we have a test case using C++ union.
   //       A C++ union can have member functions but not virtual functions.
@@ -396,6 +402,15 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     sym->set_type(std::move(t));
   }
 
+  if (
+    sym->get_type().get("tag") ==
+    "struct "
+    "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
+    "void>")
+  {
+    DBM_PRINT("SUSPECT SPOTTED");
+  }
+
   clang::RecordDecl *rd_def = rd.getDefinition();
   assert(rd_def);
 
@@ -409,10 +424,40 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
   // We have to add fields before methods as the fields are likely to be used
   // in the methods
   if (get_struct_union_class_fields(*rd_def, t))
+  {
+    if (
+      sym->get_type().get("tag") ==
+      "struct "
+      "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
+      "void>")
+    {
+      DBM_PRINT("FAILED get_struct_union_class_fields(*rd_def, t)");
+    }
     return true;
+  }
+
+  if (
+    sym->get_type().get("tag") ==
+    "struct "
+    "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
+    "void>")
+  {
+    DBM_PRINT("AFTER get_struct_union_class_fields(*rd_def, t)");
+    t.dump();
+  }
 
   if (process_record_layout_attributes(*rd_def, t))
     return true;
+
+  if (
+    sym->get_type().get("tag") ==
+    "struct "
+    "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
+    "void>")
+  {
+    DBM_PRINT("AFTER process_record_layout_attributes(*rd_def, t)");
+    t.dump();
+  }
 
   /* We successfully constructed the type of this symbol; complete the
    * incomplete-type symbol with the now-complete type definition, in place.
@@ -435,6 +480,15 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     typet t = sym->get_type();
     if (get_struct_union_class_methods_decls(*rd_def, t))
     {
+      if (
+        sym->get_type().get("tag") ==
+        "struct "
+        "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
+        "void>")
+      {
+        DBM_PRINT("AFTER get_struct_union_class_methods_decls(*rd_def, t)");
+        t.dump();
+      }
       sym->set_type(std::move(t));
       return true;
     }
@@ -473,8 +527,8 @@ bool clang_c_convertert::get_struct_union_class_methods_decls(
   const clang::RecordDecl &rd,
   typet &)
 {
-    return false;
- 
+  return false;
+
   // We don't add methods or static members to the struct in C
   return false;
 }
@@ -5032,8 +5086,8 @@ void clang_c_convertert::get_decl_name(
                ASTContext->getTypeDeclType(llvm::cast<clang::TypeDecl>(&rd)),
                *ASTContext);
 #else
-      name = getFullyQualifiedName(
-                           ASTContext->getTagDeclType(&rd), *ASTContext);
+      name =
+        getFullyQualifiedName(ASTContext->getTagDeclType(&rd), *ASTContext);
 #endif
 
     id = "tag-" + name;
@@ -5074,11 +5128,11 @@ void clang_c_convertert::get_decl_name(
 #include <iostream>
   clang::SmallString<128> DeclUSR;
 
-  //#if LLVM_VERSION_MAJOR >= 23
+  // #if LLVM_VERSION_MAJOR >= 23
   bool failed = clang::index::generateUSRForDecl(&nd, DeclUSR);
-  //#else
-  //bool failed = clang::index::generateUSRForDecl(&nd, DeclUSR);
-  //#endif
+  // #else
+  // bool failed = clang::index::generateUSRForDecl(&nd, DeclUSR);
+  // #endif
 
   if (!failed)
   {
