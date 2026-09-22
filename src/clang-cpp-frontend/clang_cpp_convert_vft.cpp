@@ -47,18 +47,23 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
   // inline body containing dynamic_cast<cxxrd&>(base_ref) — converted by
   // the loop below — can match its own runtime type.
   pre_register_inherited_vtables(cxxrd);
+  // if (
+  //   type.get("tag") ==
+  //   "struct "
+  //   "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
+  //   "void>")
+  // {
+  // }
 
   for (const auto &md : cxxrd.methods())
   {
-    if (md->getNameAsString() == "func")
-    {
-    }
     if (!md->isVirtual())
       continue;
     /*
      * 1. convert this virtual method and add them to class symbol type
      */
     struct_typet::componentt comp;
+
     if (get_decl(*md, comp))
       return true;
 
@@ -91,6 +96,7 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
     /*
      * 4. deal with overriding method
      */
+
     if (md->begin_overridden_methods() != md->end_overridden_methods())
     {
       /*
@@ -100,30 +106,35 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
        * method in each level.
        */
       overriden_map cxxmethods_overriden;
+      if (
+        type.get("tag") ==
+        "struct "
+        "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
+        "void>")
+      {
+        DBM_PRINT("TEST1");
+      }
       get_overriden_methods(*md, cxxmethods_overriden);
 
       for (const auto &overriden_md_entry : cxxmethods_overriden)
         add_thunk_method(overriden_md_entry.second, comp, type);
+
+      if (
+        type.get("tag") ==
+        "struct "
+        "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
+        "void>")
+      {
+        DBM_PRINT("TEST2");
+      }
     }
   }
-  // if (
-  //   type.get("tag") ==
-  //   "struct &$&$&$&hpx::lcos::detail::future_data<hpx::future<void>>")
-  // {
-  //   DBM_PRINT("TEST");
-  //   type.dump();
-  //   const symbolt *v = ns.lookup(
-  //     "virtual_table::"
-  //     "tag-struct "
-  //     "&$&$&$&hpx::lcos::detail::future_data_base<hpx::traits::detail::future_"
-  //     "data_void>");
-  //   v->dump();
-  // }
 
   /*
    * Set up virtual function table(vft) variable symbols
    * Each vft is modelled as a struct of function pointers.
    */
+
   setup_vtable_struct_variables(cxxrd, type);
 
   return false;
@@ -708,7 +719,7 @@ void clang_cpp_convertert::build_vtable_map(
       value_map[virtual_name] = address;
     }
   }
-    // DBM_PRINT("END!");
+  // DBM_PRINT("END!");
 }
 
 void clang_cpp_convertert::add_vtable_variable_symbols(
@@ -785,8 +796,7 @@ void clang_cpp_convertert::add_vtable_variable_symbols(
           "  class="
           << class_id << "\n"
           << "  late_cast=" << late_cast_symb->id.as_string() << "\n"
-          << "  missing virtual_name=" <<
-          compo.get("virtual_name").as_string()
+          << "  missing virtual_name=" << compo.get("virtual_name").as_string()
           << "\n"
           << "  loc=" << compo.location().file().as_string() << ":"
           << compo.location().line().as_string());
@@ -806,8 +816,7 @@ void clang_cpp_convertert::add_vtable_variable_symbols(
           "  class="
           << class_id << "\n"
           << "  late_cast=" << late_cast_symb->id.as_string() << "\n"
-          << "  virtual_name=" << compo.get("virtual_name").as_string() <<
-          "\n"
+          << "  virtual_name=" << compo.get("virtual_name").as_string() << "\n"
           << "  value.type().id()=" << value.type().id().as_string() << "\n"
           << "  compo.type().id()=" << compo.type().id().as_string());
         std::cout.flush();

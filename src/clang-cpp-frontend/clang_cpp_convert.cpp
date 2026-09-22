@@ -463,8 +463,6 @@ bool clang_cpp_convertert::get_struct_union_class(const clang::RecordDecl &rd)
   // Only convert RecordDecl not depending on a template parameter
   if (rd.isDependentContext())
   {
-    DBM_PRINT("clang_cpp_convertert::get_struct_union_class");
-    DBM_PRINT("Determined that " << rd.getNameAsString() << "is dependent");
     return false;
   }
 
@@ -487,22 +485,6 @@ bool clang_cpp_convertert::get_struct_union_class_fields(
         base_map bases;
         if (get_base_map(*cxxrd, bases))
           return true;
-
-        // DBM_PRINT("base_map for class:");
-        // for (const auto &entry : bases)
-        // {
-        //   DBM_PRINT("  base class_id=" << entry.first);
-        //   const symbolt *bs = context.find_symbol(entry.first);
-        //   if (!bs)
-        //   {
-        //     DBM_PRINT("    (no symbol found for this base_id!)");
-        //     continue;
-        //   }
-        //   const struct_typet &bt = to_struct_type(bs->get_type());
-        //   DBM_PRINT("    methods count=" << bt.methods().size());
-        //   for (const auto &m : bt.methods())
-        //     DBM_PRINT("      method: " << m.get_name());
-        // }
 
         get_base_components_methods(
           bases, type, cxxrd->getNumVBases() > 0, *cxxrd);
@@ -561,44 +543,10 @@ bool clang_cpp_convertert::get_struct_union_class_methods_decls(
     if (get_struct_class_virtual_methods(*cxxrd, to_struct_type(type)))
       return true;
   }
-  // CLASS NAMES
-  // base class_id=tag-struct &$&$&$&hpx::lcos::detail::future_data_refcnt_base
-  //   methods count=0
-  // base class_id=tag-struct
-  // &$&$&$&hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_void>
-  //   methods count=0
-  // base class_id=tag-struct
-  // &$&$&$&hpx::lcos::detail::future_data_base<hpx::future<void>>
-
-  // if (recordd.getNameAsString() == "future_data_base")
-  // {
-  //   DBM_PRINT("DUMP:");
-  //   cxxrd->dump();
-  //   DBM_PRINT("END!");
-  // }
 
   // Iterate over the declarations stored in this context
   for (const auto &decl : cxxrd->decls())
   {
-    // if (recordd.getNameAsString() == "future_data_base")
-    // {
-    //   DBM_PRINT(decl->getDeclKindName());
-
-    //   if (const auto *named = llvm::dyn_cast<clang::NamedDecl>(decl))
-    //   {
-    //     DBM_PRINT(named->getNameAsString());
-    //     DBM_PRINT(named->getQualifiedNameAsString());
-    //   }
-    // }
-
-    // if (const auto *named = llvm::dyn_cast<clang::NamedDecl>(decl))
-    // {
-    //     DBM_PRINT("CLASS: " << cxxrd->getNameAsString());
-    //     DBM_PRINT(named->getNameAsString());
-    //     DBM_PRINT(named->getQualifiedNameAsString());
-    //     DBM_PRINT("END");
-    // }
-
     // Fields were already added
     if (decl->getKind() == clang::Decl::Field)
       continue;

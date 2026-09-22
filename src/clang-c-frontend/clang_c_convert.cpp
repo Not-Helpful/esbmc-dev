@@ -315,11 +315,6 @@ bool clang_c_convertert::get_decl(const clang::Decl &decl, exprt &new_expr)
 
 bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
 {
-  // auto loc = rd.getLocation();
-
-  // if (loc.printToString().contains("future_data.cpp"))
-  //   rd.dump();
-
   if (rd.isInterface())
   {
     log_error("Interface is not supported");
@@ -328,6 +323,15 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
 
   std::string id, name;
   get_decl_name(rd, name, id);
+
+  if (
+    name ==
+    "struct "
+    "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
+    "void>")
+  {
+    DBM_PRINT("SUSPECT SPOTTED");
+  }
 
   locationt location_begin;
   get_location_from_decl(rd, location_begin);
@@ -346,8 +350,6 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     t.location() = location_begin;
     t.incomplete(true); /* for now just a declaration */
     t.tag(name);
-    // DBM_PRINT("ADDING INCOMPLETE SYM:");
-    // DBM_PRINT("NAME: " << name);
 
     symbolt symbol;
     get_default_symbol(
@@ -368,6 +370,7 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     // method.
 
     sym = context.move_symbol_to_context(symbol);
+
     if (
       sym->get_type().get("tag") ==
       "struct "
@@ -391,10 +394,6 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
 
   assert(sym->is_type);
 
-  // DBM_COMMENT:
-  // CHASING:
-  // hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_void>
-
   // TODO: Fix me when we have a test case using C++ union.
   //       A C++ union can have member functions but not virtual functions.
   //       Just use struct_typet for C++?
@@ -406,7 +405,17 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
    *    definition and up to this definition has not been defined, yet.
    */
   if (!rd.isCompleteDefinition())
+  {
+    if (
+      sym->get_type().get("tag") ==
+      "struct "
+      "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
+      "void>")
+    {
+      DBM_PRINT("!rd.isCompleteDefinition() LEAVING EARLY");
+    }
     return false;
+  }
 
   /* Don't continue if it's not incomplete; use the .incomplete() flag to avoid
    * infinite recursion if the type we're defining refers to itself
@@ -415,7 +424,6 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
   if (
     !sym->get_type().incomplete() &&
     sym->get_type().id() != "incomplete_struct")
-    return false;
   {
     if (
       sym->get_type().get("tag") ==
@@ -423,11 +431,25 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
       "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
       "void>")
     {
-      DBM_PRINT("SUSPECT INCOMPLETE");
+      DBM_PRINT("SUSPECT COMPLETE LEAVING EARLY");
+      sym->get_type().dump();
     }
+    return false;
+  }
+
+  {
     typet t = sym->get_type();
     t.remove(irept::a_incomplete);
     sym->set_type(std::move(t));
+  }
+
+  if (
+    sym->get_type().get("tag") ==
+    "struct "
+    "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
+    "void>")
+  {
+    DBM_PRINT("SUSPECT INCOMPLETE");
   }
 
   clang::RecordDecl *rd_def = rd.getDefinition();
@@ -442,6 +464,11 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
 
   // We have to add fields before methods as the fields are likely to be used
   // in the methods
+
+  // recurse here:
+  // first recurse no fail.
+  // Second recurse, action:
+  // //
   if (get_struct_union_class_fields(*rd_def, t))
   {
     if (
@@ -505,11 +532,20 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
         "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
         "void>")
       {
-        DBM_PRINT("AFTER get_struct_union_class_methods_decls(*rd_def, t)");
+        DBM_PRINT("FAILED get_struct_union_class_methods_decls(*rd_def, t)");
         t.dump();
       }
       sym->set_type(std::move(t));
       return true;
+    }
+    if (
+      sym->get_type().get("tag") ==
+      "struct "
+      "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
+      "void>")
+    {
+      DBM_PRINT("PASSED get_struct_union_class_methods_decls(*rd_def, t)");
+      t.dump();
     }
     sym->set_type(std::move(t));
   }
@@ -546,8 +582,6 @@ bool clang_c_convertert::get_struct_union_class_methods_decls(
   const clang::RecordDecl &rd,
   typet &)
 {
-  return false;
-
   // We don't add methods or static members to the struct in C
   return false;
 }
