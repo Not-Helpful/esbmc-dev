@@ -315,6 +315,7 @@ bool clang_c_convertert::get_decl(const clang::Decl &decl, exprt &new_expr)
 
 bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
 {
+  DBM_PRINT(rd.getNameAsString());
   if (rd.isInterface())
   {
     log_error("Interface is not supported");
@@ -824,7 +825,13 @@ bool clang_c_convertert::get_function(
 
   // Return type
   if (get_type(fd.getReturnType(), type.return_type()))
+  {
+    if (fd.getNameAsString()=="get_result_void")
+    {
+      DBM_PRINT("RECURSION");
+    }
     return true;
+  }
 
   if (fd.isVariadic())
     type.make_ellipsis();
@@ -1082,6 +1089,7 @@ bool clang_c_convertert::get_type(
   const clang::QualType &q_type,
   typet &new_type)
 {
+
   const clang::Type *the_type = q_type.getTypePtrOrNull();
   assert(the_type);
   if (get_type(*the_type, new_type))
@@ -1106,6 +1114,7 @@ bool clang_c_convertert::get_type(
 
 bool clang_c_convertert::get_type(const clang::Type &the_type, typet &new_type)
 {
+  DBM_PRINT("get_type: "<<the_type.getTypeClassName());
   switch (the_type.getTypeClass())
   {
   // Builtin types like integer
@@ -1312,8 +1321,16 @@ bool clang_c_convertert::get_type(const clang::Type &the_type, typet &new_type)
     const clang::TypedefType &pt =
       static_cast<const clang::TypedefType &>(the_type);
 
+
     clang::QualType q_typedef_type =
       pt.getDecl()->getUnderlyingType().getCanonicalType();
+
+    if (pt.getDecl()->getNameAsString() == "result_type")
+    {
+      DBM_PRINT("WE HAVE YOU SURROUNDED");
+      DBM_PRINT(q_typedef_type.getAsString());
+      DBM_PRINT(q_typedef_type->getTypeClassName());
+    }
 
     if (get_type(q_typedef_type, new_type))
       return true;

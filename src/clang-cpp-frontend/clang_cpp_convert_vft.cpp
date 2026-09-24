@@ -47,89 +47,71 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
   // inline body containing dynamic_cast<cxxrd&>(base_ref) — converted by
   // the loop below — can match its own runtime type.
   pre_register_inherited_vtables(cxxrd);
-  // if (
-  //   type.get("tag") ==
-  //   "struct "
-  //   "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
-  //   "void>")
-  // {
-  // }
 
   for (const auto &md : cxxrd.methods())
   {
     if (!md->isVirtual())
       continue;
-    /*
-     * 1. convert this virtual method and add them to class symbol type
-     */
+
+    bool is_target = (md->getNameAsString() == "get_result_void");
+
     struct_typet::componentt comp;
 
     if (get_decl(*md, comp))
+    {
+      if (is_target)
+        DBM_PRINT("FAIL at get_decl for: " << md->getNameAsString());
       return true;
+    }
 
-    // additional annotations for virtual/overriding methods
     if (annotate_virtual_overriding_methods(*md, comp))
+    {
+      if (is_target)
+        DBM_PRINT(
+          "FAIL at annotate_virtual_overriding_methods for: "
+          << md->getNameAsString());
       return true;
+    }
     type.methods().push_back(comp);
 
-    /*
-     * 2. If this is the first time we see a virtual method in this class,
-     *  add virtual table type symbol and virtual pointer. Then add a new
-     *  entry in the vtable.
-     */
     symbolt *vtable_type_symbol = check_vtable_type_symbol_existence(type);
     if (!vtable_type_symbol)
     {
-      // first time we create the vtable type for this class
       vtable_type_symbol = add_vtable_type_symbol(comp, type);
       if (vtable_type_symbol == nullptr)
+      {
+        if (is_target)
+          DBM_PRINT(
+            "FAIL at add_vtable_type_symbol for: " << md->getNameAsString());
         return true;
+      }
 
       add_vptr(type);
     }
 
-    /*
-     * 3. add an entry in the existing virtual table type symbol
-     */
     add_vtable_type_entry(type, comp, vtable_type_symbol);
-
-    /*
-     * 4. deal with overriding method
-     */
 
     if (md->begin_overridden_methods() != md->end_overridden_methods())
     {
-      /*
-       * In a multi-inheritance case(e.g. diamond problem)
-       * a method might overrides multiple base methods in multiple levels.
-       * so we need to create multiple thunk functions for each overriden
-       * method in each level.
-       */
       overriden_map cxxmethods_overriden;
-      if (
-        type.get("tag") ==
-        "struct "
-        "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
-        "void>")
-      {
-        DBM_PRINT("TEST1");
-      }
       get_overriden_methods(*md, cxxmethods_overriden);
 
       for (const auto &overriden_md_entry : cxxmethods_overriden)
         add_thunk_method(overriden_md_entry.second, comp, type);
-
-      if (
-        type.get("tag") ==
-        "struct "
-        "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
-        "void>")
-      {
-        DBM_PRINT("TEST2");
-      }
     }
+
+    if (is_target)
+      DBM_PRINT("REACHED END OF ITERATION for: " << md->getNameAsString());
   }
 
+  if (
+    type.get("tag") ==
+    "struct "
+    "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
+    "void>")
+  {
+    DBM_PRINT("TEST2");
+  }
   /*
    * Set up virtual function table(vft) variable symbols
    * Each vft is modelled as a struct of function pointers.
