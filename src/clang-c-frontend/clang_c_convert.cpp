@@ -43,6 +43,8 @@ CC_DIAGNOSTIC_POP()
 
 #include <boost/algorithm/string/replace.hpp>
 
+bool debug_flag = false;
+
 clang_c_convertert::clang_c_convertert(
   contextt &_context,
   std::unique_ptr<clang::ASTUnit> &_AST,
@@ -315,7 +317,9 @@ bool clang_c_convertert::get_decl(const clang::Decl &decl, exprt &new_expr)
 
 bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
 {
-  DBM_PRINT(rd.getNameAsString());
+  // TraceGuard<"clang_c_convertert::get_struct_union_class"> _trace(
+  //   rd.getNameAsString());
+
   if (rd.isInterface())
   {
     log_error("Interface is not supported");
@@ -325,14 +329,6 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
   std::string id, name;
   get_decl_name(rd, name, id);
 
-  if (
-    name ==
-    "struct "
-    "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
-    "void>")
-  {
-    DBM_PRINT("SUSPECT SPOTTED");
-  }
 
   locationt location_begin;
   get_location_from_decl(rd, location_begin);
@@ -371,26 +367,15 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     // method.
 
     sym = context.move_symbol_to_context(symbol);
-
-    if (
-      sym->get_type().get("tag") ==
-      "struct "
-      "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
-      "void>")
-    {
-      DBM_PRINT("find_symbol FAIL");
-    }
   }
-  else
+  if (
+    name ==
+    "struct "
+    "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
+    "void>")
   {
-    if (
-      sym->get_type().get("tag") ==
-      "struct "
-      "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
-      "void>")
-    {
-      DBM_PRINT("find_symbol PASS");
-    }
+    DBM_PRINT("SUSPECT SPOTTED");
+    sym->dump();    
   }
 
   assert(sym->is_type);
@@ -407,14 +392,6 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
    */
   if (!rd.isCompleteDefinition())
   {
-    if (
-      sym->get_type().get("tag") ==
-      "struct "
-      "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
-      "void>")
-    {
-      DBM_PRINT("!rd.isCompleteDefinition() LEAVING EARLY");
-    }
     return false;
   }
 
@@ -433,24 +410,9 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
       "void>")
     {
       DBM_PRINT("SUSPECT COMPLETE LEAVING EARLY");
-      sym->get_type().dump();
+      sym->dump();
     }
     return false;
-  }
-
-  {
-    typet t = sym->get_type();
-    t.remove(irept::a_incomplete);
-    sym->set_type(std::move(t));
-  }
-
-  if (
-    sym->get_type().get("tag") ==
-    "struct "
-    "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
-    "void>")
-  {
-    DBM_PRINT("SUSPECT INCOMPLETE");
   }
 
   clang::RecordDecl *rd_def = rd.getDefinition();
@@ -466,45 +428,11 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
   // We have to add fields before methods as the fields are likely to be used
   // in the methods
 
-  // recurse here:
-  // first recurse no fail.
-  // Second recurse, action:
-  // //
   if (get_struct_union_class_fields(*rd_def, t))
-  {
-    if (
-      sym->get_type().get("tag") ==
-      "struct "
-      "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
-      "void>")
-    {
-      DBM_PRINT("FAILED get_struct_union_class_fields(*rd_def, t)");
-    }
     return true;
-  }
-
-  if (
-    sym->get_type().get("tag") ==
-    "struct "
-    "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
-    "void>")
-  {
-    DBM_PRINT("AFTER get_struct_union_class_fields(*rd_def, t)");
-    t.dump();
-  }
 
   if (process_record_layout_attributes(*rd_def, t))
     return true;
-
-  if (
-    sym->get_type().get("tag") ==
-    "struct "
-    "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
-    "void>")
-  {
-    DBM_PRINT("AFTER process_record_layout_attributes(*rd_def, t)");
-    t.dump();
-  }
 
   /* We successfully constructed the type of this symbol; complete the
    * incomplete-type symbol with the now-complete type definition, in place.
@@ -527,28 +455,27 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     typet t = sym->get_type();
     if (get_struct_union_class_methods_decls(*rd_def, t))
     {
-      if (
-        sym->get_type().get("tag") ==
-        "struct "
-        "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
-        "void>")
-      {
-        DBM_PRINT("FAILED get_struct_union_class_methods_decls(*rd_def, t)");
-        t.dump();
-      }
       sym->set_type(std::move(t));
       return true;
     }
+    t.remove(irept::a_incomplete);
+    sym->set_type(std::move(t));
     if (
       sym->get_type().get("tag") ==
       "struct "
       "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
       "void>")
     {
-      DBM_PRINT("PASSED get_struct_union_class_methods_decls(*rd_def, t)");
-      t.dump();
+      DBM_PRINT("SUSPECT MARKED COMPLETE");
     }
-    sym->set_type(std::move(t));
+  }
+  if (
+    sym->get_type().get("tag") ==
+    "struct "
+    "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
+    "void>")
+  {
+    DBM_PRINT("SEE YA!");
   }
 
   return false;
@@ -826,10 +753,6 @@ bool clang_c_convertert::get_function(
   // Return type
   if (get_type(fd.getReturnType(), type.return_type()))
   {
-    if (fd.getNameAsString()=="get_result_void")
-    {
-      DBM_PRINT("RECURSION");
-    }
     return true;
   }
 
@@ -1089,7 +1012,6 @@ bool clang_c_convertert::get_type(
   const clang::QualType &q_type,
   typet &new_type)
 {
-
   const clang::Type *the_type = q_type.getTypePtrOrNull();
   assert(the_type);
   if (get_type(*the_type, new_type))
@@ -1114,7 +1036,6 @@ bool clang_c_convertert::get_type(
 
 bool clang_c_convertert::get_type(const clang::Type &the_type, typet &new_type)
 {
-  DBM_PRINT("get_type: "<<the_type.getTypeClassName());
   switch (the_type.getTypeClass())
   {
   // Builtin types like integer
@@ -1321,16 +1242,16 @@ bool clang_c_convertert::get_type(const clang::Type &the_type, typet &new_type)
     const clang::TypedefType &pt =
       static_cast<const clang::TypedefType &>(the_type);
 
-
     clang::QualType q_typedef_type =
       pt.getDecl()->getUnderlyingType().getCanonicalType();
 
-    if (pt.getDecl()->getNameAsString() == "result_type")
-    {
-      DBM_PRINT("WE HAVE YOU SURROUNDED");
-      DBM_PRINT(q_typedef_type.getAsString());
-      DBM_PRINT(q_typedef_type->getTypeClassName());
-    }
+    // if (pt.getDecl()->getNameAsString() == "result_type")
+    // {
+    //   DBM_PRINT("WE HAVE YOU SURROUNDED");
+    //   DBM_PRINT(q_typedef_type.getAsString());
+    //   DBM_PRINT(q_typedef_type->getTypeClassName());
+    //   debug_flag = true;
+    // }
 
     if (get_type(q_typedef_type, new_type))
       return true;

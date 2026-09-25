@@ -43,6 +43,7 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
   const clang::CXXRecordDecl &cxxrd,
   struct_typet &type)
 {
+  
   // Register cxxrd against any inherited vptr-class up front so that an
   // inline body containing dynamic_cast<cxxrd&>(base_ref) — converted by
   // the loop below — can match its own runtime type.
@@ -59,17 +60,11 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
 
     if (get_decl(*md, comp))
     {
-      if (is_target)
-        DBM_PRINT("FAIL at get_decl for: " << md->getNameAsString());
       return true;
     }
 
     if (annotate_virtual_overriding_methods(*md, comp))
     {
-      if (is_target)
-        DBM_PRINT(
-          "FAIL at annotate_virtual_overriding_methods for: "
-          << md->getNameAsString());
       return true;
     }
     type.methods().push_back(comp);
@@ -80,9 +75,6 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
       vtable_type_symbol = add_vtable_type_symbol(comp, type);
       if (vtable_type_symbol == nullptr)
       {
-        if (is_target)
-          DBM_PRINT(
-            "FAIL at add_vtable_type_symbol for: " << md->getNameAsString());
         return true;
       }
 
@@ -100,18 +92,9 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
         add_thunk_method(overriden_md_entry.second, comp, type);
     }
 
-    if (is_target)
-      DBM_PRINT("REACHED END OF ITERATION for: " << md->getNameAsString());
   }
 
-  if (
-    type.get("tag") ==
-    "struct "
-    "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
-    "void>")
-  {
-    DBM_PRINT("TEST2");
-  }
+
   /*
    * Set up virtual function table(vft) variable symbols
    * Each vft is modelled as a struct of function pointers.
@@ -668,8 +651,6 @@ void clang_cpp_convertert::build_vtable_map(
    */
   for (const auto &method : struct_type.methods())
   {
-    // DBM_PRINT("METHOD:");
-    // DBM_PRINT(method.get_name());
 
     if (!method.get_bool("is_virtual"))
       continue;
@@ -701,7 +682,6 @@ void clang_cpp_convertert::build_vtable_map(
       value_map[virtual_name] = address;
     }
   }
-  // DBM_PRINT("END!");
 }
 
 void clang_cpp_convertert::add_vtable_variable_symbols(
