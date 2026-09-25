@@ -1,20 +1,38 @@
 template <typename T>
-struct A;
+struct B;
+struct trigger;
 
 template<>
-struct A<int>
+struct B<void>
 {
-  using result_type = void;
-  result_type *get_result_void();
-  virtual result_type *get_result_void(int ec = 0) = 0;
+  using C = trigger;
+  B<void> *a;
+
+  virtual C bug();
 };
 
 template<typename T>
-struct A : A<int>
+struct B : B<void>
 {
-  using result_type = void;
-  result_type *get_result_void();
-  virtual result_type *get_result_void(int ec = 0) = 0;
+  B<T> getb();
 };
 
-int main() {}
+
+template<typename T>
+B<T> B<T>::getb()
+{
+  return B<T>{};
+}
+
+struct trigger : B<char>
+{
+  C bug() override
+  {
+    return *this;
+  }
+}; 
+
+int main()
+{
+  B<int> b;
+}

@@ -317,8 +317,8 @@ bool clang_c_convertert::get_decl(const clang::Decl &decl, exprt &new_expr)
 
 bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
 {
-  // TraceGuard<"clang_c_convertert::get_struct_union_class"> _trace(
-  //   rd.getNameAsString());
+  TraceGuard<"clang_c_convertert::get_struct_union_class"> _trace(
+     rd.getNameAsString());
 
   if (rd.isInterface())
   {
@@ -328,7 +328,6 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
 
   std::string id, name;
   get_decl_name(rd, name, id);
-
 
   locationt location_begin;
   get_location_from_decl(rd, location_begin);
@@ -368,15 +367,7 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
 
     sym = context.move_symbol_to_context(symbol);
   }
-  if (
-    name ==
-    "struct "
-    "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
-    "void>")
-  {
-    DBM_PRINT("SUSPECT SPOTTED");
-    sym->dump();    
-  }
+
 
   assert(sym->is_type);
 
@@ -403,15 +394,7 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     !sym->get_type().incomplete() &&
     sym->get_type().id() != "incomplete_struct")
   {
-    if (
-      sym->get_type().get("tag") ==
-      "struct "
-      "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
-      "void>")
-    {
-      DBM_PRINT("SUSPECT COMPLETE LEAVING EARLY");
-      sym->dump();
-    }
+
     return false;
   }
 
@@ -422,19 +405,20 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
   struct_union_typet t(c_tag);
   t.tag(name);
 
+  // Don't count your chickens before they hatch!
+  // This struct is still not complete, so dont say it is.
+  t.incomplete(true);
+
   /* update location with that of the type's definition */
   get_location_from_decl(*rd_def, t.location());
-
   // We have to add fields before methods as the fields are likely to be used
   // in the methods
 
   if (get_struct_union_class_fields(*rd_def, t))
     return true;
-
   if (process_record_layout_attributes(*rd_def, t))
     return true;
-
-  /* We successfully constructed the type of this symbol; complete the
+ /* We successfully constructed the type of this symbol; complete the
    * incomplete-type symbol with the now-complete type definition, in place.
    * The order of definitions in the context matters — this type must be
    * defined after any of the types it is composed of — so move it to the
@@ -451,6 +435,8 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
   sym->set_type(t);
   sym = context.reorder_symbol_to_back(id);
 
+
+
   {
     typet t = sym->get_type();
     if (get_struct_union_class_methods_decls(*rd_def, t))
@@ -460,23 +446,9 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     }
     t.remove(irept::a_incomplete);
     sym->set_type(std::move(t));
-    if (
-      sym->get_type().get("tag") ==
-      "struct "
-      "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
-      "void>")
-    {
-      DBM_PRINT("SUSPECT MARKED COMPLETE");
-    }
+
   }
-  if (
-    sym->get_type().get("tag") ==
-    "struct "
-    "hpx::lcos::detail::future_data_base<hpx::traits::detail::future_data_"
-    "void>")
-  {
-    DBM_PRINT("SEE YA!");
-  }
+
 
   return false;
 }
@@ -1245,13 +1217,7 @@ bool clang_c_convertert::get_type(const clang::Type &the_type, typet &new_type)
     clang::QualType q_typedef_type =
       pt.getDecl()->getUnderlyingType().getCanonicalType();
 
-    // if (pt.getDecl()->getNameAsString() == "result_type")
-    // {
-    //   DBM_PRINT("WE HAVE YOU SURROUNDED");
-    //   DBM_PRINT(q_typedef_type.getAsString());
-    //   DBM_PRINT(q_typedef_type->getTypeClassName());
-    //   debug_flag = true;
-    // }
+
 
     if (get_type(q_typedef_type, new_type))
       return true;
