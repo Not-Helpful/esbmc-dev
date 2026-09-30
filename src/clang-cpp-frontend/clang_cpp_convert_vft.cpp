@@ -1129,4 +1129,3 @@ bool clang_cpp_convertert::build_dynamic_cast(
   new_expr = if_exprt(is_null, typed_null, cast_or_null);
   return false;
 }
-}
