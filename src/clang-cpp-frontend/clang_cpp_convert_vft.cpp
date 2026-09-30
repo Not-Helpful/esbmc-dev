@@ -43,7 +43,6 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
   const clang::CXXRecordDecl &cxxrd,
   struct_typet &type)
 {
-  
   // Register cxxrd against any inherited vptr-class up front so that an
   // inline body containing dynamic_cast<cxxrd&>(base_ref) — converted by
   // the loop below — can match its own runtime type.
@@ -91,9 +90,7 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
       for (const auto &overriden_md_entry : cxxmethods_overriden)
         add_thunk_method(overriden_md_entry.second, comp, type);
     }
-
   }
-
 
   /*
    * Set up virtual function table(vft) variable symbols
@@ -651,7 +648,6 @@ void clang_cpp_convertert::build_vtable_map(
    */
   for (const auto &method : struct_type.methods())
   {
-
     if (!method.get_bool("is_virtual"))
       continue;
 
@@ -723,6 +719,12 @@ void clang_cpp_convertert::add_vtable_variable_symbols(
     vt_symb_var.lvalue = true;
     vt_symb_var.static_lifetime = true;
 
+    if (context.move(vt_symb_var))
+    {
+      // Already added from previous call
+      continue;
+    }
+
     // add vtable variable symbols
     const struct_typet &vt_type = to_struct_type(vt_symb_type->get_type());
     exprt values("struct", symbol_typet(vt_symb_type->id));
@@ -731,7 +733,8 @@ void clang_cpp_convertert::add_vtable_variable_symbols(
       if (compo.get_bool("is_rtti_name"))
       {
         // The vtable belongs to the most-derived class cxxrd, whatever base
-        // class' vptr selects it, so this is where the dynamic type is pinned.
+        // class' vptr selects it, so this is where the dynamic type is
+        // pinned.
         exprt name = address_of_exprt(string_constantt(rtti_type_name(cxxrd)));
         gen_typecast(ns, name, compo.type());
         values.operands().push_back(name);
@@ -786,15 +789,6 @@ void clang_cpp_convertert::add_vtable_variable_symbols(
       values.operands().push_back(value);
     }
     vt_symb_var.set_value(values);
-
-    if (context.move(vt_symb_var))
-    {
-      log_error(
-        "Failed to add vtable variable symbol {} for class {}",
-        vt_symb_var.id,
-        class_id);
-      abort();
-    }
 
     // Record (vptr-class V → concrete class D) so build_dynamic_cast can
     // enumerate candidate D's by direct lookup instead of walking the TU.

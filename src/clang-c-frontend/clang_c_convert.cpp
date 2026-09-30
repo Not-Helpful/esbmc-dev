@@ -317,9 +317,6 @@ bool clang_c_convertert::get_decl(const clang::Decl &decl, exprt &new_expr)
 
 bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
 {
-  TraceGuard<"clang_c_convertert::get_struct_union_class"> _trace(
-     rd.getNameAsString());
-
   if (rd.isInterface())
   {
     log_error("Interface is not supported");
@@ -394,7 +391,6 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     !sym->get_type().incomplete() &&
     sym->get_type().id() != "incomplete_struct")
   {
-
     return false;
   }
 
@@ -418,7 +414,7 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     return true;
   if (process_record_layout_attributes(*rd_def, t))
     return true;
- /* We successfully constructed the type of this symbol; complete the
+  /* We successfully constructed the type of this symbol; complete the
    * incomplete-type symbol with the now-complete type definition, in place.
    * The order of definitions in the context matters — this type must be
    * defined after any of the types it is composed of — so move it to the
@@ -435,10 +431,9 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
   sym->set_type(t);
   sym = context.reorder_symbol_to_back(id);
 
-
-
   {
     typet t = sym->get_type();
+    DBM_PRINT("PROCESSING METHODS");
     if (get_struct_union_class_methods_decls(*rd_def, t))
     {
       sym->set_type(std::move(t));
@@ -446,10 +441,7 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     }
     t.remove(irept::a_incomplete);
     sym->set_type(std::move(t));
-
   }
-
-
   return false;
 }
 

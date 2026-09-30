@@ -8,6 +8,13 @@ struct intrusive_ptr
   {
   }
 
+  // When asking for this template, clang gives us
+  // instrusive_ptr<Allocator>. Processing requires
+  // processing Allocator, which loops back to Base.
+  // ESBMC was set up to assume that Base was processed
+  // after this "looping back", but it isn't!
+  // The logic bailed out early because Base is already being processed
+  // earlier in the call stack.   
   template <typename Y>
   intrusive_ptr(intrusive_ptr<Y> const &r) : ptr(r.ptr)
   {
@@ -20,7 +27,7 @@ struct Base
   {
   }
 
-  void keep_alive_while_waiting()
+  void force_processing_of_intrustive_ptr_Base()
   {
     intrusive_ptr<Base> b;
   }
