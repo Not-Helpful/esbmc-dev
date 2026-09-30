@@ -339,9 +339,6 @@ static bool holds_incomplete_record(const typet &t)
 
 bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
 {
-  TraceGuard<"clang_c_convertert::get_struct_union_class"> _trace(
-    rd.getNameAsString());
-
   if (rd.isInterface())
   {
     log_error("Interface is not supported");

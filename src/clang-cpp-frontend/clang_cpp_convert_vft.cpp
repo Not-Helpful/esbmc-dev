@@ -43,7 +43,6 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
   const clang::CXXRecordDecl &cxxrd,
   struct_typet &type)
 {
-  
   // Register cxxrd against any inherited vptr-class up front so that an
   // inline body containing dynamic_cast<cxxrd&>(base_ref) — converted by
   // the loop below — can match its own runtime type.
@@ -91,9 +90,7 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
       for (const auto &overriden_md_entry : cxxmethods_overriden)
         add_thunk_method(overriden_md_entry.second, comp, type);
     }
-
   }
-
 
   /*
    * Set up virtual function table(vft) variable symbols
@@ -298,21 +295,11 @@ void clang_cpp_convertert::add_vtable_type_entry(
 
   irep_idt vt_name = vtable_type_prefix + tag_prefix + type.tag().as_string();
   /*
-<<<<<<< HEAD
-   * `pretty_name` gets printed in symbol table:
-   *    virtual_table::BLAH@tag-BLAH={
-   * .<pretty_name>=&<virtual_method_base_class> };
-   *    virtual_table::BLAH@tag-BLEH={
-   * .<pretty_name>=&<thunk_to_overriding_method_in_derived_class> };
-   *    virtual_table::BLEH@tag-BLEH={
-   * .<pretty_name>=&<overriding_function_in_derived_class> };
-=======
    * `pretty_name` is what the symbol table prints for an entry, whether it
    * resolves to a base's method, a thunk, or a derived override:
    *    virtual_table::BLAH@tag-BLEH={ .<pretty_name>=&<thunk> };
    * add_vtable_variable_symbols also keys the override switch map on it, since
    * a component's `virtual_name` is no part of the IREP2 struct type (#4715).
->>>>>>> 343e96652abd3969007b15933d8bea98801d1569
    */
   const irep_idt entry_pretty_name = comp.get("virtual_name");
 
@@ -679,7 +666,6 @@ void clang_cpp_convertert::build_vtable_map(
    */
   for (const auto &method : struct_type.methods())
   {
-
     if (!method.get_bool("is_virtual"))
       continue;
 
@@ -774,40 +760,8 @@ void clang_cpp_convertert::add_vtable_variable_symbols(
       // is keyed on: add_vtable_type_entry sets it from that. The rtti entry is
       // the one component whose two names differ, and it is handled above.
       std::map<irep_idt, exprt>::const_iterator cit2 =
-<<<<<<< HEAD
-        switch_map.find(compo.get("virtual_name").as_string());
-
-      if (cit2 == switch_map.end())
-      {
-        // KNOWN ISSUE (temporary, do not upstream):
-        // switch_map is missing an entry for this vtable slot. Root cause
-        // still under investigation -- see notes on
-        // future_data_base<future_data_void>::execute_deferred. Log loudly
-        // and substitute a null function pointer so conversion can proceed
-        // instead of aborting here; this class's vtable variable will be
-        // WRONG (this slot won't dispatch correctly), but downstream
-        // passes might crash somewhere more informative, or might not
-        // crash at all, either of which is useful signal.
-        //
-        DBM_PRINT(
-          "MISSING SWITCH_MAP ENTRY (continuing anyway):\n"
-          "  class="
-          << class_id << "\n"
-          << "  late_cast=" << late_cast_symb->id.as_string() << "\n"
-          << "  missing virtual_name=" << compo.get("virtual_name").as_string()
-          << "\n"
-          << "  loc=" << compo.location().file().as_string() << ":"
-          << compo.location().line().as_string());
-        std::cout.flush();
-
-        pointer_typet placeholder_pointer_type(compo.type());
-        exprt placeholder = gen_zero(placeholder_pointer_type);
-        values.operands().push_back(placeholder);
-        continue;
-      }
-
-=======
         switch_map.find(compo.pretty_name());
+
       if (cit2 == switch_map.end())
       {
         log_error(
@@ -816,19 +770,14 @@ void clang_cpp_convertert::add_vtable_variable_symbols(
           vt_symb_type->id);
         abort();
       }
->>>>>>> 343e96652abd3969007b15933d8bea98801d1569
       const exprt &value = cit2->second;
       if (value.type().id() != compo.type().id())
       {
-        DBM_PRINT(
-          "TYPE MISMATCH ON SWITCH_MAP ENTRY (continuing anyway):\n"
-          "  class="
-          << class_id << "\n"
-          << "  late_cast=" << late_cast_symb->id.as_string() << "\n"
-          << "  virtual_name=" << compo.get("virtual_name").as_string() << "\n"
-          << "  value.type().id()=" << value.type().id().as_string() << "\n"
-          << "  compo.type().id()=" << compo.type().id().as_string());
-        std::cout.flush();
+        log_error(
+          "Type mismatch for {} and {}",
+          value.type().id(),
+          compo.type().id();
+        abort();
       }
       values.operands().push_back(value);
     }
@@ -906,22 +855,21 @@ void clang_cpp_convertert::pre_register_inherited_vtables(
     return;
 
   std::function<void(const clang::CXXRecordDecl *)> walk =
-    [&](const clang::CXXRecordDecl *cur)
-  {
-    for (const auto &spec : cur->bases())
-    {
-      if (spec.isVirtual())
-        continue;
-      const auto *base = spec.getType()->getAsCXXRecordDecl();
-      if (!base)
-        continue;
-      std::string base_id, base_name;
-      get_decl_name(*base, base_name, base_id);
-      if (ns.lookup(vtable_type_prefix + base_id))
-        vtable_classes_per_vptr_[base_id].insert(&cxxrd);
-      walk(base);
-    }
-  };
+    [&](const clang::CXXRecordDecl *cur) {
+      for (const auto &spec : cur->bases())
+      {
+        if (spec.isVirtual())
+          continue;
+        const auto *base = spec.getType()->getAsCXXRecordDecl();
+        if (!base)
+          continue;
+        std::string base_id, base_name;
+        get_decl_name(*base, base_name, base_id);
+        if (ns.lookup(vtable_type_prefix + base_id))
+          vtable_classes_per_vptr_[base_id].insert(&cxxrd);
+        walk(base);
+      }
+    };
   walk(&cxxrd);
 }
 
@@ -950,8 +898,7 @@ bool clang_cpp_convertert::build_dynamic_cast(
   if (get_type(cast.getType(), target_type))
     return true;
 
-  auto fallback = [&]()
-  {
+  auto fallback = [&]() {
     gen_typecast(ns, sub, target_type);
     new_expr = sub;
     return false;
@@ -1111,8 +1058,7 @@ bool clang_cpp_convertert::build_dynamic_cast(
 
   // OR-chain: vptr == arm0 || vptr == arm1 || ... — used by the reference
   // form and the T* pointer form. Precondition: arms not empty.
-  auto vptr_match_any = [&]() -> exprt
-  {
+  auto vptr_match_any = [&]() -> exprt {
     exprt match = equality_exprt(vptr_read, arms.front().first);
     for (size_t i = 1; i < arms.size(); ++i)
       match = or_exprt(match, equality_exprt(vptr_read, arms[i].first));
@@ -1182,4 +1128,5 @@ bool clang_cpp_convertert::build_dynamic_cast(
   exprt is_null = equality_exprt(src_pointer, gen_zero(src_pointer.type()));
   new_expr = if_exprt(is_null, typed_null, cast_or_null);
   return false;
+}
 }
