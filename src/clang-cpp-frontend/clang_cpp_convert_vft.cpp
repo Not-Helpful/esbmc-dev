@@ -783,7 +783,7 @@ void clang_cpp_convertert::add_vtable_variable_symbols(
         log_error(
           "Type mismatch for {} and {}",
           value.type().id(),
-          compo.type().id();
+          compo.type().id());
         abort();
       }
       values.operands().push_back(value);
