@@ -1,38 +1,46 @@
 template <typename T>
-struct B;
-struct trigger;
-
-template<>
-struct B<void>
+struct smart_ptr
 {
-  using C = trigger;
-  B<void> *a;
+  T *ptr = nullptr;
 
-  virtual C bug();
-};
-
-template<typename T>
-struct B : B<void>
-{
-  B<T> getb();
-};
-
-
-template<typename T>
-B<T> B<T>::getb()
-{
-  return B<T>{};
-}
-
-struct trigger : B<char>
-{
-  C bug() override
+  smart_ptr() = default;
+  explicit smart_ptr(T *p) : ptr(p)
   {
-    return *this;
   }
-}; 
+
+  template <typename Y>
+  smart_ptr(smart_ptr<Y> const &r) : ptr(r.ptr)
+  {
+  }
+};
+
+struct Base
+{
+  void keep_alive_while_waiting()
+  {
+    smart_ptr<Base> this_(
+      this); // <-- triggers conversion of intrusive_ptr<Base>
+    (void)this_;
+  }
+
+  virtual void execute_deferred()
+  {
+  }
+};
+
+struct Derived : Base
+{
+};
+struct Derived2 : Derived
+{
+};
+
+void somewhere_else_in_the_program()
+{
+  smart_ptr<Derived2> sd;
+  smart_ptr<Base> sb = sd; // upcast -- instantiates the Y=Allocator ctor
+}
 
 int main()
 {
-  B<int> b;
 }
