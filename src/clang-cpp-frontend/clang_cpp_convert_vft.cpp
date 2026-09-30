@@ -737,6 +737,12 @@ void clang_cpp_convertert::add_vtable_variable_symbols(
     vt_symb_var.lvalue = true;
     vt_symb_var.static_lifetime = true;
 
+    if (context.move(vt_symb_var))
+    {
+      // Already added from previous call
+      continue;
+    }
+
     // add vtable variable symbols
     const struct_typet &vt_type = to_struct_type(vt_symb_type->get_type());
     exprt values("struct", symbol_typet(vt_symb_type->id));
@@ -749,7 +755,8 @@ void clang_cpp_convertert::add_vtable_variable_symbols(
       if (compo.get_name() == rtti_name)
       {
         // The vtable belongs to the most-derived class cxxrd, whatever base
-        // class' vptr selects it, so this is where the dynamic type is pinned.
+        // class' vptr selects it, so this is where the dynamic type is
+        // pinned.
         exprt name = address_of_exprt(string_constantt(rtti_type_name(cxxrd)));
         gen_typecast(ns, name, compo.type());
         values.operands().push_back(name);
@@ -789,15 +796,6 @@ void clang_cpp_convertert::add_vtable_variable_symbols(
     migrate_expr(values, values2);
     migrate_namespace_lookup = old_ns;
     vt_symb_var.set_value(values2);
-
-    if (context.move(vt_symb_var))
-    {
-      log_error(
-        "Failed to add vtable variable symbol {} for class {}",
-        vt_symb_var.id,
-        class_id);
-      abort();
-    }
 
     // Record (vptr-class V → concrete class D) so build_dynamic_cast can
     // enumerate candidate D's by direct lookup instead of walking the TU.

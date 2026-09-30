@@ -464,6 +464,7 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
 
   {
     typet t = sym->get_type();
+    DBM_PRINT("PROCESSING METHODS");
     if (get_struct_union_class_methods_decls(*rd_def, t))
     {
       sym->set_type(std::move(t));
@@ -472,7 +473,6 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     t.remove(irept::a_incomplete);
     sym->set_type(std::move(t));
   }
-
   return false;
 }
 
