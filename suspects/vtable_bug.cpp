@@ -1,26 +1,28 @@
 template <typename T>
-struct smart_ptr
+struct intrusive_ptr
 {
   T *ptr = nullptr;
 
-  smart_ptr() = default;
-  explicit smart_ptr(T *p) : ptr(p)
+  intrusive_ptr() = default;
+  explicit intrusive_ptr(T *p) : ptr(p)
   {
   }
 
   template <typename Y>
-  smart_ptr(smart_ptr<Y> const &r) : ptr(r.ptr)
+  intrusive_ptr(intrusive_ptr<Y> const &r) : ptr(r.ptr)
   {
   }
 };
 
 struct Base
 {
+  virtual ~Base()
+  {
+  }
+
   void keep_alive_while_waiting()
   {
-    smart_ptr<Base> this_(
-      this); // <-- triggers conversion of intrusive_ptr<Base>
-    (void)this_;
+    intrusive_ptr<Base> b;
   }
 
   virtual void execute_deferred()
@@ -28,17 +30,17 @@ struct Base
   }
 };
 
-struct Derived : Base
-{
-};
-struct Derived2 : Derived
+struct Allocator : Base
 {
 };
 
+
 void somewhere_else_in_the_program()
 {
-  smart_ptr<Derived2> sd;
-  smart_ptr<Base> sb = sd; // upcast -- instantiates the Y=Allocator ctor
+  Allocator a;
+  intrusive_ptr<Allocator> pa(&a);
+  intrusive_ptr<Base> pb = pa; // upcast -- instantiates the Y=Allocator ctor
+  (void)pb;
 }
 
 int main()
