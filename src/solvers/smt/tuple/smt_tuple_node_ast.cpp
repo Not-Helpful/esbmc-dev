@@ -46,10 +46,10 @@ void tuple_node_smt_ast::make_free(smt_solver_baset *ctx)
         ctx->convert_sort(ctx->get_flattened_array_subtype(it));
       elements[i] = flat.array_conv.mk_array_symbol(newname, newsort, subsort);
     }
-    else if (is_array_type(it))
+    else if (is_array_type(it) || is_vector_type(it))
     {
       elements[i] = ctx->mk_fresh(
-        newsort, fieldname, ctx->convert_sort(to_array_type(it).subtype));
+        newsort, fieldname, ctx->convert_sort(array_or_vector_subtype(it)));
     }
     else
     {
@@ -127,9 +127,9 @@ smt_astt tuple_node_smt_ast::eq(smt_solver_baset *ctx, smt_astt other) const
 {
   const_cast<tuple_node_smt_ast *>(to_tuple_node_ast(other))->make_free(ctx);
 
-  // We have two tuple_node_smt_asts and need to create a boolean ast representing
-  // their equality: iterate over all their members, compute an equality for
-  // each of them, and then combine that into a final ast.
+  // We have two tuple_node_smt_asts and need to create a boolean ast
+  // representing their equality: iterate over all their members, compute an
+  // equality for each of them, and then combine that into a final ast.
   tuple_node_smt_astt ta = this;
   tuple_node_smt_astt tb = to_tuple_node_ast(other);
 
@@ -172,6 +172,10 @@ smt_astt tuple_node_smt_ast::update(
   // unit/solvers/tuple_node_update.test.cpp.
   const_cast<tuple_node_smt_ast *>(this)->make_free(ctx);
 
+  // Same disagreement as in project(), but this one writes. Checked before the
+  // result is built so a rejected update allocates nothing.
+  check_tuple_field(idx, elements.size(), sort->get_tuple_type());
+
   std::string name = ctx->mk_fresh_name("tuple_update::") + ".";
   tuple_node_smt_ast *result = new tuple_node_smt_ast(flat, ctx, sort, name);
   result->elements = elements;
@@ -201,10 +205,12 @@ tuple_node_smt_ast::project(smt_solver_baset *ctx, unsigned int idx) const
   // actually allocate all our pieces of ASTs as variables.
   const_cast<tuple_node_smt_ast *>(this)->make_free(ctx);
 
-#ifndef NDEBUG
-  assert(
-    idx < struct_union_members(sort->get_tuple_type()).size() &&
-    "Out-of-bounds tuple element accessed");
-#endif
+  // Bounded by `elements` rather than by the sort's member list, because that
+  // is the vector indexed below. smt_solver_baset::convert_member takes this
+  // index from the *expression's* struct type while the AST carries the sort
+  // it was built from; where a frontend leaves the two disagreeing this read
+  // ran off the end and returned a garbage pointer.
+  check_tuple_field(idx, elements.size(), sort->get_tuple_type());
+
   return elements[idx];
 }

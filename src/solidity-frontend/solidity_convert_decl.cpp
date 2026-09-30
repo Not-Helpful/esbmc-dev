@@ -11,6 +11,7 @@
 #include <util/arith/arith_tools.h>
 #include <util/arith/bitvector.h>
 #include <util/lang/c_types.h>
+#include <irep2/irep2_utils.h>
 #include <util/expr/expr_util.h>
 #include <util/base/i2string.h>
 #include <util/arith/mp_arith.h>
@@ -182,13 +183,14 @@ bool solidity_convertert::get_var_decl(
   typet t;
   // VariableDeclaration node contains both "typeName" and "typeDescriptions".
   // However, ExpressionStatement node just contains "typeDescriptions".
-  // For consistensy, we use ["typeName"]["typeDescriptions"] as in state-variable-declaration
-  // to improve the re-usability of get_type* function, when dealing with non-array var decls.
-  // For array, do NOT use ["typeName"]. Otherwise, it will cause problem
-  // when populating typet in get_cast
+  // For consistensy, we use ["typeName"]["typeDescriptions"] as in
+  // state-variable-declaration to improve the re-usability of get_type*
+  // function, when dealing with non-array var decls. For array, do NOT use
+  // ["typeName"]. Otherwise, it will cause problem when populating typet in
+  // get_cast
 
-  if (get_type_description(
-        ast_node, ast_node["typeName"]["typeDescriptions"], t))
+  if (
+    get_type_description(ast_node, ast_node["typeName"]["typeDescriptions"], t))
     return true;
 
   bool is_contract =
@@ -282,7 +284,6 @@ bool solidity_convertert::get_var_decl(
   // this will be used to decide if the var will be converted to this->var
   // when parsing function body.
   bool is_state_var = ast_node["stateVariable"].get<bool>();
-  set_sol_state_var(t, is_state_var);
 
   // For local storage reference variables (e.g. Wrapper storage ref = param),
   // register an alias so that uses of 'ref' resolve to the source symbol.
@@ -306,7 +307,7 @@ bool solidity_convertert::get_var_decl(
 
   // 2. populate id and name
   std::string name, id;
-  //TODO: Omitted variable
+  // TODO: Omitted variable
   if (ast_node["name"].get<std::string>().empty())
     // Omitted variable
     get_aux_var(name, id);
@@ -315,6 +316,10 @@ bool solidity_convertert::get_var_decl(
     if (get_var_decl_name(ast_node, name, id))
       return true;
   }
+
+  // The state flag is keyed by symbol id, so it is recorded here rather than
+  // beside the type: the id is not known until now (§10).
+  set_sol_state_var(id, is_state_var);
 
   // if we have already populated the var symbol, we do not need to re-parse
   // however, we need to return the symbol info
@@ -338,8 +343,8 @@ bool solidity_convertert::get_var_decl(
   get_default_symbol(symbol, debug_modulename, t, name, id, location_begin);
 
   symbol.lvalue = true;
-  // static_lifetime: this means it's defined in the file level, not inside contract
-  // special case for mapping, even if it's inside a contract
+  // static_lifetime: this means it's defined in the file level, not inside
+  // contract special case for mapping, even if it's inside a contract
   symbol.static_lifetime = current_contractName.empty() ||
                            (is_mapping && !is_new_expr) ||
                            (is_mapping_array && !is_new_expr) ||
@@ -350,9 +355,10 @@ bool solidity_convertert::get_var_decl(
   // For state var decl, we look for "value".
   // For local var decl, we look for "initialValue"
   bool has_init = (ast_node.contains("value") || !initialValue.empty());
-  // For inherited ones, the initial value will be set in "move_inheritance_to_ctor()"
-  // e.g. D.x = B.x
-  // Therefore, even if the copied json nodes contain init_value (has_init = true), we still skip such settings.
+  // For inherited ones, the initial value will be set in
+  // "move_inheritance_to_ctor()" e.g. D.x = B.x Therefore, even if the copied
+  // json nodes contain init_value (has_init = true), we still skip such
+  // settings.
   bool set_init = has_init && !is_inherited;
   const nlohmann::json init_value =
     ast_node.contains("value") ? ast_node["value"] : initialValue;
@@ -368,7 +374,8 @@ bool solidity_convertert::get_var_decl(
   }
 
   // 6. add symbol into the context
-  // just like clang-c-frontend, we have to add the symbol before converting the initial assignment
+  // just like clang-c-frontend, we have to add the symbol before converting the
+  // initial assignment
   symbolt &added_symbol = *move_symbol_to_context(symbol);
   code_declt decl(symbol_expr(added_symbol));
 
@@ -447,13 +454,15 @@ bool solidity_convertert::get_var_decl(
     t_sol_type == SolidityGrammar::SolType::ARRAY ||
     t_sol_type == SolidityGrammar::SolType::ARRAY_LITERAL)
   {
-    /** 
+    /**
       uint[2] z;            // uint *z = (uint *)calloc(2, sizeof(uint));
-      
-                            // uint tmp1[2] = {1,2}; // populated into sym tab, not a real statement
-      uint[2] zz = [1,2];   // uint *zz = (uint *)_ESBMC_arrcpy(tmp1, 2, 2, sizeof(uint));
 
-      uint[2] y = x;        // uint *zz = (uint *)_ESBMC_arrcpy(x, 2, 2, sizeof(uint));
+                            // uint tmp1[2] = {1,2}; // populated into sym tab,
+    not a real statement uint[2] zz = [1,2];   // uint *zz = (uint
+    *)_ESBMC_arrcpy(tmp1, 2, 2, sizeof(uint));
+
+      uint[2] y = x;        // uint *zz = (uint *)_ESBMC_arrcpy(x, 2, 2,
+    sizeof(uint));
 
       TODO: suport disorder:
       uint[2] y = x;
@@ -494,7 +503,7 @@ bool solidity_convertert::get_var_decl(
       solidity_gen_typecast(ns, acpy_call, t);
       set_sol_array_size(acpy_call.type(), arr_size);
       // set as rvalue
-      added_symbol.set_value(acpy_call);
+      added_symbol.set_value(migrate_expr(acpy_call));
       decl.operands().push_back(acpy_call);
     }
     else
@@ -507,7 +516,7 @@ bool solidity_convertert::get_var_decl(
       // typecast
       solidity_gen_typecast(ns, calc_call, t);
       // set as rvalue
-      added_symbol.set_value(calc_call);
+      added_symbol.set_value(migrate_expr(calc_call));
       decl.operands().push_back(calc_call);
     }
   }
@@ -559,7 +568,7 @@ bool solidity_convertert::get_var_decl(
       //=> uint* zz = (uint *)calloc(10, sizeof(uint));
       //=> uint* zz = (uint *)calloc(len, sizeof(uint));
       solidity_gen_typecast(ns, val, t);
-      added_symbol.set_value(val);
+      added_symbol.set_value(migrate_expr(val));
       decl.operands().push_back(val);
 
       // get rhs size, e.g. 10
@@ -582,15 +591,16 @@ bool solidity_convertert::get_var_decl(
     }
     else if (val.is_symbol())
     {
-      /** 
+      /**
       uint[] zzz;           // uint* zzz; // will not reach here actually
-                            // 
+                            //
       uint[] zzzz = [1,2];  // memcpy(zzzz, tmp2, 2*sizeof(uint));
                             // uint* zzzzz = 0;
       uint[] zzzzzz = zzz;  // memcpy(zzzzzz, zzz, zzz.size * sizeof(uint));
 
-      Theoretically we can convert it to something like int *z = new int[2]{0,1};
-      However, this feature seems to be not fully supported in current esbmc-cpp (v7.6.1)
+      Theoretically we can convert it to something like int *z = new
+      int[2]{0,1}; However, this feature seems to be not fully supported in
+      current esbmc-cpp (v7.6.1)
     */
       // get size
       exprt size_expr;
@@ -634,8 +644,10 @@ bool solidity_convertert::get_var_decl(
   else if (is_mapping && is_new_expr)
   {
     // mapping(string => uint) test;
-    // 1. the contract that contains this mapping is also used in a new expression
-    // => __attribute__((annotate("__ESBMC_inf_size"))) struct _ESBMC_Mapping _ESBMC_inf_test[];
+    // 1. the contract that contains this mapping is also used in a new
+    // expression
+    // => __attribute__((annotate("__ESBMC_inf_size"))) struct _ESBMC_Mapping
+    // _ESBMC_inf_test[];
     // => struct mapping_t test = {_ESBMC_inf_test, this.address};
     // 2.
     // => struct mapping_t_fast test = {_ESBMC_inf_test};
@@ -659,7 +671,9 @@ bool solidity_convertert::get_var_decl(
     arr_s.file_local = true;
     arr_s.lvalue = true;
     auto &add_added_s = *move_symbol_to_context(arr_s);
-    add_added_s.set_value(gen_zero(get_complete_type(arr_t, ns), true));
+    const expr2tc arr_zero =
+      gen_zero(migrate_type(get_complete_type(arr_t, ns)), true);
+    add_added_s.set_value(arr_zero);
 
     // 2. construct mapping_t struct instance's value
     typet map_t;
@@ -689,7 +703,7 @@ bool solidity_convertert::get_var_decl(
     solidity_gen_typecast(ns, addr_expr, comps[addr_idx].type());
     inits.operands()[addr_idx] = addr_expr;
 
-    added_symbol.set_value(inits);
+    added_symbol.set_value(migrate_expr(inits));
     decl.operands().push_back(inits);
   }
   else if (!set_init && is_byte_static)
@@ -704,7 +718,7 @@ bool solidity_convertert::get_var_decl(
     assert(has_sol_bytesn_size(t));
     exprt len = from_integer(std::stoul(get_sol_bytesn_size(t)), uint_type());
     call.arguments().push_back(len);
-    added_symbol.set_value(call);
+    added_symbol.set_value(migrate_expr(call));
     decl.operands().push_back(call);
   }
   // now we have rule out other special cases
@@ -712,15 +726,15 @@ bool solidity_convertert::get_var_decl(
   {
     if (get_init_expr(init_value, literal_type, t, val))
       return true;
-    added_symbol.set_value(val);
+    added_symbol.set_value(migrate_expr(val));
     decl.operands().push_back(val);
   }
 
   // For local variables without explicit initializer, Solidity guarantees
   // zero-initialization.  Emit the zero value so the GOTO program gets
   // an assignment (DECL alone leaves the variable uninitialised).
-  // Only add if no init operand was already pushed by a special-case handler above
-  // (arrays, dynarray, mapping, etc. handle their own initialization).
+  // Only add if no init operand was already pushed by a special-case handler
+  // above (arrays, dynarray, mapping, etc. handle their own initialization).
   if (
     !is_state_var && decl.operands().size() == 1 && !is_contract && !is_mapping)
     decl.operands().push_back(gen_zero(get_complete_type(t, ns), true));
@@ -765,8 +779,8 @@ bool solidity_convertert::get_struct_class(const nlohmann::json &struct_def)
     t.tag("struct " + name);
 
     // populate the member_entity_scope
-    // this map is used to find reference when there is no decl_ref_id provided in the nodes
-    // or replace the find_decl_ref in order to speed up
+    // this map is used to find reference when there is no decl_ref_id provided
+    // in the nodes or replace the find_decl_ref in order to speed up
     int scp = struct_def["id"].get<int>();
     member_entity_scope.insert(std::pair<int, std::string>(scp, name));
   }
@@ -874,12 +888,6 @@ bool solidity_convertert::get_struct_class(const nlohmann::json &struct_def)
 
       if (comp.is_code() && to_code(comp).statement() == "skip")
         break;
-
-      // set virtual / override
-      if ((*itr).contains("virtual") && (*itr)["virtual"] == true)
-        comp.set("#is_sol_virtual", true);
-      else if ((*itr).contains("overrides"))
-        comp.set("#is_sol_override", true);
 
       t.methods().push_back(comp);
       break;
@@ -1017,7 +1025,8 @@ bool solidity_convertert::get_struct_class_fields(
   if (get_sol_mapping_array(comp.type()))
     return false;
 
-  // dynarray state vars are modeled as global infinite arrays (not struct members)
+  // dynarray state vars are modeled as global infinite arrays (not struct
+  // members)
   if (get_sol_dynarray_state(comp.type()))
     return false;
 
@@ -1058,12 +1067,6 @@ bool solidity_convertert::get_struct_class_method(
 
   if (get_access_from_decl(ast_node, comp))
     return true;
-
-  // set virtual / override
-  if (ast_node.contains("virtual") && ast_node["virtual"] == true)
-    comp.set("#is_sol_virtual", true);
-  else if (ast_node.contains("overrides"))
-    comp.set("#is_sol_override", true);
 
   type.methods().push_back(comp);
   return false;
@@ -1169,8 +1172,8 @@ bool solidity_convertert::get_noncontract_defition(nlohmann::json &ast_node)
     // a library is equivalent to a static class
     std::string lib_name = ast_node["name"].get<std::string>();
 
-    // we treat library as a contract, but we do not populate it as struct/contract symbol
-    // instead, we only populate the entity and functions
+    // we treat library as a contract, but we do not populate it as
+    // struct/contract symbol instead, we only populate the entity and functions
     std::string old = current_baseContractName;
     current_baseContractName = lib_name;
     if (get_struct_class(ast_node))
@@ -1234,7 +1237,7 @@ void solidity_convertert::add_enum_member_val(nlohmann::json &ast_node)
 {
   /*
   "nodeType": "EnumDefinition",
-  "members": 
+  "members":
     [
       {
           "id": 2,
@@ -1382,7 +1385,8 @@ void solidity_convertert::get_state_var_decl_name(
   std::string &id)
 {
   // Follow the way in clang:
-  //  - For state variable name, just use the ast_node["name"], e.g. sol:@C@Base@x#11
+  //  - For state variable name, just use the ast_node["name"], e.g.
+  //  sol:@C@Base@x#11
   //  - For state variable id, add prefix "sol:@"
   name = ast_node["name"].get<std::string>();
   if (!cname.empty())
@@ -1429,11 +1433,13 @@ void solidity_convertert::get_local_var_decl_name(
   {
     // converting local variable inside a function
     // For non-state functions, we give it different id.
-    // E.g. for local variable i in function nondet(), it's "sol:@C@Base@F@nondet@i#55".
+    // E.g. for local variable i in function nondet(), it's
+    // "sol:@C@Base@F@nondet@i#55".
     if (current_functionName.empty())
       current_functionName = (*current_functionDecl)["name"];
     assert(!current_functionName.empty());
-    // As the local variable inside the function will not be inherited, we can use current_functionName
+    // As the local variable inside the function will not be inherited, we can
+    // use current_functionName
     id = "sol:@C@" + cname + "@F@" + current_functionName + "@" + name + "#" +
          i2string(ast_node["id"].get<std::int16_t>());
   }
@@ -1449,8 +1455,10 @@ void solidity_convertert::get_local_var_decl_name(
   }
   else if (ast_node.contains("scope"))
   {
-    // This means we are handling a local variable which is not inside a function body.
-    //! Assume it is a variable inside struct/error which can be declared outside the contract
+    // This means we are handling a local variable which is not inside a
+    // function body.
+    //! Assume it is a variable inside struct/error which can be declared
+    //! outside the contract
     int scp = ast_node["scope"].get<int>();
     if (member_entity_scope.count(scp) == 0)
     {
@@ -1495,7 +1503,8 @@ void solidity_convertert::get_function_definition_name(
 {
   // Follow the way in clang:
   //  - For function name, just use the ast_node["name"]
-  // assume Solidity AST json object has "name" field, otherwise throws an exception in nlohmann::json
+  // assume Solidity AST json object has "name" field, otherwise throws an
+  // exception in nlohmann::json
   std::string contract_name;
   get_current_contract_name(ast_node, contract_name);
   if (contract_name.empty())
@@ -1505,7 +1514,8 @@ void solidity_convertert::get_function_definition_name(
     return;
   }
 
-  //! for event/... who have added an body node. It seems that a ["kind"] is automatically added.?
+  //! for event/... who have added an body node. It seems that a ["kind"] is
+  //! automatically added.?
   if (
     ast_node.contains("kind") && !ast_node["kind"].is_null() &&
     ast_node["kind"].get<std::string>() == "constructor")

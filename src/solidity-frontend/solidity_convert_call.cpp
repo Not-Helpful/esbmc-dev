@@ -15,6 +15,8 @@
 #include <util/base/i2string.h>
 #include <util/arith/mp_arith.h>
 #include <util/irep/std_expr.h>
+#include <irep2/irep2_utils.h>
+#include <util/irep/migrate.h>
 #include <util/message/message.h>
 #include <fstream>
 #include <limits>
@@ -41,7 +43,8 @@ bool solidity_convertert::get_library_function_call(
 }
 
 // library/error/event functions have no definition node
-// the key difference comparing to the `get_non_library_function_call` is that we do not need a this-object as the first argument for the function call
+// the key difference comparing to the `get_non_library_function_call` is that
+// we do not need a this-object as the first argument for the function call
 bool solidity_convertert::get_library_function_call(
   const exprt &func,
   const typet &t,
@@ -144,10 +147,10 @@ bool solidity_convertert::get_library_function_call(
     * @param caller: the function caller node which contains the arguments
     TODO: if the paramenter is a 'memory' type, we need to create
     a copy. E.g. string memory x => char *x => char * x_cpy
-    this could be done by memcpy. However, for dyn_array, we do not have 
+    this could be done by memcpy. However, for dyn_array, we do not have
     the size info. Thus in the future we need to convert the dyn array to
     a struct which record both array and size. This will also help us to support
-    array.length, .push and .pop 
+    array.length, .push and .pop
 **/
 bool solidity_convertert::get_non_library_function_call(
   const nlohmann::json &decl_ref,
@@ -204,7 +207,8 @@ bool solidity_convertert::get_non_library_function_call(
       if (get_ctor_decl_this_ref(caller, this_object))
         return true;
     }
-    // otherwise, it's the auxiliary function we defined //e.g. call, delegatecall...
+    // otherwise, it's the auxiliary function we defined //e.g. call,
+    // delegatecall...
 
     call.arguments().push_back(this_object);
   }
@@ -254,10 +258,11 @@ bool solidity_convertert::get_non_library_function_call(
 }
 
 // extract new contract instance expression
-// we insert that contract name into the newContractSet if there is a new expresssion related to this contract
-// e.g. Base x = new Base(); then we insert "Base" into newContractSet
-// the idea is that if the contract is not used in 'new', then we can simply create a
-// global static infinity array to play as a mapping structure
+// we insert that contract name into the newContractSet if there is a new
+// expresssion related to this contract e.g. Base x = new Base(); then we insert
+// "Base" into newContractSet the idea is that if the contract is not used in
+// 'new', then we can simply create a global static infinity array to play as a
+// mapping structure
 void solidity_convertert::extract_new_contracts()
 {
   if (!src_ast_json.contains("nodes"))
@@ -272,8 +277,9 @@ void solidity_convertert::extract_new_contracts()
         if (node.contains("typeName"))
         {
           typet new_type;
-          if (get_type_description(
-                node["typeName"]["typeDescriptions"], new_type))
+          if (
+            get_type_description(
+              node["typeName"]["typeDescriptions"], new_type))
           {
             log_error("failed to obtain typeDescriptions");
             abort();
@@ -436,7 +442,7 @@ bool solidity_convertert::assign_param_nondet(
             ==>
             if(nondet_bool())
             {
-              __ESBMC_Object_m.run(_ESBMC_Object_Base) 
+              __ESBMC_Object_m.run(_ESBMC_Object_Base)
               / / where its cname = ["Base", "Derive"]
             }
           */
@@ -449,7 +455,8 @@ bool solidity_convertert::assign_param_nondet(
       else if (
         get_sol_type(t) == SolidityGrammar::SolType::STRING && is_pointer_check)
       {
-        //! specific for string, we need to explicitly assign it as nondet_string()
+        //! specific for string, we need to explicitly assign it as
+        //! nondet_string()
         // otherwise we will get invalid_object
         side_effect_expr_function_callt nondet_str;
         get_library_function_call_no_args(
@@ -469,7 +476,8 @@ bool solidity_convertert::assign_param_nondet(
   return false;
 }
 
-// check if the target contract have at least one non-ctor external or public function
+// check if the target contract have at least one non-ctor external or public
+// function
 bool solidity_convertert::has_callable_func(const std::string &cname)
 {
   return std::any_of(
@@ -549,11 +557,12 @@ bool solidity_convertert::get_high_level_member_access(
     expr, empty_json, base, member, _mem_call, is_func_call, new_expr);
 }
 
-/** 
- * Conversion: 
+/**
+ * Conversion:
   constructor()
   {
-    this->_ESBMC_bind_cname = get_nondet_cname(); // unless we have a new Base(), then = Base;
+    this->_ESBMC_bind_cname = get_nondet_cname(); // unless we have a new
+ Base(), then = Base;
   }
 
   function test1(Base x, address _addr) public
@@ -566,12 +575,13 @@ bool solidity_convertert::get_high_level_member_access(
                           //   x._ESBMC_bind_cname = base
                           // if _addr == _ESBMC_Object_y.$address
                           //   x._ESBMC_bind_cname = y;
-  }	
+  }
 
   the auxilidary tmp var will not be created if the member_type is void
   @expr: the whole member access expression json
   @options: call with options
-  @is_func_call: true if it's a function member access; false state variable access
+  @is_func_call: true if it's a function member access; false state variable
+ access
   @_mem_call: function call statement, with arguments populated
   return true: we fail to generate the high_level_member_access bound harness
                however, this should not be treated as an erorr.
@@ -656,15 +666,17 @@ bool solidity_convertert::get_high_level_member_access(
       exprt back_block = code_blockt();
       if (is_call_w_options)
       {
-        if (model_transaction(
-              expr, cur_this_expr, base, balance, l, front_block, back_block))
+        if (
+          model_transaction(
+            expr, cur_this_expr, base, balance, l, front_block, back_block))
         {
           log_error("failed to model the transaction property changes");
           return true;
         }
       }
-      else if (get_high_level_call_wrapper(
-                 cname, cur_this_expr, front_block, back_block))
+      else if (
+        get_high_level_call_wrapper(
+          cname, cur_this_expr, front_block, back_block))
         return true;
 
       for (auto op : front_block.operands())
@@ -673,7 +685,8 @@ bool solidity_convertert::get_high_level_member_access(
         move_to_back_block(op);
     }
 
-    return false; // since it has only one possible option, no need to futher binding
+    return false; // since it has only one possible option, no need to futher
+                  // binding
   }
 
   // now we need to consider the binding
@@ -746,7 +759,7 @@ bool solidity_convertert::get_high_level_member_access(
   ft.arguments().push_back(base_param);
   exprt new_base = symbol_expr(*context.find_symbol(base_id));
 
-  added_fsymbol.set_type(ft);
+  added_fsymbol.set_type(migrate_type(ft));
   //! we need to move it to the struct symbol
   // this is because we use the member from the contract
   move_builtin_to_contract(cname, symbol_expr(added_fsymbol), true);
@@ -801,7 +814,8 @@ bool solidity_convertert::get_high_level_member_access(
     ct.cmt_constant(true);
     get_symbol_decl_ref(str, "sol:@" + str, ct, cname_string);
 
-    // since we do not modify the string, and it always point to the known object
+    // since we do not modify the string, and it always point to the known
+    // object
     exprt _cmp_cname = exprt("=", string_t);
     _cmp_cname.operands().push_back(bind_expr);
     _cmp_cname.operands().push_back(cname_string);
@@ -815,13 +829,14 @@ bool solidity_convertert::get_high_level_member_access(
 
     // ?fix address?. e.g.
     // B target = B(_addr); // previously
-    // base->$address =  _ESBMC_Object_B.$address // note that pointer this->target == base
+    // base->$address =  _ESBMC_Object_B.$address // note that pointer
+    // this->target == base
 
     bool is_revert = false;
     if (is_func_call)
     {
-      // e.g. x.call() y.call(). we need to find the definition of the call beyond the contract x/y separately
-      // get call
+      // e.g. x.call() y.call(). we need to find the definition of the call
+      // beyond the contract x/y separately get call
       std::string func_name = member.name().as_string();
       assert(!func_name.empty());
       const nlohmann::json &member_decl_ref = get_func_decl_ref(str, func_name);
@@ -850,9 +865,10 @@ bool solidity_convertert::get_high_level_member_access(
       {
         // check if the state variable exsist in the target contract
         // signature: type + name
-        // this is due to that the structureTypeMap only ensure the function signature matched
-        if (is_var_getter_matched(
-              str, member.name().as_string(), member.type()))
+        // this is due to that the structureTypeMap only ensure the function
+        // signature matched
+        if (
+          is_var_getter_matched(str, member.name().as_string(), member.type()))
           memcall = member_exprt(_base, member.name(), member.type());
         else
         {
@@ -886,15 +902,16 @@ bool solidity_convertert::get_high_level_member_access(
       exprt back_block = code_blockt();
       if (is_call_w_options)
       {
-        if (model_transaction(
-              expr, this_expr, new_base, balance, l, front_block, back_block))
+        if (
+          model_transaction(
+            expr, this_expr, new_base, balance, l, front_block, back_block))
         {
           log_error("failed to model the transaction property changes");
           return true;
         }
       }
-      else if (get_high_level_call_wrapper(
-                 cname, this_expr, front_block, back_block))
+      else if (
+        get_high_level_call_wrapper(cname, this_expr, front_block, back_block))
         return true;
 
       // if-body
@@ -929,7 +946,7 @@ bool solidity_convertert::get_high_level_member_access(
     func_body.move_to_operands(_ret);
   }
 
-  added_fsymbol.set_value(func_body);
+  added_fsymbol.set_value(migrate_expr(func_body));
 
   // construct function call
   side_effect_expr_function_callt _call;
@@ -1241,7 +1258,7 @@ bool solidity_convertert::get_bind_cname_expr(
 /**
  * symbol
  *   * identifier: tag-Bank
-*/
+ */
 void solidity_convertert::get_new_object(const typet &t, exprt &this_object)
 {
   log_debug("solidity", "\t\tget this object ref");
@@ -1340,8 +1357,9 @@ const nlohmann::json &solidity_convertert::find_function_by_signature(
 
 // Resolve a JSON node to a FunctionDefinition referenced by it.
 // Accepts the two forms emitted by solc when a function is used as a value:
-//   Logic.f           -> MemberAccess { memberName: "f", referencedDeclaration: <fn id> }
-//   freeFunction f    -> Identifier   { referencedDeclaration: <fn id> }
+//   Logic.f           -> MemberAccess { memberName: "f", referencedDeclaration:
+//   <fn id> } freeFunction f    -> Identifier   { referencedDeclaration: <fn
+//   id> }
 // Uses the static `find_node_by_id` helper against the full AST so that a
 // cross-contract reference like `Logic.setX` resolves from a delegatecall
 // in Proxy even though current_baseContractName is still Proxy (the scoped
@@ -1551,7 +1569,7 @@ bool solidity_convertert::get_typed_call_definition(
 
     arg_param_ids.push_back(pid);
   }
-  added_symbol.set_type(t);
+  added_symbol.set_type(migrate_type(t));
 
   // Body construction.
   code_blockt func_body;
@@ -1624,7 +1642,7 @@ bool solidity_convertert::get_typed_call_definition(
     func_body.move_to_operands(ret_false);
   }
 
-  added_symbol.set_value(func_body);
+  added_symbol.set_value(migrate_expr(func_body));
   out_sym = &added_symbol;
   return false;
 }
@@ -1858,7 +1876,7 @@ bool solidity_convertert::try_inline_delegate_shadow_helper_call(
     ls.lvalue = true;
     ls.file_local = true;
     auto &added_local = *move_symbol_to_context(ls);
-    added_local.set_value(arg_exprs[i]);
+    added_local.set_value(migrate_expr(arg_exprs[i]));
 
     code_declt decl(symbol_expr(added_local));
     decl.operands().push_back(arg_exprs[i]);
@@ -1887,7 +1905,11 @@ bool solidity_convertert::try_inline_delegate_shadow_helper_call(
       get_default_symbol(rs, debug_modulename, rt, rname, rid, loc);
       rs.lvalue = true;
       rs.file_local = true;
-      rs.set_value(gen_zero(get_complete_type(rt, ns), true));
+      // expr2tc return type, so this cannot silently fall back to the legacy
+      // gen_zero the decl operand below still wants.
+      const expr2tc rzero =
+        gen_zero(migrate_type(get_complete_type(rt, ns)), true);
+      rs.set_value(rzero);
       auto &added_ret = *move_symbol_to_context(rs);
       code_declt rdecl(symbol_expr(added_ret));
       rdecl.operands().push_back(gen_zero(get_complete_type(rt, ns), true));
@@ -1954,8 +1976,9 @@ bool solidity_convertert::try_get_delegate_shadow_call(
 
   std::string target_sig;
   std::vector<const nlohmann::json *> raw_args;
-  if (extract_abi_encode_signature(
-        func_call["arguments"][0], target_sig, raw_args))
+  if (
+    extract_abi_encode_signature(
+      func_call["arguments"][0], target_sig, raw_args))
     return true;
 
   std::string caller_cname;
@@ -2039,7 +2062,7 @@ bool solidity_convertert::try_get_delegate_shadow_call(
     ls.lvalue = true;
     ls.file_local = true;
     auto &added_local = *move_symbol_to_context(ls);
-    added_local.set_value(arg_exprs[i]);
+    added_local.set_value(migrate_expr(arg_exprs[i]));
 
     code_declt decl(symbol_expr(added_local));
     decl.operands().push_back(arg_exprs[i]);
@@ -2057,7 +2080,7 @@ bool solidity_convertert::try_get_delegate_shadow_call(
   ss.lvalue = true;
   ss.file_local = true;
   auto &added_succ = *move_symbol_to_context(ss);
-  added_succ.set_value(false_exprt());
+  added_succ.set_value(gen_false_expr());
   {
     code_declt decl(symbol_expr(added_succ));
     decl.operands().push_back(false_exprt());
@@ -2138,7 +2161,10 @@ bool solidity_convertert::try_get_delegate_shadow_call(
         get_default_symbol(rs, debug_modulename, rt, rname, rid, loc);
         rs.lvalue = true;
         rs.file_local = true;
-        rs.set_value(gen_zero(get_complete_type(rt, ns), true));
+        // expr2tc return type; see the sibling site.
+        const expr2tc rzero =
+          gen_zero(migrate_type(get_complete_type(rt, ns)), true);
+        rs.set_value(rzero);
         auto &added_ret = *move_symbol_to_context(rs);
         code_declt rdecl(symbol_expr(added_ret));
         rdecl.operands().push_back(gen_zero(get_complete_type(rt, ns), true));
@@ -2209,8 +2235,9 @@ bool solidity_convertert::try_get_signature_dispatched_call(
 
   std::string target_sig;
   std::vector<const nlohmann::json *> raw_args;
-  if (extract_abi_encode_signature(
-        func_call["arguments"][0], target_sig, raw_args))
+  if (
+    extract_abi_encode_signature(
+      func_call["arguments"][0], target_sig, raw_args))
     return true;
   log_debug(
     "solidity",
@@ -2290,8 +2317,9 @@ bool solidity_convertert::try_get_signature_dispatched_call(
 }
 
 // add `call(address _addr)` to the contract
-// If it contains the function signature, it should be directly converted to the function calls rather than invoke this `call`
-// e.g. addr.call(abi.encodeWithSignature("doSomething(uint256)", 123))
+// If it contains the function signature, it should be directly converted to the
+// function calls rather than invoke this `call` e.g.
+// addr.call(abi.encodeWithSignature("doSomething(uint256)", 123))
 // => _ESBMC_Object_Base.doSomething(123);
 bool solidity_convertert::get_call_definition(
   const std::string &cname,
@@ -2326,11 +2354,11 @@ bool solidity_convertert::get_call_definition(
   param.cmt_identifier(addr_id);
   t.arguments().push_back(param);
 
-  added_symbol.set_type(t);
+  added_symbol.set_type(migrate_type(t));
 
   // body:
   /*
-  if(_addr == _ESBMC_Object_x) 
+  if(_addr == _ESBMC_Object_x)
   {
     *Also check if it has public or external non-ctor function
     old_sender = msg_sender
@@ -2340,7 +2368,7 @@ bool solidity_convertert::get_call_definition(
     return true;
   }
   if(...) {...}
-  
+
   return false;
   */
   code_blockt func_body;
@@ -2352,7 +2380,8 @@ bool solidity_convertert::get_call_definition(
   func_body.move_to_operands(label);
 
   exprt addr_expr = symbol_expr(addr_added_symbol);
-  exprt msg_sender = symbol_expr(*context.find_symbol("c:@msg_sender"));
+  const symbolt &msg_sender_sym = *context.find_symbol("c:@msg_sender");
+  exprt msg_sender = symbol_expr(msg_sender_sym);
   symbolt this_sym = *context.find_symbol(call_id + "#this");
   exprt this_expr = symbol_expr(this_sym);
   exprt this_address = member_exprt(this_expr, "$address", addr_t);
@@ -2368,7 +2397,7 @@ bool solidity_convertert::get_call_definition(
     locationt());
   symbolt &added_old_sender = *move_symbol_to_context(old_sender);
   code_declt old_sender_decl(symbol_expr(added_old_sender));
-  added_old_sender.set_value(msg_sender);
+  added_old_sender.set_value(symbol_expr2tc(msg_sender_sym));
   old_sender_decl.operands().push_back(msg_sender);
   func_body.move_to_operands(old_sender_decl);
 
@@ -2449,7 +2478,7 @@ bool solidity_convertert::get_call_definition(
   return_expr.return_value() = false_exprt();
   func_body.move_to_operands(return_expr);
 
-  added_symbol.set_value(func_body);
+  added_symbol.set_value(migrate_expr(func_body));
   new_expr = symbol_expr(added_symbol);
   return false;
 }
@@ -2460,7 +2489,7 @@ bool solidity_convertert::get_call_definition(
  * @base: target
  * @value: msg.value
  * @block: returns
-*/
+ */
 bool solidity_convertert::model_transaction(
   const nlohmann::json &expr,
   const exprt &this_expr,
@@ -2493,7 +2522,8 @@ bool solidity_convertert::model_transaction(
     return true;
 
   typet val_t = unsignedbv_typet(256);
-  exprt msg_value = symbol_expr(*context.find_symbol("c:@msg_value"));
+  const symbolt &msg_value_sym = *context.find_symbol("c:@msg_value");
+  exprt msg_value = symbol_expr(msg_value_sym);
 
   if (get_high_level_call_wrapper(cname, this_expr, front_block, back_block))
     return true;
@@ -2510,7 +2540,7 @@ bool solidity_convertert::model_transaction(
     loc);
   symbolt &added_old_value = *move_symbol_to_context(old_value);
   code_declt old_val_decl(symbol_expr(added_old_value));
-  added_old_value.set_value(msg_value);
+  added_old_value.set_value(symbol_expr2tc(msg_value_sym));
   old_val_decl.operands().push_back(msg_value);
   front_block.move_to_operands(old_val_decl);
 
@@ -2601,23 +2631,23 @@ bool solidity_convertert::get_call_value_definition(
   param.cmt_identifier(val_id);
   t.arguments().push_back(param);
 
-  added_symbol.set_type(t);
+  added_symbol.set_type(migrate_type(t));
 
   // body:
   /*
   __ESBMC_Hide;
   uint256_t old_value = msg_value;
   uint160_t old_sender =  msg_sender;
-  if(_addr == _ESBMC_Object_x.$address) 
-  {    
+  if(_addr == _ESBMC_Object_x.$address)
+  {
     *! we do not consider gas consumption
 
-    msg_value = value 
+    msg_value = value
     msg_sender = this.address;
     if(this.balance < x)      <-- simulate EVM rollback
       return false;
-    this.balance -= x; 
-    _ESBMC_Object_x.balance += x; 
+    this.balance -= x;
+    _ESBMC_Object_x.balance += x;
 
     _ESBMC_Object_x.receive() * or fallback
 
@@ -2626,7 +2656,7 @@ bool solidity_convertert::get_call_value_definition(
     return true;
   }
   if(...) {...}
-  
+
   return false;
   */
   code_blockt func_body;
@@ -2639,8 +2669,10 @@ bool solidity_convertert::get_call_value_definition(
   label.code() = code_skipt();
   func_body.operands().push_back(label);
 
-  exprt msg_sender = symbol_expr(*context.find_symbol("c:@msg_sender"));
-  exprt msg_value = symbol_expr(*context.find_symbol("c:@msg_value"));
+  const symbolt &msg_sender_sym = *context.find_symbol("c:@msg_sender");
+  exprt msg_sender = symbol_expr(msg_sender_sym);
+  const symbolt &msg_value_sym = *context.find_symbol("c:@msg_value");
+  exprt msg_value = symbol_expr(msg_value_sym);
   symbolt this_sym = *context.find_symbol(call_id + "#this");
   exprt this_expr = symbol_expr(this_sym);
   exprt this_address = member_exprt(this_expr, "$address", addrp_t);
@@ -2657,7 +2689,7 @@ bool solidity_convertert::get_call_value_definition(
     locationt());
   symbolt &added_old_value = *move_symbol_to_context(old_value);
   code_declt old_val_decl(symbol_expr(added_old_value));
-  added_old_value.set_value(msg_value);
+  added_old_value.set_value(symbol_expr2tc(msg_value_sym));
   old_val_decl.operands().push_back(msg_value);
   func_body.move_to_operands(old_val_decl);
 
@@ -2672,7 +2704,7 @@ bool solidity_convertert::get_call_value_definition(
     locationt());
   symbolt &added_old_sender = *move_symbol_to_context(old_sender);
   code_declt old_sender_decl(symbol_expr(added_old_sender));
-  added_old_sender.set_value(msg_sender);
+  added_old_sender.set_value(symbol_expr2tc(msg_sender_sym));
   old_sender_decl.operands().push_back(msg_sender);
   func_body.move_to_operands(old_sender_decl);
 
@@ -2803,7 +2835,7 @@ bool solidity_convertert::get_call_value_definition(
   return_expr.return_value() = false_exprt();
   func_body.move_to_operands(return_expr);
 
-  added_symbol.set_value(func_body);
+  added_symbol.set_value(migrate_expr(func_body));
   new_expr = symbol_expr(added_symbol);
   return false;
 }
@@ -2852,7 +2884,7 @@ bool solidity_convertert::get_transfer_definition(
   param.cmt_identifier(val_id);
   t.arguments().push_back(param);
 
-  added_symbol.set_type(t);
+  added_symbol.set_type(migrate_type(t));
 
   code_blockt func_body;
   exprt addr_expr = symbol_expr(addr_added_symbol);
@@ -2864,8 +2896,10 @@ bool solidity_convertert::get_transfer_definition(
   label.code() = code_skipt();
   func_body.operands().push_back(label);
 
-  exprt msg_sender = symbol_expr(*context.find_symbol("c:@msg_sender"));
-  exprt msg_value = symbol_expr(*context.find_symbol("c:@msg_value"));
+  const symbolt &msg_sender_sym = *context.find_symbol("c:@msg_sender");
+  exprt msg_sender = symbol_expr(msg_sender_sym);
+  const symbolt &msg_value_sym = *context.find_symbol("c:@msg_value");
+  exprt msg_value = symbol_expr(msg_value_sym);
   symbolt this_sym = *context.find_symbol(call_id + "#this");
   exprt this_expr = symbol_expr(this_sym);
   exprt this_address = member_exprt(this_expr, "$address", addrp_t);
@@ -2883,7 +2917,7 @@ bool solidity_convertert::get_transfer_definition(
     locationt());
   symbolt &added_old_value = *move_symbol_to_context(old_value);
   code_declt old_val_decl(symbol_expr(added_old_value));
-  added_old_value.set_value(msg_value);
+  added_old_value.set_value(symbol_expr2tc(msg_value_sym));
   old_val_decl.operands().push_back(msg_value);
   func_body.move_to_operands(old_val_decl);
 
@@ -2899,7 +2933,7 @@ bool solidity_convertert::get_transfer_definition(
     locationt());
   symbolt &added_old_sender = *move_symbol_to_context(old_sender);
   code_declt old_sender_decl(symbol_expr(added_old_sender));
-  added_old_sender.set_value(msg_sender);
+  added_old_sender.set_value(symbol_expr2tc(msg_sender_sym));
   old_sender_decl.operands().push_back(msg_sender);
   func_body.move_to_operands(old_sender_decl);
 
@@ -3048,7 +3082,7 @@ bool solidity_convertert::get_transfer_definition(
   return_expr.return_value() = false_exprt();
   func_body.move_to_operands(return_expr);
 
-  added_symbol.set_value(func_body);
+  added_symbol.set_value(migrate_expr(func_body));
   new_expr = symbol_expr(added_symbol);
   return false;
 }
@@ -3098,7 +3132,7 @@ bool solidity_convertert::get_send_definition(
   param.cmt_identifier(val_id);
   t.arguments().push_back(param);
 
-  added_symbol.set_type(t);
+  added_symbol.set_type(migrate_type(t));
 
   code_blockt func_body;
   exprt addr_expr = symbol_expr(addr_added_symbol);
@@ -3110,8 +3144,10 @@ bool solidity_convertert::get_send_definition(
   label.code() = code_skipt();
   func_body.operands().push_back(label);
 
-  exprt msg_sender = symbol_expr(*context.find_symbol("c:@msg_sender"));
-  exprt msg_value = symbol_expr(*context.find_symbol("c:@msg_value"));
+  const symbolt &msg_sender_sym = *context.find_symbol("c:@msg_sender");
+  exprt msg_sender = symbol_expr(msg_sender_sym);
+  const symbolt &msg_value_sym = *context.find_symbol("c:@msg_value");
+  exprt msg_value = symbol_expr(msg_value_sym);
   symbolt this_sym = *context.find_symbol(call_id + "#this");
   exprt this_expr = symbol_expr(this_sym);
   exprt this_address = member_exprt(this_expr, "$address", addr_t);
@@ -3128,7 +3164,7 @@ bool solidity_convertert::get_send_definition(
     locationt());
   symbolt &added_old_value = *move_symbol_to_context(old_value);
   code_declt old_val_decl(symbol_expr(added_old_value));
-  added_old_value.set_value(msg_value);
+  added_old_value.set_value(symbol_expr2tc(msg_value_sym));
   old_val_decl.operands().push_back(msg_value);
   func_body.move_to_operands(old_val_decl);
 
@@ -3143,7 +3179,7 @@ bool solidity_convertert::get_send_definition(
     locationt());
   symbolt &added_old_sender = *move_symbol_to_context(old_sender);
   code_declt old_sender_decl(symbol_expr(added_old_sender));
-  added_old_sender.set_value(msg_sender);
+  added_old_sender.set_value(symbol_expr2tc(msg_sender_sym));
   old_sender_decl.operands().push_back(msg_sender);
   func_body.move_to_operands(old_sender_decl);
 
@@ -3191,7 +3227,8 @@ bool solidity_convertert::get_send_definition(
     // if(this.balance < val) return false;
     exprt less_than = exprt("<", val_expr.type());
     less_than.copy_to_operands(this_balance, val_expr);
-    //! "ifthenelse" has to be declared as codet, not exprt and use convert_expr_to_code
+    //! "ifthenelse" has to be declared as codet, not exprt and use
+    //! convert_expr_to_code
     codet cmp_less_than("ifthenelse");
     code_returnt ret_false;
     ret_false.return_value() = false_exprt();
@@ -3276,7 +3313,7 @@ bool solidity_convertert::get_send_definition(
   return_expr.return_value() = false_exprt();
   func_body.move_to_operands(return_expr);
 
-  added_symbol.set_value(func_body);
+  added_symbol.set_value(migrate_expr(func_body));
   new_expr = symbol_expr(added_symbol);
 
   return false;
@@ -3316,7 +3353,7 @@ bool solidity_convertert::get_staticcall_definition(
   param.cmt_identifier(addr_id);
   t.arguments().push_back(param);
 
-  added_symbol.set_type(t);
+  added_symbol.set_type(migrate_type(t));
 
   // body: same as call#0
   code_blockt func_body;
@@ -3327,7 +3364,8 @@ bool solidity_convertert::get_staticcall_definition(
   func_body.move_to_operands(label);
 
   exprt addr_expr = symbol_expr(addr_added_symbol);
-  exprt msg_sender = symbol_expr(*context.find_symbol("c:@msg_sender"));
+  const symbolt &msg_sender_sym = *context.find_symbol("c:@msg_sender");
+  exprt msg_sender = symbol_expr(msg_sender_sym);
   symbolt this_sym = *context.find_symbol(call_id + "#this");
   exprt this_expr = symbol_expr(this_sym);
   exprt this_address = member_exprt(this_expr, "$address", addr_t);
@@ -3343,7 +3381,7 @@ bool solidity_convertert::get_staticcall_definition(
     locationt());
   symbolt &added_old_sender = *move_symbol_to_context(old_sender);
   code_declt old_sender_decl(symbol_expr(added_old_sender));
-  added_old_sender.set_value(msg_sender);
+  added_old_sender.set_value(symbol_expr2tc(msg_sender_sym));
   old_sender_decl.operands().push_back(msg_sender);
   func_body.move_to_operands(old_sender_decl);
 
@@ -3379,7 +3417,7 @@ bool solidity_convertert::get_staticcall_definition(
         std::to_string(aux_counter++),
       locationt());
     symbolt &added_snap = *move_symbol_to_context(snap_sym);
-    added_snap.set_value(static_ins);
+    added_snap.set_value(migrate_expr(static_ins));
     code_declt snap_decl(symbol_expr(added_snap));
     snap_decl.operands().push_back(static_ins);
     then.move_to_operands(snap_decl);
@@ -3436,7 +3474,7 @@ bool solidity_convertert::get_staticcall_definition(
   return_expr.return_value() = false_exprt();
   func_body.move_to_operands(return_expr);
 
-  added_symbol.set_value(func_body);
+  added_symbol.set_value(migrate_expr(func_body));
   new_expr = symbol_expr(added_symbol);
   return false;
 }
@@ -3478,7 +3516,7 @@ bool solidity_convertert::get_delegatecall_definition(
   param.cmt_identifier(addr_id);
   t.arguments().push_back(param);
 
-  added_symbol.set_type(t);
+  added_symbol.set_type(migrate_type(t));
 
   // body:
   // Unlike call, delegatecall does NOT change msg.sender or msg.value.
@@ -3553,7 +3591,7 @@ bool solidity_convertert::get_delegatecall_definition(
   return_expr.return_value() = false_exprt();
   func_body.move_to_operands(return_expr);
 
-  added_symbol.set_value(func_body);
+  added_symbol.set_value(migrate_expr(func_body));
   new_expr = symbol_expr(added_symbol);
   return false;
 }
@@ -3599,8 +3637,8 @@ std::string solidity_convertert::find_contract_name_for_id(int func_id)
 
 // Handle a super.method() call.
 // The Solidity compiler has already resolved which base function to call via
-// C3 linearization; member_access["referencedDeclaration"] is that function's id.
-// We bypass the override map and call the base function directly on 'this'.
+// C3 linearization; member_access["referencedDeclaration"] is that function's
+// id. We bypass the override map and call the base function directly on 'this'.
 bool solidity_convertert::get_super_function_call(
   const nlohmann::json &member_access,
   const nlohmann::json &call_expr,

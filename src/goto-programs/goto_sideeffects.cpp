@@ -534,7 +534,8 @@ bool summary_has_sideeffect(const exprt &e)
 /// Fold @p e to a constant boolean: 1 = true, 0 = false, -1 = not a constant.
 /// -1 covers both "genuinely symbolic" and "constant, but the simplifier could
 /// not fold it"; either way the caller rejects the callee, so a stronger
-/// simplifier only widens the set of accepted shapes, it never changes a result.
+/// simplifier only widens the set of accepted shapes, it never changes a
+/// result.
 int summary_fold_bool(const exprt &e)
 {
   expr2tc e2;
@@ -559,10 +560,10 @@ void summary_coerce(exprt &e, const typet &t)
     e.make_typecast(t);
 }
 
-/// Whether `if(c, e, e')' may be pushed into the operands of @p id.  `/', `mod',
-/// `index' and `dereference' are excluded because the mux would then select
-/// their operand rather than their result, leaving a single site where the
-/// source had one per arm -- a divisor check, say, would cover only the
+/// Whether `if(c, e, e')' may be pushed into the operands of @p id.  `/',
+/// `mod', `index' and `dereference' are excluded because the mux would then
+/// select their operand rather than their result, leaving a single site where
+/// the source had one per arm -- a divisor check, say, would cover only the
 /// selected divisor.  (goto_check does not currently instrument inside a
 /// quantifier body, so this is about not depending on that.)
 bool summary_mux_pushable(const irep_idt &id)
@@ -877,9 +878,9 @@ summarize_code(const codet &code, summary_statet &st, const namespacet &ns)
     st.locals = outer;
     // Merge every outer-scope local written on either path; a variable written
     // in only one branch takes its pre-branch value on the other.  Values only
-    // defined on one path (declared without initializer, assigned in one branch)
-    // are left unset so a later unconditional read bails.  Locals declared
-    // inside a branch drop out of scope with the restore above.
+    // defined on one path (declared without initializer, assigned in one
+    // branch) are left unset so a later unconditional read bails.  Locals
+    // declared inside a branch drop out of scope with the restore above.
     std::set<irep_idt> keys;
     for (const auto &kv : then_env)
       if (outer.count(kv.first))
@@ -973,7 +974,8 @@ summarize_code(const codet &code, summary_statet &st, const namespacet &ns)
       if (!summarize_code(*body, st, ns))
         return false;
       // The frontend wraps the loop iterator in a code_expressiont; route it
-      // through summarize_code, which unwraps the statement to apply its effect.
+      // through summarize_code, which unwraps the statement to apply its
+      // effect.
       if (iter && iter->is_not_nil())
       {
         if (iter->is_code())
@@ -1349,7 +1351,8 @@ bool goto_convertt::has_sideeffect(const expr2tc &expr)
   if (is_nil_expr(expr))
     return false;
 
-  // A legacy "sideeffect" exprt migrates to sideeffect2t (function_call, malloc,
+  // A legacy "sideeffect" exprt migrates to sideeffect2t (function_call,
+  // malloc,
   // ++/--, …) OR sideeffect_assign2t (assignment / compound-assignment used as
   // an expression); the legacy has_sideeffect treats both as side effects.
   if (is_sideeffect2t(expr) || is_sideeffect_assign2t(expr))
@@ -1404,6 +1407,122 @@ void goto_convertt::flatten_contract_clause(exprt &clause, goto_programt &dest)
   remove_sideeffects(clause, dest);
 }
 
+/// Lower a value-discarding `A && B` as `if (A) B;`, `A || B` as `if (!A) B;`.
+/// The ternary rebuild encodes the same control flow but materialises the
+/// discarded boolean, hiding the lone-`assert(false)` branch body that
+/// generate_ifthenelse folds. MSVC's <assert.h> spells an assertion that way --
+/// `(void)((!!(e)) || (_wassert(...), 0))` -- so unfolded it stays `ASSERT 0`
+/// under `!e` rather than the `ASSERT e` glibc and Darwin produce, and a
+/// constant-false claim holds on no path, defeating any consumer that asks
+/// whether it can (#7585).
+///
+/// False, \p expr untouched, where the rewrite does not apply: value used, tail
+/// side-effect-free (its evaluation may still raise a claim the ternary keeps),
+/// or condition coverage / witness validation needs the original operands --
+/// the gates generate_ifthenelse applies to its own folds.
+bool goto_convertt::lower_discarded_short_circuit(
+  exprt &expr,
+  goto_programt &dest,
+  bool result_is_used)
+{
+  if (result_is_used || expr.operands().size() < 2)
+    return false;
+
+  if (
+    options.get_bool_option("condition-coverage") ||
+    options.get_bool_option("condition-coverage-claims") ||
+    options.get_bool_option("condition-coverage-rm") ||
+    options.get_bool_option("condition-coverage-claims-rm") ||
+    options.get_bool_option("validate-violation-witness"))
+    return false;
+
+  exprt::operandst ops = expr.operands();
+  exprt tail = ops.back();
+  if (ops.size() > 2)
+  {
+    tail = exprt(expr.id(), expr.type());
+    tail.operands().assign(ops.begin() + 1, ops.end());
+    tail.location() = expr.location();
+  }
+
+  if (!has_sideeffect(tail))
+    return false;
+
+  const locationt location = expr.location();
+  exprt guard = ops.front();
+  guard.location() = location;
+  remove_sideeffects(guard, dest, true);
+  if (expr.is_or())
+    guard = boolean_negate(guard);
+
+  goto_programt body;
+  remove_sideeffects(tail, body, false);
+  if (tail.is_not_nil())
+    convert(code_expressiont(tail), body);
+
+  goto_programt no_else;
+  generate_ifthenelse(guard, body, no_else, location, dest);
+  expr.make_nil();
+  return true;
+}
+
+/// Rebuild `A && B` as `A ? B : false` and `A || B` as `A ? true : B`, right to
+/// left over the operands, so the generic lowering below handles it.
+void goto_convertt::rewrite_short_circuit_as_ternary(exprt &expr)
+{
+  exprt tmp;
+
+  if (expr.is_and())
+    tmp = true_exprt();
+  else
+    // ID_or
+    tmp = false_exprt();
+
+  // Make sure we do not lose the location in tmp
+  tmp.location() = expr.location();
+
+  exprt::operandst &ops = expr.operands();
+
+  // start with last one
+  for (exprt::operandst::reverse_iterator it = ops.rbegin(); it != ops.rend();
+       ++it)
+  {
+    exprt &op = *it;
+
+    // This is a hack for now. We need to solve this properly by
+    // correctly tracking all locations through all GOTO transformations
+    op.location() = expr.location();
+
+    if (!op.is_boolean())
+    {
+      log_error("{} takes boolean operands only", expr.id().as_string());
+      abort();
+    }
+
+    if (expr.is_and())
+    {
+      // We need to record the location of the newly generated expression
+      exprt false_expr = false_exprt();
+      false_expr.location() = op.location();
+      if_exprt if_e(op, tmp, false_expr);
+      if_e.location() = op.location();
+      tmp.swap(if_e);
+    }
+    else // ID_or
+    {
+      // We need to record the location of the newly generated expression
+      exprt true_expr = true_exprt();
+      true_expr.location() = op.location();
+      if_exprt if_e(op, true_expr, tmp);
+      if_e.location() = op.location();
+      tmp.swap(if_e);
+    }
+  }
+
+  expr.swap(tmp);
+  expr.location() = tmp.location();
+}
+
 void goto_convertt::remove_sideeffects(
   exprt &expr,
   goto_programt &dest,
@@ -1435,58 +1554,10 @@ void goto_convertt::remove_sideeffects(
       abort();
     }
 
-    exprt tmp;
+    if (lower_discarded_short_circuit(expr, dest, result_is_used))
+      return;
 
-    if (expr.is_and())
-      tmp = true_exprt();
-    else
-      // ID_or
-      tmp = false_exprt();
-
-    // Make sure we do not lose the location in tmp
-    tmp.location() = expr.location();
-
-    exprt::operandst &ops = expr.operands();
-
-    // start with last one
-    for (exprt::operandst::reverse_iterator it = ops.rbegin(); it != ops.rend();
-         ++it)
-    {
-      exprt &op = *it;
-
-      // This is a hack for now. We need to solve this properly by
-      // correctly tracking all locations through all GOTO transformations
-      op.location() = expr.location();
-
-      if (!op.is_boolean())
-      {
-        log_error("{} takes boolean operands only", expr.id().as_string());
-        abort();
-      }
-
-      if (expr.is_and())
-      {
-        // We need to record the location of the newly generated expression
-        exprt false_expr = false_exprt();
-        false_expr.location() = op.location();
-        if_exprt if_e(op, tmp, false_expr);
-        if_e.location() = op.location();
-        tmp.swap(if_e);
-      }
-      else // ID_or
-      {
-        // We need to record the location of the newly generated expression
-        exprt true_expr = true_exprt();
-        true_expr.location() = op.location();
-        if_exprt if_e(op, true_expr, tmp);
-        if_e.location() = op.location();
-        tmp.swap(if_e);
-      }
-    }
-
-    expr.swap(tmp);
-    expr.location() = tmp.location();
-
+    rewrite_short_circuit_as_ternary(expr);
     remove_sideeffects(expr, dest, result_is_used);
     return;
   }
@@ -1499,8 +1570,8 @@ void goto_convertt::remove_sideeffects(
     // If neither branch has a sideeffect and we are not validating a violation
     // witness, the ternary can stay as an if_exprt — no lowering needed.
     // Under --validate-violation-witness we always lower so that the resulting
-    // IF instruction carries the ? column from expr.location(), which symex_goto
-    // uses for column-accurate branching waypoint matching.
+    // IF instruction carries the ? column from expr.location(), which
+    // symex_goto uses for column-accurate branching waypoint matching.
     if (
       !has_sideeffect(to_if_expr(expr).true_case()) &&
       !has_sideeffect(to_if_expr(expr).false_case()) &&
@@ -1726,7 +1797,8 @@ void goto_convertt::remove_sideeffects(
           }
         }
         // Only bypass Forall_operands when we actually rewrote the && chain;
-        // otherwise (e.g. single foo(x) or foo(x)==0) fall through to normal path.
+        // otherwise (e.g. single foo(x) or foo(x)==0) fall through to normal
+        // path.
         if (and_expr)
         {
           remove_function_call(expr, dest, result_is_used);
@@ -1749,9 +1821,10 @@ void goto_convertt::remove_sideeffects(
             (inner->op0().is_and() || inner->op0().id() == "or"))
             inner = &inner->op0();
 
-          // Recurse through the full &&/|| tree so a side effect nested inside a
-          // disjunct's && chain is hoisted at the leaf rather than lowering the
-          // whole nested chain at once (which dropped leading conjuncts, #6298).
+          // Recurse through the full &&/|| tree so a side effect nested inside
+          // a disjunct's && chain is hoisted at the leaf rather than lowering
+          // the whole nested chain at once (which dropped leading conjuncts,
+          // #6298).
           if (inner->is_and() || inner->id() == "or")
           {
             flatten_contract_clause(args.front(), dest);
@@ -2382,11 +2455,14 @@ void goto_convertt::remove_function_call(
 
   goto_programt tmp_program;
   const typet &ftype = call.function().type();
-  if (ftype.return_type().id() == "constructor")
+  // A call that already passes the object (the IREP2 C++ adjust pass builds
+  // those) needs no temporary `this`.
+  if (
+    ftype.return_type().id() == "constructor" &&
+    call.arguments().size() < to_code_type(ftype).arguments().size())
   {
-    // for constructor, we need to add the implicit `this` as the first argument,
-    // so convert to:
-    // BLAH(&return_value$_BLAH$1, ...)
+    // for constructor, we need to add the implicit `this` as the first
+    // argument, so convert to: BLAH(&return_value$_BLAH$1, ...)
     side_effect_expr_function_callt ctor_call;
     ctor_call.function() = call.function();
     exprt::operandst &args = ctor_call.arguments();
@@ -2436,10 +2512,11 @@ void goto_convertt::remove_cpp_new(
   goto_programt &dest,
   bool result_is_used)
 {
-  // For side effect with 'cpp_new' statement, `expr' refers to the side effect that
-  // contains an initializer. Technically, this function converts the cpp_new side effect
-  // and replaces it with a new symbol if `result_is_used` is true. It's not just simply
-  // removing the side effect node in the exprt tree.
+  // For side effect with 'cpp_new' statement, `expr' refers to the side effect
+  // that contains an initializer. Technically, this function converts the
+  // cpp_new side effect and replaces it with a new symbol if `result_is_used`
+  // is true. It's not just simply removing the side effect node in the exprt
+  // tree.
   codet call;
 
   symbolt new_symbol;

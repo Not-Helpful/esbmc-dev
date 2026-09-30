@@ -111,19 +111,29 @@ public:
     return !t.get("#sol_bytesn_size").empty();
   }
 
-  // Set/get/test the Solidity contract name carried on a typet via the
-  // #sol_contract irep attribute (the declaring contract of a contract type).
-  static void set_sol_contract(typet &t, const irep_idt &cname)
+  // The declaring contract of a contract type. No longer carried on the typet:
+  // see get_sol_contract below.
+  /// Derived rather than read back from `#sol_contract`: a contract type is a
+  /// pointer to the contract's own `tag-<name>` symbol type, and the converter
+  /// already knows every contract's name, so the name need not ride on the type
+  /// -- which matters because IREP2 has no field for it
+  /// (docs/roadmap/scope-solidity-irep2.md §8).
+  std::string get_sol_contract(const typet &t) const
   {
-    t.set("#sol_contract", cname);
+    const typet &sub = t.is_pointer() ? t.subtype() : t;
+    if (sub.id() != typet::t_symbol)
+      return "";
+
+    const std::string id = sub.identifier().as_string();
+    if (id.compare(0, prefix.size(), prefix) != 0)
+      return "";
+
+    const std::string cname = id.substr(prefix.size());
+    return linearizedBaseList.count(cname) ? cname : "";
   }
-  static std::string get_sol_contract(const typet &t)
+  bool has_sol_contract(const typet &t) const
   {
-    return t.get("#sol_contract").as_string();
-  }
-  static bool has_sol_contract(const typet &t)
-  {
-    return !t.get("#sol_contract").empty();
+    return !get_sol_contract(t).empty();
   }
 
   // Set/get the Solidity "mapping-backed array" flag carried on a typet via
@@ -149,42 +159,33 @@ public:
   }
 
   // Set/get the Solidity "state variable" flag carried on a typet via the
-  // #sol_state_var irep attribute (stored as "1"/"0").
-  static void set_sol_state_var(typet &t, bool v)
-  {
-    t.set("#sol_state_var", v ? "1" : "0");
-  }
-  static bool get_sol_state_var(const typet &t)
-  {
-    return t.get("#sol_state_var") == "1";
-  }
+  /// Whether a declared variable is a contract state variable. Held here, keyed
+  /// by the variable's symbol id, rather than on its `typet`: IREP2 has no
+  /// field for it, and a symbol's id survives every migration by construction,
+  /// so the frontend keeps what is Solidity-level and the shared representation
+  /// stays closed (docs/roadmap/scope-solidity-irep2.md §10).
+  std::unordered_set<irep_idt> sol_state_vars;
 
-  // Set/get the Solidity builtin name carried on a typet via the #sol_name
-  // irep attribute.
-  static void set_sol_name(typet &t, const irep_idt &name)
+  void set_sol_state_var(const irep_idt &symbol_id, bool v)
   {
-    t.set("#sol_name", name);
+    if (v)
+      sol_state_vars.insert(symbol_id);
+    else
+      sol_state_vars.erase(symbol_id);
   }
-  static std::string get_sol_name(const typet &t)
+  bool get_sol_state_var(const irep_idt &symbol_id) const
   {
-    return t.get("#sol_name").as_string();
-  }
-
-  // Set the Solidity data location ("memory"/"storage"/"calldata") carried on
-  // a typet via the #sol_data_loc irep attribute. Set-only today (no readers);
-  // wrapped to keep every Solidity type-attribute write behind one seam.
-  static void set_sol_data_loc(typet &t, const irep_idt &loc)
-  {
-    t.set("#sol_data_loc", loc);
+    return sol_state_vars.count(symbol_id) != 0;
   }
 
   // json nodes that always empty
   // used as the return value for find_constructor_ref when
   // dealing with the implicit constructor call
-  // this is to avoid reference to stack memory associated with local variable returned
+  // this is to avoid reference to stack memory associated with local variable
+  // returned
   static const nlohmann::json empty_json;
-  //! Be careful of using 'current_contractName'. This might lead to trouble in inheritance.
-  //! If you are not sure, use 'get_current_contract_name' instead.
+  //! Be careful of using 'current_contractName'. This might lead to trouble in
+  //! inheritance. If you are not sure, use 'get_current_contract_name' instead.
   static std::string current_baseContractName;
 
   // json for Solidity AST. Use object for contract
@@ -335,7 +336,8 @@ protected:
     const nlohmann::json &expr,
     const nlohmann::json &callee_expr_json);
 
-  // handle the non-contract definition, including struct/enum/error/event/abstract/...
+  // handle the non-contract definition, including
+  // struct/enum/error/event/abstract/...
   bool get_noncontract_defition(nlohmann::json &ast_node);
   bool
   get_noncontract_decl_ref(const nlohmann::json &ast_node, exprt &new_expr);
@@ -402,8 +404,8 @@ protected:
     struct_typet::componentt &comp);
   bool get_block(
     const nlohmann::json &expr,
-    exprt &
-      new_expr); // For Solidity's mutually inclusive: rule block and rule statement
+    exprt &new_expr); // For Solidity's mutually inclusive: rule block and rule
+                      // statement
   bool get_statement(const nlohmann::json &block, exprt &new_expr);
   bool get_expr(const nlohmann::json &expr, exprt &new_expr);
   bool get_expr(
@@ -668,7 +670,7 @@ protected:
     locationt &location);
   unsigned int
   get_line_number(const nlohmann::json &ast_node, bool final_position = false);
-  unsigned int add_offset(const std::string &src, unsigned int start_position);
+  size_t add_offset(const std::string &src, size_t start_position);
   std::string get_src_from_json(const nlohmann::json &ast_node);
 
   symbolt *move_symbol_to_context(symbolt &symbol);
@@ -937,7 +939,7 @@ protected:
   // dispatches only this public/external function (constructor + state
   // init still run). Empty means feature disabled.
   std::string focus_func;
-  //smart contract source file
+  // smart contract source file
   const std::string &contract_path;
 
   std::string absolute_path;
@@ -953,10 +955,13 @@ protected:
   // for tuple
   bool current_lhsDecl;
   bool current_rhsDecl;
-  // Use current level of BinOp type as the "anchor" type for numerical literal conversion:
-  // In order to remove the unnecessary implicit IntegralCast. We need type of current level of BinaryOperator.
-  // All numeric literals will be implicitly converted to this type. Pop it when finishing the current level of BinaryOperator.
-  // TODO: find a better way to deal with implicit type casting if it's not able to cope with complex rules
+  // Use current level of BinOp type as the "anchor" type for numerical literal
+  // conversion: In order to remove the unnecessary implicit IntegralCast. We
+  // need type of current level of BinaryOperator. All numeric literals will be
+  // implicitly converted to this type. Pop it when finishing the current level
+  // of BinaryOperator.
+  // TODO: find a better way to deal with implicit type casting if it's not able
+  // to cope with complex rules
   std::stack<const nlohmann::json *> current_BinOp_type;
   std::string current_functionName;
   // Track whether we are inside a Solidity "unchecked { ... }" block.
@@ -1016,7 +1021,8 @@ protected:
   // The prefix for the id of each class (Solidity-defined structs)
   std::string prefix = "tag-";
 
-  // The prefix for c2goto library struct types (C frontend uses "struct" in tag)
+  // The prefix for c2goto library struct types (C frontend uses "struct" in
+  // tag)
   std::string lib_prefix = "tag-struct ";
 
   // for auxiliary var name
@@ -1025,9 +1031,10 @@ protected:
   // bound setting
   bool is_bound;
 
-  // Check if a contract should use "new" expression semantics (dynamic allocation).
-  // In unbound mode with a single verification target, new-expressions are optimized
-  // away (treated as static instances) to reduce state space.
+  // Check if a contract should use "new" expression semantics (dynamic
+  // allocation). In unbound mode with a single verification target,
+  // new-expressions are optimized away (treated as static instances) to reduce
+  // state space.
   bool should_treat_as_new(const std::string &contract_name) const
   {
     if (!newContractSet.count(contract_name))
@@ -1071,7 +1078,8 @@ private:
 
   // RAII scope guards for global state variables.
   // Usage: ScopeGuard<T> guard(member, new_value);
-  // Restores original value on destruction (including early returns/exceptions).
+  // Restores original value on destruction (including early
+  // returns/exceptions).
   template <typename T>
   class ScopeGuard
   {

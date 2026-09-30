@@ -19,6 +19,8 @@
 #include <util/lang/c_types.h>
 #include <util/config/config.h>
 
+#include "float_consts.h"
+
 namespace
 {
 // a == b => a.crc() == b.crc(); count (but don't fail on) crc collisions.
@@ -78,6 +80,14 @@ TEST_CASE("expr crc is consistent with equality (H-B2)", "[core][irep2]")
     symbol2tc(u32, "y"),
     add2tc(u32, c5, c7),
     add2tc(u32, c5, c7), // equal to [10], distinct pointer
+    float_const(0.0),
+    float_const(0.0),       // equal to [12], distinct pointer
+    float_const(0.0, true), // -0.0: IEEE-equal to [12], a different literal
+    float_const(1.0),
+    float_nan(),
+    float_nan(), // equal to [16], though IEEE compares NaNs unequal
+    float_inf(false),
+    float_inf(true),
   };
 
   check_crc_consistency(corpus);
@@ -119,8 +129,8 @@ TEST_CASE("crc is deterministic across construction (H-B2)", "[core][irep2]")
   REQUIRE(a->crc() == b->crc());
 
   // Deterministic spot-check (not the probabilistic a!=b=>distinct-crc law that
-  // the sweep above only WARNs on): these two fixed structures must not collide,
-  // confirming the chain length is actually mixed into the hash.
+  // the sweep above only WARNs on): these two fixed structures must not
+  // collide, confirming the chain length is actually mixed into the hash.
   expr2tc shorter = deep_add_chain(1999);
   REQUIRE(a != shorter);
   REQUIRE(a->crc() != shorter->crc());

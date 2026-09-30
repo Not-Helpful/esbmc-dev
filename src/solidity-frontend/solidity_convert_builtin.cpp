@@ -1,5 +1,6 @@
 /// \file solidity_convert_builtin.cpp
-/// \brief Built-in function and low-level call handling for the Solidity frontend.
+/// \brief Built-in function and low-level call handling for the Solidity
+/// frontend.
 ///
 /// Implements recognition and conversion of Solidity built-in operations:
 /// low-level calls (call, delegatecall, staticcall, transfer, send),
@@ -136,9 +137,9 @@ bool solidity_convertert::add_auxiliary_members(
 
   // for dynamic bytes
   // for each contract, we add a static infinity array {$cname}_pool
-  // e.g. __attribute__((annotate("__ESBMC_inf_size"))) unsigned char base_pool[1];
-  // then we add symbol call $dynamic_pool
-  // e.g. BytesPool pool = bytes_pool_init(base_pool);
+  // e.g. __attribute__((annotate("__ESBMC_inf_size"))) unsigned char
+  // base_pool[1]; then we add symbol call $dynamic_pool e.g. BytesPool pool =
+  // bytes_pool_init(base_pool);
   // 1. declare static base pool
 
   // however, this will affect the performance,
@@ -302,16 +303,12 @@ void solidity_convertert::get_builtin_symbol(
 
   symbolt sym;
   get_default_symbol(sym, "C++", t, name, id, l);
-  {
-    typet st = sym.get_type();
-    set_sol_state_var(st, true);
-    sym.set_type(std::move(st));
-  }
+  set_sol_state_var(id, true);
   sym.file_local = true;
   sym.lvalue = true;
   auto &added_sym = *move_symbol_to_context(sym);
   code_declt decl(symbol_expr(added_sym));
-  added_sym.set_value(val);
+  added_sym.set_value(migrate_expr(val));
   decl.operands().push_back(val);
   move_to_initializer(decl);
 
@@ -510,12 +507,13 @@ void solidity_convertert::get_builtin_property_expr(
      get_sol_type(base.op0().type()) == SolidityGrammar::SolType::CONTRACT))
     // e.g. address(_ins_).balance => _ins_.balance
     //      address(this) => this->address
-    //TODO: fixme! this pattern match is weak
+    // TODO: fixme! this pattern match is weak
     mem = member_exprt(base.op0(), comp_name, t);
   else
   {
     // e.g. address(msg.sender).balance
-    // we do not know what instance is msg.sender pointed to, so over-approximate
+    // we do not know what instance is msg.sender pointed to, so
+    // over-approximate
     get_aux_property_function(cname, base, t, loc, name, mem);
   }
 

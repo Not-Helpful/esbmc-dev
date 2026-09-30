@@ -712,8 +712,9 @@ interval_domaint::make_expression_value<interval_domaint::real_intervalt>(
     (upper ? *interval.upper : *interval.lower).convert_to<double>();
   v.value.from_double(d);
 
-  // 'from_double' changes the original spec. This makes solvers complain that we are comparing
-  // 'orange' floats to 'apple' floats. To fix this, we need to convert the spec back.
+  // 'from_double' changes the original spec. This makes solvers complain that
+  // we are comparing 'orange' floats to 'apple' floats. To fix this, we need to
+  // convert the spec back.
   const ieee_float_spect original_spec(
     to_floatbv_type(type).fraction, to_floatbv_type(type).exponent);
   v.value.change_spec(original_spec);
@@ -859,7 +860,9 @@ void print_interval(
   out << name;
 
   if (i.upper)
-    out << " <= " << i.get_upper() << "\n";
+    out << " <= " << i.get_upper();
+
+  out << "\n";
 }
 
 // TODO: refactor
@@ -908,7 +911,7 @@ bool contains_float(const expr2tc &e)
 void interval_domaint::transform(
   goto_programt::const_targett from,
   goto_programt::const_targett to,
-  ai_baset &,
+  ai_baset &ai,
   const namespacet &ns)
 {
   (void)ns;
@@ -985,12 +988,8 @@ void interval_domaint::transform(
   }
 
   case ASSERT:
-  {
-    // There is a bug in Floats that need to be investigated! regression-float/nextafter
-    if (!contains_float(instruction.guard) && enable_assume_asserts)
-      assume(instruction.guard);
+    assume_assertion(instruction.guard, ai);
     break;
-  }
 
   case FUNCTION_CALL:
   case END_FUNCTION:
@@ -1007,9 +1006,10 @@ void interval_domaint::transform(
     break;
   }
 
-  /* The abstract interpreter can only affect the state 'after' the execution of the statement
-   * however, function calls need to change the parameter 'before' its execution. We can
-   * deal with this by just checking if the target instruction is a function call!
+  /* The abstract interpreter can only affect the state 'after' the execution of
+   * the statement however, function calls need to change the parameter 'before'
+   * its execution. We can deal with this by just checking if the target
+   * instruction is a function call!
    */
   if (to->is_function_call())
   {
@@ -1029,10 +1029,17 @@ void interval_domaint::transform(
     // Let's do an assignment for all parameters!
     for (size_t i = 0; i < function.arguments.size(); i++)
     {
-      const expr2tc &arg_value = code_function_call.operands[i];
       const type2tc &arg_type = function.arguments[i];
       const expr2tc arg_symbol =
         symbol2tc(arg_type, function.argument_names[i]);
+
+      if (i >= code_function_call.operands.size())
+      {
+        havoc_rec(arg_symbol);
+        continue;
+      }
+
+      const expr2tc &arg_value = code_function_call.operands[i];
 
       // Are we dealing with a recursive function?
       std::unordered_set<expr2tc, irep2_hash> symbols;
@@ -1137,7 +1144,7 @@ bool interval_domaint::join(
          * This happens due to the Abstract Interpreter
          * being unable to merge the information that is
          * coming before the loop (see #1738)
-        */
+         */
         log_error(
           "Narrowing is currently disabled. See GitHub issue #1738 for more "
           "details");
@@ -1219,48 +1226,20 @@ bool interval_domaint::join(
   return result;
 }
 
-void interval_domaint::phi_join_with_snapshot(
-  const expr2tc &lhs,
-  const std::shared_ptr<interval_map> &if_snapshot)
+void interval_domaint::join_snapshot(
+  const std::shared_ptr<interval_map> &snapshot)
 {
-  if (!is_symbol2t(lhs))
+  if (is_bottom())
+  {
+    bottom = false;
+    intervals = snapshot;
+    copied = false;
     return;
-  const irep_idt &name = to_symbol2t(lhs).thename;
-  const auto if_it = if_snapshot->find(name);
-
+  }
+  if (intervals == snapshot)
+    return;
   copy_if_needed();
-
-  if (if_it == if_snapshot->end())
-  {
-    // JOIN(TOP, else) = TOP
-    intervals->erase(name);
-    return;
-  }
-
-  const auto dst_it = intervals->find(name);
-  if (dst_it == intervals->end())
-    return; // JOIN(if, TOP) = TOP
-
-  const auto &src = if_it->second;
-  auto &dst = dst_it->second;
-  if (src.index() != dst.index())
-    return;
-
-  switch (src.index())
-  {
-  case 0:
-    join_intervals<integer_intervalt>(
-      std::get<0>(src), std::get<0>(dst), false);
-    break;
-  case 1:
-    join_intervals<real_intervalt>(std::get<1>(src), std::get<1>(dst), false);
-    break;
-  case 2:
-    join_intervals<wrapped_interval>(std::get<2>(src), std::get<2>(dst), false);
-    break;
-  default:
-    break;
-  }
+  join(*intervals, *snapshot, false);
 }
 
 void interval_domaint::assign(const expr2tc &expr, const bool recursive)
@@ -1306,7 +1285,8 @@ void interval_domaint::havoc_rec(const expr2tc &expr)
   }
   else if (is_symbol2t(expr) || is_code_decl2t(expr))
   {
-    // Reset the interval domain if it is being reassigned (-infinity, +infinity).
+    // Reset the interval domain if it is being reassigned (-infinity,
+    // +infinity).
     irep_idt identifier = is_symbol2t(expr) ? to_symbol2t(expr).thename
                                             : to_code_decl2t(expr).value;
     if (intervals->count(identifier))
@@ -1377,6 +1357,18 @@ void interval_domaint::assume_rec(
   else if (
     is_floatbv_type(lhs) && is_floatbv_type(rhs) && enable_real_intervals)
     apply_assume_less<interval_domaint::real_intervalt>(lhs, rhs);
+}
+
+void interval_domaint::assume_assertion(
+  const expr2tc &guard,
+  const ai_baset &ai)
+{
+  // There is a bug in Floats that need to be investigated!
+  // regression-float/nextafter
+  if (
+    enable_assume_asserts && !ai.continue_past_failed_assertions &&
+    !contains_float(guard))
+    assume(guard);
 }
 
 void interval_domaint::assume(const expr2tc &cond)
@@ -1544,7 +1536,8 @@ void interval_domaint::assume_rec(const expr2tc &cond, bool negation)
   {
     assume_rec(to_typecast2t(cond).from, negation);
   }
-  //added in case "cond = false" which happens when the ibex contractor results in empty set.
+  // added in case "cond = false" which happens when the ibex contractor results
+  // in empty set.
   else if (is_constant_bool2t(cond))
   {
     if ((negation && is_true(cond)) || (!negation && is_false(cond)))
@@ -1651,6 +1644,17 @@ void interval_domaint::process_instruction(goto_programt::const_targett from)
   case ASSUME:
     assume(instruction.guard);
     break;
+  case FUNCTION_CALL:
+  {
+    const expr2tc &ret = to_code_function_call2t(instruction.code).ret;
+    if (is_nil_expr(ret))
+      break;
+    if (is_dereference2t(ret))
+      clear_state();
+    else
+      havoc_rec(ret);
+    break;
+  }
   default:
     log_debug(
       "interval",

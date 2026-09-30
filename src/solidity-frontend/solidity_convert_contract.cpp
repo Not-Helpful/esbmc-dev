@@ -107,7 +107,8 @@ void solidity_convertert::add_static_contract_instance(const std::string c_name)
   if (context.find_symbol(ctor_id) == nullptr)
   {
     // this means that contract, including ctor, has not been parse yet
-    // this will lead to issue in the following process, particuarly this_pointer
+    // this will lead to issue in the following process, particuarly
+    // this_pointer
     const auto &json = find_constructor_ref(c_name);
     if (json.empty())
     {
@@ -240,7 +241,7 @@ void solidity_convertert::get_inherit_ctor_definition(
   param.cmt_identifier(aid);
   param.location() = l;
   ft.arguments().push_back(param);
-  add_sym.set_type(ft);
+  add_sym.set_type(migrate_type(ft));
 
   // body
   exprt func_body = code_blockt();
@@ -468,7 +469,7 @@ bool solidity_convertert::get_high_level_call_wrapper(
     locationt());
   symbolt &added_old_sender = *move_symbol_to_context(old_sender);
   code_declt old_sender_decl(symbol_expr(added_old_sender));
-  added_old_sender.set_value(msg_sender);
+  added_old_sender.set_value(migrate_expr(msg_sender));
   old_sender_decl.operands().push_back(msg_sender);
   front_block.move_to_operands(old_sender_decl);
 
@@ -551,11 +552,11 @@ nlohmann::json solidity_convertert::reorder_arguments(
 
 /*
   perform multi-transaction verification
-  the idea is to verify the assertions that must be held 
+  the idea is to verify the assertions that must be held
   in any function calling order.
   convert the verifying contract to a "sol_main" function, e.g.
 
-  Contract Base             
+  Contract Base
   {
       constrcutor(){}
       function A(){}
@@ -574,9 +575,12 @@ nlohmann::json solidity_convertert::reorder_arguments(
     }
   }
 
-  Additionally, we need to handle the inheritance. Theoretically, we need to merge (i.e. create a copy) the public and internal state variables and functions inside Base contracts into the Derive contract. However, in practice we do not need to do so. Instead, we 
-    - call the constructors based on the linearizedBaseList 
-    - add the inherited public function call to the if-body 
+  Additionally, we need to handle the inheritance. Theoretically, we need to
+  merge (i.e. create a copy) the public and internal state variables and
+  functions inside Base contracts into the Derive contract. However, in practice
+  we do not need to do so. Instead, we
+    - call the constructors based on the linearizedBaseList
+    - add the inherited public function call to the if-body
 
 */
 bool solidity_convertert::multi_transaction_verification(
@@ -652,7 +656,7 @@ bool solidity_convertert::multi_transaction_verification(
   // no params
   main_type.make_ellipsis();
 
-  main_sym.set_type(main_type);
+  main_sym.set_type(migrate_type(main_type));
   main_sym.set_value(func_body);
 
   // set "_ESBMC_Main_X" as the main function
@@ -663,8 +667,8 @@ bool solidity_convertert::multi_transaction_verification(
 }
 
 /*
-  This function perform multi-transaction verification on each contract in isolation.
-  To do so, we construct nondetered switch_case;
+  This function perform multi-transaction verification on each contract in
+  isolation. To do so, we construct nondetered switch_case;
 */
 // Shared: call multi_transaction_verification for each contract and collect
 // the resulting _ESBMC_Main_X entry function symbols.
@@ -732,7 +736,7 @@ bool solidity_convertert::register_harness_main(
 
   symbolt &added_symbol = *context.move_symbol_to_context(new_symbol);
   main_type.make_ellipsis();
-  added_symbol.set_type(main_type);
+  added_symbol.set_type(migrate_type(main_type));
   added_symbol.set_value(func_body);
   config.main = sol_name;
   return false;

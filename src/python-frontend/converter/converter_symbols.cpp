@@ -5,6 +5,7 @@
 #include <util/arith/arith_tools.h>
 #include <util/message/message.h>
 
+#include <algorithm>
 #include <regex>
 #include <utility>
 
@@ -44,9 +45,12 @@ void python_converter::update_symbol(const exprt &expr) const
 
   // Update the type of the symbol and its value.
   const typet &expr_type = expr.type();
-  sym->set_type(expr_type);
+  sym->set_type(migrate_type(expr_type));
   {
     exprt v = sym->get_value();
+    // Stays legacy: this retypes the root only, so migrating eagerly would
+    // build an arith node over operands of the old type and trip
+    // assert_arith_2ops_consistency (docs/roadmap/scope-python-irep2.md §6.2).
     v.type() = expr_type;
     sym->set_value(std::move(v));
   }
@@ -80,7 +84,7 @@ void python_converter::update_symbol(const exprt &expr) const
         exprt new_value = from_integer(int_val, expr_type);
 
         // Assign the new value to the symbol.
-        sym->set_value(new_value);
+        sym->set_value(migrate_expr(new_value));
       }
       catch (const std::exception &e)
       {
@@ -234,6 +238,195 @@ symbolt *python_converter::find_method_in_imported_base(
   class symbol_id base_id(
     module_path, defined_name, is_ctor ? defined_name : method_name);
   return symbol_table_.find_symbol(base_id.to_string());
+}
+
+/// Whether import alias @p alias binds @p name: `import a.b` binds `a`, and
+/// `from m import *` may bind any name.
+static bool
+alias_binds_name(const nlohmann::json &alias, const std::string &name)
+{
+  const std::string imported = alias.value("name", "");
+  const nlohmann::json asname = alias.value("asname", nlohmann::json());
+  return imported == "*" ||
+         (asname.is_string() ? asname.get<std::string>()
+                             : imported.substr(0, imported.find('.'))) == name;
+}
+
+/// Whether @p node of type @p type names @p name as what it binds: an import
+/// alias, a parameter, or a def or class statement.
+static bool binds_by_name(
+  const nlohmann::json &node,
+  const std::string &type,
+  const std::string &name,
+  bool any_scope)
+{
+  if (type == "alias")
+    return alias_binds_name(node, name);
+  if (type == "arg")
+    return any_scope && node.value("arg", "") == name;
+  const nlohmann::json bound = node.value("name", nlohmann::json());
+  return bound.is_string() && bound.get<std::string>() == name;
+}
+
+static bool may_bind_name(
+  const nlohmann::json &node,
+  const std::string &name,
+  bool any_scope);
+
+/// Whether anything @p node of type @p type holds may bind @p name, reading a
+/// node that binds by itself rather than through a child.
+static bool may_bind_within(
+  const nlohmann::json &node,
+  const std::string &type,
+  const std::string &name,
+  bool any_scope)
+{
+  const auto binds = [&](const nlohmann::json &child) {
+    return may_bind_name(child, name, any_scope);
+  };
+  if (type == "Name")
+    return node.value("id", "") == name &&
+           node.value("ctx", nlohmann::json::object()).value("_type", "") !=
+             "Load";
+  // A bare annotation (`m: int`) records a type and binds nothing.
+  if (type == "AnnAssign" && node.value("value", nlohmann::json()).is_null())
+    return false;
+  return std::any_of(node.begin(), node.end(), binds);
+}
+
+/// Whether @p node, a statement or part of one, may bind @p name. Bindings in
+/// nested function and class bodies count only with @p any_scope, which a call
+/// site needs: it sees the scope it stands in as well as the module's.
+static bool may_bind_name(
+  const nlohmann::json &node,
+  const std::string &name,
+  bool any_scope)
+{
+  if (node.is_array())
+    return std::any_of(
+      node.begin(), node.end(), [&](const nlohmann::json &child) {
+        return may_bind_name(child, name, any_scope);
+      });
+  if (!node.is_object())
+    return false;
+
+  const std::string type = node.value("_type", "");
+  if (binds_by_name(node, type, name, any_scope))
+    return true;
+  if (type == "alias" || type == "arg")
+    return false;
+  if (type == "FunctionDef" || type == "AsyncFunctionDef" || type == "ClassDef")
+    return any_scope &&
+           std::any_of(
+             node.begin(), node.end(), [&](const nlohmann::json &child) {
+               return may_bind_name(child, name, any_scope);
+             });
+
+  return may_bind_within(node, type, name, any_scope);
+}
+
+bool python_converter::class_binds_name(
+  const std::string &class_name,
+  const std::string &name) const
+{
+  const nlohmann::json *node = sole_class_binding(class_name);
+  return node &&
+         may_bind_name(node->value("body", nlohmann::json()), name, false);
+}
+
+const nlohmann::json *
+python_converter::sole_class_binding(const std::string &name) const
+{
+  const nlohmann::json *found = nullptr;
+  for (const auto &stmt : (*ast_json)["body"])
+  {
+    // Any scope: a name the call site's own function binds is not this class.
+    if (!may_bind_name(stmt, name, true))
+      continue;
+    if (found || stmt.value("_type", "") != "ClassDef")
+      return nullptr;
+    found = &stmt;
+  }
+  return found;
+}
+
+std::optional<std::vector<std::string>>
+python_converter::c3_merge(std::vector<std::vector<std::string>> seqs)
+{
+  const auto in_a_tail = [&](const std::string &cls) {
+    return std::any_of(seqs.begin(), seqs.end(), [&](const auto &seq) {
+      return std::find(seq.begin() + 1, seq.end(), cls) != seq.end();
+    });
+  };
+
+  std::vector<std::string> merged;
+  for (;;)
+  {
+    seqs.erase(
+      std::remove_if(
+        seqs.begin(), seqs.end(), [](const auto &seq) { return seq.empty(); }),
+      seqs.end());
+    if (seqs.empty())
+      return merged;
+
+    const auto good =
+      std::find_if(seqs.begin(), seqs.end(), [&](const auto &seq) {
+        return !in_a_tail(seq.front());
+      });
+    if (good == seqs.end())
+      return std::nullopt;
+
+    const std::string head = good->front();
+    for (auto &seq : seqs)
+      if (seq.front() == head)
+        seq.erase(seq.begin());
+    merged.push_back(head);
+  }
+}
+
+std::optional<std::vector<std::string>>
+python_converter::class_mro(const std::string &class_name, mro_memo &memo) const
+{
+  // An entry stays empty while its class is being linearised, so reaching it
+  // again (a cycle) yields no order; a finished entry is reused.
+  const auto [entry, inserted] = memo.try_emplace(class_name);
+  if (!inserted)
+    return entry->second;
+
+  const nlohmann::json *node = sole_class_binding(class_name);
+  if (!node)
+    return std::nullopt;
+
+  std::vector<std::vector<std::string>> seqs;
+  std::vector<std::string> bases;
+  for (const auto &base : node->value("bases", nlohmann::json::array()))
+  {
+    const std::string base_name =
+      base.value("_type", "") == "Name" ? base.value("id", "") : std::string();
+    // object ends every MRO and declares no user method.
+    if (base_name == "object")
+      continue;
+    std::optional<std::vector<std::string>> mro =
+      base_name.empty() ? std::nullopt : class_mro(base_name, memo);
+    if (!mro)
+      return std::nullopt;
+    seqs.push_back(std::move(*mro));
+    bases.push_back(base_name);
+  }
+
+  seqs.push_back(std::move(bases));
+  std::optional<std::vector<std::string>> mro = c3_merge(std::move(seqs));
+  if (mro)
+    mro->insert(mro->begin(), class_name);
+  entry->second = mro;
+  return mro;
+}
+
+std::optional<std::vector<std::string>>
+python_converter::class_mro(const std::string &class_name) const
+{
+  mro_memo memo;
+  return class_mro(class_name, memo);
 }
 
 symbolt *python_converter::find_function_in_base_classes(
@@ -519,7 +712,33 @@ symbolt *python_converter::find_symbol(const std::string &sym_id) const
 
   if (symbolt *symbol = find_symbol_in_global_scope(sym_id))
     return symbol;
+
+  if (symbolt *symbol = find_model_symbol(sym_id))
+    return symbol;
+
   return find_imported_symbol(sym_id);
+}
+
+/// A model-provided name referenced from user code forms an id under the
+/// caller's file; the model defining it lives in its own namespace. Retried
+/// only for an id that names a file: an unresolved reference carries an empty
+/// filename -- `random.random()` without `import random` forms `py:@F@random`
+/// -- and resolving that would accept a module the program never imported.
+symbolt *python_converter::find_model_symbol(const std::string &sym_id) const
+{
+  if (is_loading_models || sym_id.rfind("py:", 0) != 0)
+    return nullptr;
+
+  const std::size_t at = sym_id.find('@');
+  if (at == std::string::npos || at <= 3)
+    return nullptr;
+
+  const std::string suffix = sym_id.substr(at);
+  for (const std::string &ns : model_namespaces_)
+    if (symbolt *symbol = symbol_table_.find_symbol("py:" + ns + suffix))
+      return symbol;
+
+  return nullptr;
 }
 
 symbolt *python_converter::find_symbol_in_global_scope(
@@ -595,7 +814,7 @@ symbolt &python_converter::create_tmp_symbol(
   cl.is_extern = false;
   cl.file_local = true;
   if (symbol_value != exprt())
-    cl.set_value(symbol_value);
+    cl.set_value(migrate_expr(symbol_value));
 
   return cl;
 }

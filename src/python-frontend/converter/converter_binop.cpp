@@ -7,7 +7,7 @@
 #include <python-frontend/python_expr_builder.h>
 #include <python-frontend/python-list/python_list.h>
 #include <python-frontend/math/python_math.h>
-#include <python-frontend/math/round_to_nearest_guard.h>
+#include <util/base/host_rounding_mode.h>
 #include <python-frontend/string/string_handler.h>
 #include <python-frontend/tuple/tuple_handler.h>
 #include <python-frontend/dynamic_type/dynamic_type_handler.h>
@@ -249,7 +249,7 @@ std::string py_percent_format(
       // printf rounds %f/%e/%g per the host FP rounding mode, which the
       // pipeline can leave non-default; pin FE_TONEAREST across both snprintf
       // passes so the fold matches CPython's round-half-to-even.
-      const round_to_nearest_guard guard;
+      const host_rounding_mode guard(FE_TONEAREST);
       std::string b;
       int n = 0;
       if (conv == 'f' || conv == 'F')
@@ -434,7 +434,8 @@ exprt python_converter::get_logical_operator_expr(const nlohmann::json &element)
   };
 
   // Mark that we're processing operands in an expression context
-  // This ensures boolean-returning function calls are converted to side-effect expressions
+  // This ensures boolean-returning function calls are converted to side-effect
+  // expressions
   bool old_is_converting_rhs = is_converting_rhs;
   is_converting_rhs = true;
 
@@ -685,24 +686,26 @@ exprt handle_float_vs_string(exprt &bin_expr, const std::string &op)
 
   return bin_expr;
 }
+
+void python_converter::convert_function_call_to_side_effect(exprt &expr)
+{
+  if (!expr.is_function_call())
+    return;
+  side_effect_expr_function_callt side_effect;
+  code_function_callt &code = static_cast<code_function_callt &>(expr);
+  side_effect.function() = code.function();
+  side_effect.location() = code.location();
+  side_effect.type() = code.type();
+  side_effect.arguments() = code.arguments();
+  expr = side_effect;
+}
+
 void python_converter::convert_function_calls_to_side_effects(
   exprt &lhs,
   exprt &rhs)
 {
-  auto to_side_effect_call = [](exprt &expr) {
-    side_effect_expr_function_callt side_effect;
-    code_function_callt &code = static_cast<code_function_callt &>(expr);
-    side_effect.function() = code.function();
-    side_effect.location() = code.location();
-    side_effect.type() = code.type();
-    side_effect.arguments() = code.arguments();
-    expr = side_effect;
-  };
-
-  if (lhs.is_function_call())
-    to_side_effect_call(lhs);
-  if (rhs.is_function_call())
-    to_side_effect_call(rhs);
+  convert_function_call_to_side_effect(lhs);
+  convert_function_call_to_side_effect(rhs);
 }
 
 /// Handle chained comparisons
@@ -755,9 +758,9 @@ exprt python_converter::handle_chained_comparisons_logic(
       // (get_binary_operator_expr, "cast void* to integer"). Restricted to
       // integers: a float bound is reconciled differently there (the float is
       // bitcast to the pointer type), so folding it in here would make the two
-      // conjuncts of `a <= x <= b` reconstruct x inconsistently. A float-bounded
-      // chained comparison over an unannotated param stays a pre-existing
-      // crash, unchanged by this patch.
+      // conjuncts of `a <= x <= b` reconstruct x inconsistently. A
+      // float-bounded chained comparison over an unannotated param stays a
+      // pre-existing crash, unchanged by this patch.
       auto is_integer = [](const typet &t) {
         return t.is_signedbv() || t.is_unsignedbv();
       };
@@ -901,7 +904,8 @@ exprt python_converter::handle_membership_operator(
   std::string lhs_type = type_handler_.type_to_string(lhs.type());
   std::string rhs_type = type_handler_.type_to_string(rhs.type());
 
-  // Handle string membership testing: "substr" in "string" or "substr" not in "string"
+  // Handle string membership testing: "substr" in "string" or "substr" not in
+  // "string"
   if (
     lhs.type().is_pointer() || rhs.type().is_pointer() ||
     lhs.type().is_array() || rhs.type().is_array() || lhs_type == "str" ||
@@ -1034,12 +1038,12 @@ exprt python_converter::get_binary_operator_expr(const nlohmann::json &element)
     return type_identity_result;
 
   // Handle None comparisons (don't unwrap optionals for identity checks)
-  bool is_none_check = handle_none_check_setup(op, lhs, rhs);
-  if (!is_none_check)
-  {
-    lhs = unwrap_optional_if_needed(lhs, element);
-    rhs = unwrap_optional_if_needed(rhs, element);
-  }
+  // Optionals are unwrapped here, except for an identity check against None.
+  if (
+    exprt optional_result = resolve_optional_operands(
+      op, lhs, rhs, element, handle_none_check_setup(op, lhs, rhs));
+    optional_result.is_not_nil())
+    return optional_result;
 
   if (lhs.type() == none_type() || rhs.type() == none_type())
   {
@@ -1341,12 +1345,12 @@ exprt python_converter::get_binary_operator_expr(const nlohmann::json &element)
   // value flowing from it, including a function's return — is modelled as a
   // pointer-width unsigned integer handle (value 0 for None; see
   // type_handler `NoneType`/`Optional`). A freshly constructed instance such as
-  // `Node(0)` is stored by value (tag-Node). Comparing the two fed a struct sort
-  // and a pointer-width scalar to the solver's mk_eq, whose operand-width assert
-  // is elided under NDEBUG -> SIGSEGV in release builds (github #4796). The
-  // tag-matched pointer case above does not fire because the handle carries no
-  // class tag. Reinterpret the struct as its address cast to the handle type so
-  // both sides compare as object references.
+  // `Node(0)` is stored by value (tag-Node). Comparing the two fed a struct
+  // sort and a pointer-width scalar to the solver's mk_eq, whose operand-width
+  // assert is elided under NDEBUG -> SIGSEGV in release builds (github #4796).
+  // The tag-matched pointer case above does not fire because the handle carries
+  // no class tag. Reinterpret the struct as its address cast to the handle type
+  // so both sides compare as object references.
   if (op == "Eq" || op == "NotEq" || op == "Is" || op == "IsNot")
   {
     // A None-able object handle: a pointer-width unsigned integer (how
@@ -1515,7 +1519,8 @@ exprt python_converter::get_binary_operator_expr(const nlohmann::json &element)
   };
 
   // For arithmetic operations (Sub, Add, Mult, etc.) on an any_type (void*)
-  // operand combined with an integer operand, cast the void* to the integer type.
+  // operand combined with an integer operand, cast the void* to the integer
+  // type.
   if (
     !type_utils::is_relational_op(op) && op != "Is" && op != "IsNot" &&
     op != "In" && op != "NotIn")
@@ -1549,9 +1554,9 @@ exprt python_converter::get_binary_operator_expr(const nlohmann::json &element)
     };
     // An operand with no concrete type is an unmodelled value (e.g. the result
     // of calling a generator function, whose type stays "empty"). Coercing it —
-    // in particular wrapping it in a typecast — yields a null-typed operand that
-    // crashes expression simplification. Leave such a comparison untouched so it
-    // lowers like any other (the assertion is simply not satisfied).
+    // in particular wrapping it in a typecast — yields a null-typed operand
+    // that crashes expression simplification. Leave such a comparison untouched
+    // so it lowers like any other (the assertion is simply not satisfied).
     auto has_concrete_type = [](const exprt &e) {
       return !e.type().is_nil() && !e.type().is_empty();
     };
@@ -1700,6 +1705,48 @@ exprt python_converter::get_binary_operator_expr(const nlohmann::json &element)
   return bin_expr;
 }
 
+/// Replace Optional<T> operands by their values (#8016). `==`/`!=` also compare
+/// the None flags, so None equals only None. Returns the finished comparison,
+/// or nil once \p lhs and \p rhs hold plain values.
+exprt python_converter::resolve_optional_operands(
+  const std::string &op,
+  exprt &lhs,
+  exprt &rhs,
+  const nlohmann::json &element,
+  bool is_none_check)
+{
+  if (is_none_check)
+    return nil_exprt();
+  auto none_flag = [&](exprt &operand) -> exprt {
+    if (!type_utils::is_optional_struct(operand.type()))
+      return false_exprt();
+    operand = materialize_optional(operand, element);
+    exprt flag = member_exprt(operand, "is_none", bool_type());
+    operand = unwrap_optional_if_needed(operand, element);
+    return flag;
+  };
+  const bool any_optional = type_utils::is_optional_struct(lhs.type()) ||
+                            type_utils::is_optional_struct(rhs.type());
+  const exprt lhs_none = none_flag(lhs);
+  const exprt rhs_none = none_flag(rhs);
+  if (!any_optional || (op != "Eq" && op != "NotEq"))
+    return nil_exprt();
+
+  auto is_scalar = [](const typet &t) {
+    return t.is_signedbv() || t.is_unsignedbv() || t.is_floatbv() ||
+           t.is_bool();
+  };
+  if (!is_scalar(lhs.type()) || !is_scalar(rhs.type()))
+    return nil_exprt();
+  const exprt values_equal =
+    equality_exprt(lhs, typecast_exprt(rhs, lhs.type()));
+  const exprt equal = or_exprt(
+    and_exprt(lhs_none, rhs_none),
+    and_exprt(
+      and_exprt(not_exprt(lhs_none), not_exprt(rhs_none)), values_equal));
+  return op == "Eq" ? equal : exprt(not_exprt(equal));
+}
+
 bool python_converter::handle_none_check_setup(
   const std::string &op,
   const exprt &lhs,
@@ -1715,6 +1762,44 @@ bool python_converter::handle_none_check_setup(
   }
 
   return is_none_check;
+}
+
+exprt python_converter::build_bytes_concat(const exprt &lhs, const exprt &rhs)
+{
+  const typet &lhs_type = lhs.type();
+  const typet &rhs_type = rhs.type();
+  if (lhs_type.subtype() != rhs_type.subtype())
+    return nil_exprt();
+
+  const exprt &lhs_size_expr = to_array_type(lhs_type).size();
+  const exprt &rhs_size_expr = to_array_type(rhs_type).size();
+  if (!lhs_size_expr.is_constant() || !rhs_size_expr.is_constant())
+    return nil_exprt();
+
+  const BigInt lhs_size_big =
+    binary2integer(to_constant_expr(lhs_size_expr).value().c_str(), true);
+  const BigInt rhs_size_big =
+    binary2integer(to_constant_expr(rhs_size_expr).value().c_str(), true);
+  if (lhs_size_big < 0 || rhs_size_big < 0)
+    return nil_exprt();
+
+  const long long lhs_size = lhs_size_big.to_int64();
+  const long long rhs_size = rhs_size_big.to_int64();
+  const typet &elem_type = lhs_type.subtype();
+  typet result_type = type_handler_.build_array(elem_type, lhs_size + rhs_size);
+  // Tag the result `bytes` too, so a chained concatenation (`a + b + c`) keeps
+  // recognising its left operand as bytes on the second `+`.
+  type_utils::set_cpp_type(result_type, "bytes");
+
+  exprt result("array", result_type);
+  for (long long i = 0; i < lhs_size; ++i)
+    result.copy_to_operands(
+      python_expr::build_index(lhs, from_integer(i, size_type())));
+  for (long long i = 0; i < rhs_size; ++i)
+    result.copy_to_operands(
+      python_expr::build_index(rhs, from_integer(i, size_type())));
+
+  return result;
 }
 
 exprt python_converter::handle_array_operations(
@@ -1741,6 +1826,18 @@ exprt python_converter::handle_array_operations(
       throw std::runtime_error(msg.str());
     }
     return nil_exprt();
+  }
+
+  // `bytes + bytes` is concatenation (bytes.__add__). Route it here early,
+  // since bytes and a numpy array share the same underlying
+  // `array of long_long_int_type` representation.
+  if (
+    op == "Add" && type_utils::is_bytes_array(lhs.type()) &&
+    type_utils::is_bytes_array(rhs.type()))
+  {
+    exprt concatenated = build_bytes_concat(lhs, rhs);
+    if (!concatenated.is_nil())
+      return concatenated;
   }
 
   // Check for zero-length array comparisons
@@ -2012,10 +2109,7 @@ exprt python_converter::handle_tuple_operations(
 
     // V.3: build the concatenated tuple value in IREP2. Each component is the
     // exact round-trip of a member_exprt over the migrated operand; the struct
-    // literal is assembled via constant_struct2tc and back-migrated once, then
-    // the full struct type is re-attached -- migrate_type drops the frontend-only
-    // aggregate-kind marker the `in`/membership/subscript dispatch reads with no
-    // tag fallback (mirrors tuple_handler::get_tuple_expr).
+    // literal is assembled via constant_struct2tc and back-migrated once.
     expr2tc lhs2, rhs2;
     migrate_expr(lhs, lhs2);
     migrate_expr(rhs, rhs2);
@@ -2028,7 +2122,6 @@ exprt python_converter::handle_tuple_operations(
 
     exprt result =
       migrate_expr_back(constant_struct2tc(migrate_type(new_type), members));
-    result.type() = new_type;
 
     if (element.contains("lineno"))
       result.location() = get_location_from_decl(element);
@@ -2076,7 +2169,6 @@ exprt python_converter::handle_tuple_operations(
 
     exprt result =
       migrate_expr_back(constant_struct2tc(migrate_type(new_type), members));
-    result.type() = new_type;
 
     if (element.contains("lineno"))
       result.location() = get_location_from_decl(element);
@@ -2084,8 +2176,8 @@ exprt python_converter::handle_tuple_operations(
   }
 
   // Lexicographic ordering for tuples, lowered to element-wise comparisons
-  // (the SMT backend has no struct ordering -- a raw `>` on a tuple struct trips
-  // an is_signedbv assertion):
+  // (the SMT backend has no struct ordering -- a raw `>` on a tuple struct
+  // trips an is_signedbv assertion):
   //   (a0,a1,..) < (b0,b1,..)
   //     == a0<b0 or (a0==b0 and (a1<b1 or (a1==b1 and ...)))
   // Components may be integer/bool/float scalars (mixed int/float promote to
@@ -2408,12 +2500,13 @@ exprt python_converter::handle_relational_type_mismatches(
   // Single character comparisons (including equality/inequality)
   if (type_utils::is_ordered_comparison(op) || op == "Eq" || op == "NotEq")
   {
-    // Special handling. Reject cases where both operands are character arrays (like chr(65) == "A")
-    // Todo: we should change the all expression to a correct format in future.
+    // Special handling. Reject cases where both operands are character arrays
+    // (like chr(65) == "A") Todo: we should change the all expression to a
+    // correct format in future.
     bool both_arrays = lhs.type().is_array() && rhs.type().is_array();
 
-    // If both operands are strings (including char pointers), skip single-char comparison
-    // and let the string comparison path handle it (strcmp).
+    // If both operands are strings (including char pointers), skip single-char
+    // comparison and let the string comparison path handle it (strcmp).
     bool both_strings = type_utils::is_string_type(lhs.type()) &&
                         type_utils::is_string_type(rhs.type());
 

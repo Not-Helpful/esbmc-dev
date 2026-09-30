@@ -40,11 +40,14 @@ class IntegerLiteral;
 class FloatingLiteral;
 class TagDecl;
 class FieldDecl;
+class ValueDecl;
 class MemberExpr;
 class EnumConstantDecl;
 class APValue;
 class AlignedAttr;
 class InitListExpr;
+class TemplateParamObjectDecl;
+class Expr;
 } // namespace clang
 
 std::string
@@ -62,15 +65,15 @@ public:
   bool convert();
 
   /**
- * @brief Perform the typecast by creating a tmp variable on RHS
- *
- * The idea is to look for all components of the union and match
- * the type. If not found, throws an error
- *
- * @param ns Namespace for looking up the union components
- * @param dest RHS dest
- * @param type Union type
- */
+   * @brief Perform the typecast by creating a tmp variable on RHS
+   *
+   * The idea is to look for all components of the union and match
+   * the type. If not found, throws an error
+   *
+   * @param ns Namespace for looking up the union components
+   * @param dest RHS dest
+   * @param type Union type
+   */
   static void
   gen_typecast_to_union(const namespacet &ns, exprt &dest, const typet &type);
 
@@ -129,11 +132,27 @@ protected:
 
   /**
    *  Since this class is inherited by clang-cpp-frontend,
-   *  some get_* functions are made `virtual' to deal with clang CXX declarations
+   *  some get_* functions are made `virtual' to deal with clang CXX
+   * declarations
    */
   virtual bool get_decl(const clang::Decl &decl, exprt &new_expr);
 
   virtual bool get_var(const clang::VarDecl &vd, exprt &new_expr);
+  virtual const clang::Expr &elided_copy_source(const clang::Expr &init);
+  bool has_dynamic_local_init(const clang::VarDecl &vd) const;
+  void add_init_guard(const symbolt &var);
+  bool get_static_var_init(
+    const clang::VarDecl &vd,
+    symbolt &symbol,
+    const typet &t,
+    const locationt &location_begin,
+    exprt &new_expr);
+
+  std::string header_internal_suffix(const clang::NamedDecl &nd);
+  /// Internal-linkage functions and variables sharing a USR, in the order they
+  /// were first named; see header_internal_suffix.
+  std::unordered_map<std::string, std::vector<const clang::Decl *>>
+    internal_copies;
 
   virtual bool get_function(const clang::FunctionDecl &fd, exprt &new_expr);
 
@@ -166,14 +185,13 @@ protected:
    */
   bool get_function_param(const clang::ParmVarDecl &pd, exprt &param);
   /*
-   * This function determines whether we should name an unnamed function parameter
-   * and continue to add its symbol.
+   * This function determines whether we should name an unnamed function
+   * parameter and continue to add its symbol.
    *
    * Params:
-   *  pd: the clang AST node for the function parameter we are currently dealing with
-   *  id: id for this function parameter
-   *  name: name for this function parameter
-   *  param: ESBMC's IR representing the function parameter
+   *  pd: the clang AST node for the function parameter we are currently dealing
+   * with id: id for this function parameter name: name for this function
+   * parameter param: ESBMC's IR representing the function parameter
    */
   virtual void name_param_and_continue(
     const clang::ParmVarDecl &pd,
@@ -228,6 +246,11 @@ protected:
    * member-expression lowering, and ctor member-initialiser-list lowering. */
   bool wrap_bitfield_type_if_needed(const clang::FieldDecl &fd, typet &t);
 
+  /* If `vd` is a flexible array member, give its array type `t` size zero:
+   * C17 6.7.2.1p18 sizes the struct as if the member were omitted. Every site
+   * that lowers a field's type must agree, or members and components differ. */
+  void size_flexible_array_member(const clang::ValueDecl &vd, typet &t);
+
   virtual bool get_expr(const clang::Stmt &stmt, exprt &new_expr);
 
   bool get_base_flattened_inits(
@@ -240,6 +263,14 @@ protected:
 
   bool
   get_binary_operator_expr(const clang::BinaryOperator &binop, exprt &new_expr);
+
+  void get_vector_comparison(
+    const clang::BinaryOperator &binop,
+    irep_idt relation,
+    exprt lhs,
+    exprt rhs,
+    const typet &type,
+    exprt &new_expr);
 
   bool get_compound_assign_expr(
     const clang::CompoundAssignOperator &compop,
@@ -267,6 +298,10 @@ protected:
 
   void
   get_start_location_from_stmt(const clang::Stmt &stmt, locationt &location);
+
+  /// Report an initializer list none of get_expr's arms models, with its type
+  /// and source location. Always returns true (conversion failed).
+  bool report_unsupported_init_list(const clang::InitListExpr &init_stmt);
 
   void
   get_final_location_from_stmt(const clang::Stmt &stmt, locationt &location);
@@ -326,11 +361,10 @@ protected:
   process_record_layout_attributes(const clang::RecordDecl &rd, typet &t) const;
 
   /*
-   * add additional annotations if a class/struct/union field has alignment attribute
-   * Arguments:
-   *   field: clang AST representing the class/struct/union field we are dealing with
-   *   comp: a `component` in class/struct/union's symbol type
-   *   type: a class/struct/union's symbol type
+   * add additional annotations if a class/struct/union field has alignment
+   * attribute Arguments: field: clang AST representing the class/struct/union
+   * field we are dealing with comp: a `component` in class/struct/union's
+   * symbol type type: a class/struct/union's symbol type
    */
   bool check_alignment_attributes(
     const clang::FieldDecl *field,
@@ -340,7 +374,8 @@ protected:
    * check if a class/struct/union's field has global storage
    * (e.g. static)
    * Arguments:
-   *   field: clang AST representing the class/struct/union field we are dealing with
+   *   field: clang AST representing the class/struct/union field we are dealing
+   * with
    */
   bool is_field_global_storage(const clang::FieldDecl *field);
 
@@ -357,11 +392,8 @@ protected:
   virtual bool perform_virtual_dispatch(const clang::MemberExpr &member);
 
   /*
-   * Function to get the ESBMC IR representing a virtual function table dynamic binding for "->" operator
-   * Turning
-   *  x->F
-   * into
-   *  x->X@vtable_pointer->F
+   * Function to get the ESBMC IR representing a virtual function table dynamic
+   * binding for "->" operator Turning x->F into x->X@vtable_pointer->F
    *
    * Params:
    *  - member: the method to which this MemberExpr refers
@@ -385,6 +417,11 @@ protected:
 
   virtual bool is_aggregate_type(const clang::QualType &q_type);
 
+  bool get_mangled_id(const clang::NamedDecl &nd, std::string &id);
+  bool add_template_param_object(
+    const clang::TemplateParamObjectDecl &tpo,
+    const std::string &name,
+    const std::string &id);
   bool get_APValue_expr(
     const clang::APValue &value,
     exprt &new_expr,
@@ -397,9 +434,9 @@ protected:
 
   /**
    * Rewrites references to builtin functions to their ESBMC counterparts.
-   * Clang provides builtins for e.g. malloc, memcpy, etc. Instead of re-implementing
-   * these functions in ESBMC, we rewrite references to e.g. `__builtin_memcpy` to
-   * just `memcpy`.
+   * Clang provides builtins for e.g. malloc, memcpy, etc. Instead of
+   * re-implementing these functions in ESBMC, we rewrite references to e.g.
+   * `__builtin_memcpy` to just `memcpy`.
    *
    * @param d declaration to rewrite (if it refers to a builtin function)
    * @param name name of the declaration

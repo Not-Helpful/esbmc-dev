@@ -51,8 +51,8 @@ exprt python_converter::make_enum_member_struct_expr(
     symbolt str_sym;
     str_sym.id = str_id;
     str_sym.name = "_name_" + member_name;
-    str_sym.set_type(str_val.type());
-    str_sym.set_value(str_val);
+    str_sym.set_type(migrate_type(str_val.type()));
+    str_sym.set_value(migrate_expr(str_val));
     str_sym.static_lifetime = true;
     str_sym.is_extern = false;
     str_sym.file_local = true;
@@ -76,8 +76,8 @@ exprt python_converter::make_enum_member_struct_expr(
   // V.3: assemble the enum member struct { value, name } in IREP2 and
   // back-migrate once. Both members are already-built value exprs (the member's
   // integer value symbol and the char* name pointer), so migrating them
-  // round-trips exactly. Re-attach the struct type afterwards: migrate_type does
-  // not carry the frontend struct's component attributes.
+  // round-trips exactly. Re-attach the struct type afterwards: migrate_type
+  // does not carry the frontend struct's component attributes.
   expr2tc value_member, name_member;
   migrate_expr(symbol_expr(int_sym), value_member);
   migrate_expr(name_ptr, name_member);
@@ -151,7 +151,8 @@ void python_converter::register_instance_attribute(
   // Add to regular instance attribute map
   instance_attr_map[symbol_id].insert(attr_name);
 
-  // For 'self' parameters, also track with normalized key for cross-method access
+  // For 'self' parameters, also track with normalized key for cross-method
+  // access
   if (var_name == "self")
   {
     std::string normalized_key = create_normalized_self_key(class_tag);
@@ -356,16 +357,17 @@ typet python_converter::infer_attr_type_from_usage(
     return t;
 
   // Cross-module inference sources. A class and the code that constructs it can
-  // live in different modules: e.g. `Node` is defined in node.py while the calls
-  // `n2 = Node(2, n1)` are in the importing main.py. The struct type is built
-  // while converting the *defining* module, where the call sites are not the
-  // current module_body. Gather every reachable module body — the entry module
-  // (entry_ast_), every imported module (module_ast_pool_), and the current
-  // module — deduplicated by address, so both the class definition and its
-  // constructor call sites are visible regardless of which module is current.
-  // Without this, an imported class's __init__-parameter attributes stay
-  // any_type() and nested reads inside functions abort ("Cannot resolve nested
-  // attribute"), e.g. quixbugs detect_cycle's `node.successor.successor`.
+  // live in different modules: e.g. `Node` is defined in node.py while the
+  // calls `n2 = Node(2, n1)` are in the importing main.py. The struct type is
+  // built while converting the *defining* module, where the call sites are not
+  // the current module_body. Gather every reachable module body — the entry
+  // module (entry_ast_), every imported module (module_ast_pool_), and the
+  // current module — deduplicated by address, so both the class definition and
+  // its constructor call sites are visible regardless of which module is
+  // current. Without this, an imported class's __init__-parameter attributes
+  // stay any_type() and nested reads inside functions abort ("Cannot resolve
+  // nested attribute"), e.g. quixbugs detect_cycle's
+  // `node.successor.successor`.
   std::vector<const nlohmann::json *> module_bodies;
   auto add_body = [&](const nlohmann::json &mod) {
     if (!mod.is_object() || !mod.contains("body") || !mod["body"].is_array())
@@ -905,20 +907,29 @@ void python_converter::get_class_definition(
   codet &target_block)
 {
   // A class symbol is keyed by name alone, with no enclosing-scope component,
-  // so two functions each defining a class of the same name share one symbol:
-  // the second registration is dropped and the second function silently runs
-  // the first one's constructor, proving the wrong value (#7541). #6765 already
-  // makes is_class decline such a name; declining does not prevent the
-  // collision, so refuse the program rather than answer it wrongly.
+  // so definitions of a name at module, function or method scope share one
+  // symbol: the later registrations are dropped and their constructors are
+  // never run, proving the wrong value (#7541). #6765 already makes is_class
+  // decline such a name; declining does not prevent the collision, so refuse
+  // the program rather than answer it wrongly.
   const std::string &class_name = class_node["name"].get<std::string>();
-  if (
-    ast_json && json_utils::count_function_scope_classes(
-                  (*ast_json)["body"], class_name) > 1)
-    throw std::runtime_error(
-      "class '" + class_name +
-      "' is defined in more than one function body; ESBMC keys a class symbol "
-      "by name alone, so the definitions would share one symbol. Rename one of "
-      "them.");
+  if (ast_json)
+  {
+    std::vector<int> lines;
+    json_utils::collect_class_definition_lines(
+      (*ast_json)["body"], class_name, lines);
+    if (lines.size() > 1)
+    {
+      std::ostringstream oss;
+      oss << "class '" << class_name << "' is defined " << lines.size()
+          << " times (lines";
+      for (int line : lines)
+        oss << ' ' << line;
+      oss << "); ESBMC keys a class symbol by name alone, so the definitions "
+             "would share one symbol. Rename all but one.";
+      throw std::runtime_error(oss.str());
+    }
+  }
 
   python_class_builder(*this, class_node).build(target_block);
 }

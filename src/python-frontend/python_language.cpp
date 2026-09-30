@@ -1,9 +1,10 @@
 #include <python-frontend/python_language.h>
+#include <python-frontend/python_library.h>
 #include <python-frontend/python_converter.h>
 #include <python-frontend/python_annotation/python_annotation.h>
 #include <python-frontend/module/global_scope.h>
 #include <python-frontend/python_adjust.h>
-#include <python-frontend/math/round_to_nearest_guard.h>
+#include <util/base/host_rounding_mode.h>
 #include <python-frontend/param_annotations.h>
 #include <clang-cpp-frontend/clang_cpp_adjust.h>
 #include <util/message/message.h>
@@ -81,6 +82,21 @@ languaget *new_python_language()
   return new python_languaget;
 }
 
+// Options the forked parser needs to know about. ``--deadlock-check`` makes it
+// load the deadlock-aware threading model (models/threading_deadlock.py); the
+// C frontend handles the analogous swap via preprocessor #defines
+// (clang-c-frontend/c_preprocess.cpp).
+static void append_parser_flags(std::vector<std::string> &args)
+{
+  static const std::pair<const char *, const char *> flags[] = {
+    {"deadlock-check", "--deadlock-check"},
+    {"python-typecheck", "--typecheck"}};
+
+  for (const auto &[option, flag] : flags)
+    if (config.options.get_bool_option(option))
+      args.push_back(flag);
+}
+
 bool python_languaget::parse(const std::string &path)
 {
   log_debug("python", "Parsing: {}", path);
@@ -98,13 +114,7 @@ bool python_languaget::parse(const std::string &path)
 
   // Execute Python script to generate JSON file from AST
   std::vector<std::string> args = {parser_path.string(), path, ast_output_dir};
-
-  // Propagate ``--deadlock-check`` to the parser so it loads the
-  // deadlock-aware threading model (models/threading_deadlock.py). The
-  // C frontend handles the analogous swap via preprocessor #defines
-  // (clang-c-frontend/c_preprocess.cpp).
-  if (config.options.get_bool_option("deadlock-check"))
-    args.push_back("--deadlock-check");
+  append_parser_flags(args);
 
   // Get Python interpreter path informed by the user
   std::string python_exec = config.options.get_option("python");
@@ -126,48 +136,10 @@ bool python_languaget::parse(const std::string &path)
     exit(1);
   }
 
-  // Verify the interpreter is Python 3 — parser/__main__.py uses f-strings, which
-  // Python 2.x cannot parse, surfacing a cryptic SyntaxError (issue #1967).
-  // The check prints just the major version so a single getline suffices.
-  {
-    bp::ipstream version_out;
-    try
-    {
-      bp::child version_proc(
-        python_exec_path,
-        std::vector<std::string>{
-          "-c", "import sys; print(sys.version_info[0])"},
-        bp::std_out > version_out,
-        bp::std_err > bp::null);
-      std::string major;
-      std::getline(version_out, major);
-      version_proc.wait();
-      while (!major.empty() && (major.back() == '\r' || major.back() == '\n' ||
-                                major.back() == ' '))
-        major.pop_back();
-      if (major != "3")
-      {
-        log_error(
-          "ESBMC's Python frontend requires Python 3 (interpreter at "
-          "'{}' reports major version '{}'). Re-run with "
-          "--python <path-to-python3>.\n",
-          python_exec_path.string(),
-          major.empty() ? std::string("?") : major);
-        exit(1);
-      }
-    }
-    catch (const std::exception &e)
-    {
-      log_error(
-        "Failed to determine Python version for '{}': {}. "
-        "Re-run with --python <path-to-python3>.\n",
-        python_exec_path.string(),
-        e.what());
-      exit(1);
-    }
-  }
-
-  // Create a child process to execute Python
+  // parser/__main__.py reports the version itself and exits non-zero on
+  // Python 2 (issue #1967); it is kept Python-2-parseable so that it can.
+  // Spawning a second interpreter here to ask the same question cost one
+  // process per run.
   bp::child process(python_exec_path, args);
 
   // Wait for execution
@@ -197,18 +169,17 @@ bool python_languaget::parse(const std::string &path)
   nlohmann::json parsed_ast;
   try
   {
-    // Parse under FE_TONEAREST: nlohmann converts float literals with the
-    // host strtod, and a leftover non-default rounding mode (e.g. gaol's
-    // static init leaves FE_UPWARD on goto-contractor builds) would store a
-    // double one ulp away from CPython's value for the same literal.
-    const round_to_nearest_guard rounding_guard;
+    // Parse under FE_TONEAREST: nlohmann converts float literals with host
+    // strtod, so a non-default rounding mode set by another stage would store
+    // a double one ulp away from CPython's value for the same literal.
+    const host_rounding_mode rounding_guard(FE_TONEAREST);
     parsed_ast = nlohmann::json::parse(ast_json);
   }
   catch (const nlohmann::json::exception &e)
   {
-    // parser/__main__.py exited 0 but left a truncated or empty AST file. Report
-    // it instead of aborting via an uncaught nlohmann parse_error
-    // (issue #2012).
+    // parser/__main__.py exited 0 but left a truncated or empty AST file.
+    // Report it instead of aborting via an uncaught nlohmann parse_error (issue
+    // #2012).
     log_error(
       "<python-parser> failed to parse generated AST {}: {}\n",
       script_path.str(),
@@ -267,18 +238,24 @@ bool python_languaget::typecheck(contextt &context, const std::string &)
   // constants with host floating point (numpy scalar folds, complex-string
   // strtod, str/format rendering), and those folds must agree bit-for-bit
   // with the AST float literals, which are parsed under FE_TONEAREST (see
-  // parse() above). A leftover mode like gaol's FE_UPWARD on goto-contractor
-  // builds would otherwise skew only the folded side of a comparison by one
-  // ulp and flip verdicts (regression/numpy/round_decimals,
+  // parse() above). A non-default mode set by another stage would otherwise
+  // skew only the folded side of a comparison by one ulp and flip verdicts
+  // (regression/numpy/round_decimals,
   // regression/python/complex_constructor_extended on the DebugOpt CI).
-  const round_to_nearest_guard rounding_guard;
+  const host_rounding_mode rounding_guard(FE_TONEAREST);
 
   // Load c models. The C++ handled-stack exception OM (push/pop_handled,
-  // rethrow_current) is deliberately NOT pulled in for Python: it drags the full
-  // C++ std::terminate closure, and Python does not use std::current_exception.
-  // The lowering's inline re-raise fallback (remove_exceptions) covers Python's
-  // bare `raise` without that OM.
+  // rethrow_current) is deliberately NOT pulled in for Python: it drags the
+  // full C++ std::terminate closure, and Python does not use
+  // std::current_exception. The lowering's inline re-raise fallback
+  // (remove_exceptions) covers Python's bare `raise` without that OM.
   add_cprover_library(context, this);
+
+  if (
+    !config.options.get_bool_option("building-python-library") &&
+    !config.options.get_bool_option("no-library") &&
+    !config.options.get_bool_option("int-encoding"))
+    add_cpython_library(context);
 
   try
   {
@@ -296,7 +273,8 @@ bool python_languaget::typecheck(contextt &context, const std::string &)
   // *replaces* clang_cpp_adjust on the Python path (the B.5 "sole adjuster"
   // milestone, gated behind a default-off flag). It stays default-off: a
   // whole-corpus legacy-vs-hop-off census (2026-07-29) found the missing
-  // assignment/operand conversion documented in docs/roadmap/scope-v1k-adjuster.md
+  // assignment/operand conversion documented in
+  // docs/roadmap/scope-v1k-adjuster.md
   // ("the assignment-conversion trap") reaches the solver as an ill-typed term
   // and crashes it, so the flip waits on the coupled arithmetic-reconciliation
   // effort that section sizes.
@@ -306,31 +284,38 @@ bool python_languaget::typecheck(contextt &context, const std::string &)
     return py_adjuster.adjust();
   }
 
+  /* The models were linked wholesale before the converter ran, because the
+   * converter resolves their calls by name. Now that the program is in the
+   * context, drop the ones it cannot reach; assert_no_pruned_calls checks
+   * after goto_convert that nothing since has referenced one. */
+  prune_unreferenced_library_functions(context, &cpython_library_bodies());
+
   clang_cpp_adjust adjuster(context);
   if (adjuster.adjust())
     return true;
 
   // V.4 B.2: optionally run the IREP2-native Python adjuster. Default off.
   //
-  // It runs *after* clang_cpp_adjust for now: reading get_value2() migrates each
-  // legacy value to IREP2, which requires its types to already be resolved —
-  // before clang_cpp_adjust they are still by-name symbol_types and migrating a
-  // constant aggregate trips constant_struct2t's (un-relaxed) assert. Post-adjust
-  // the types are resolved, so the walk is safe; it currently resolves nothing
-  // (clang_cpp_adjust already did) and only writes a symbol back when it changes
-  // the value, so the flag is behaviour-inert.
+  // It runs *after* clang_cpp_adjust for now: reading get_value2() migrates
+  // each legacy value to IREP2, which requires its types to already be resolved
+  // — before clang_cpp_adjust they are still by-name symbol_types and migrating
+  // a constant aggregate trips constant_struct2t's (un-relaxed) assert.
+  // Post-adjust the types are resolved, so the walk is safe; it currently
+  // resolves nothing (clang_cpp_adjust already did) and only writes a symbol
+  // back when it changes the value, so the flag is behaviour-inert.
   //
-  // B.3 experiment (2026-06-25, negative result, do not retry as-is): moving the
-  // pass *before* clang_cpp_adjust to exercise resolution was prototyped. It
-  // additionally needs member2t/index2t to tolerate a transient pointer source
-  // (the Python frontend stores instances/containers behind a pointer) plus a
-  // pointer auto-deref in resolve_source. With those, migration no longer aborts,
-  // but the whole 20-test fixture then produced *no verdict* under the flag
-  // (symex crash/hang): running the IREP2 adjuster before clang_cpp_adjust while
-  // clang_cpp_adjust still runs afterwards double-resolves the same nodes — the
-  // "two-places-resolve hazard" the V.1k spike flagged. Conclusion: the
-  // before-placement is only viable once it *replaces* clang_cpp_adjust for
-  // Python (B.5), which is a dedicated effort, not a reorder of this call.
+  // B.3 experiment (2026-06-25, negative result, do not retry as-is): moving
+  // the pass *before* clang_cpp_adjust to exercise resolution was prototyped.
+  // It additionally needs member2t/index2t to tolerate a transient pointer
+  // source (the Python frontend stores instances/containers behind a pointer)
+  // plus a pointer auto-deref in resolve_source. With those, migration no
+  // longer aborts, but the whole 20-test fixture then produced *no verdict*
+  // under the flag (symex crash/hang): running the IREP2 adjuster before
+  // clang_cpp_adjust while clang_cpp_adjust still runs afterwards
+  // double-resolves the same nodes — the "two-places-resolve hazard" the V.1k
+  // spike flagged. Conclusion: the before-placement is only viable once it
+  // *replaces* clang_cpp_adjust for Python (B.5), which is a dedicated effort,
+  // not a reorder of this call.
   if (config.options.get_bool_option("python-irep2-adjust"))
   {
     python_adjust py_adjuster(context);

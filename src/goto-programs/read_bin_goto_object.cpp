@@ -98,7 +98,8 @@ bool read_bin_goto_object(
       // Symbol is not in the function set
       if (function_set.find(id2string(fname)) == function_set.end())
       {
-        // Keep this symbol in case we end up needing it as a dependency later on
+        // Keep this symbol in case we end up needing it as a dependency later
+        // on
         ignored.add(symbol);
         continue; // skip to next symbol
       }
@@ -114,9 +115,9 @@ bool read_bin_goto_object(
 
   if (!goto_functions)
   {
-    /* c2goto never runs goto_convert, so a library body travels in its
-     * symbol value and is built later by goto_convert_functions; the section
-     * read below is empty by construction. */
+    /* A blob written without goto_convert carries each body in its symbol's
+     * value, to be built later by goto_convert_functions; its function
+     * section is empty by construction. */
     assert(count == 0);
     return false;
   }
@@ -143,8 +144,8 @@ bool read_bin_goto_object(
   contextt &context,
   goto_functionst &goto_functions)
 {
-  contextt
-    empt_ignored; // empty context to put ignored symbols in; will not be used since empty function filter
+  contextt empt_ignored; // empty context to put ignored symbols in; will not be
+                         // used since empty function filter
   std::unordered_set<std::string>
     empt_function_set; // empty function filter; no function whitelist
   return read_bin_goto_object(

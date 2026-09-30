@@ -183,9 +183,10 @@ exprt python_dict_handler::get_dict_comprehension(const nlohmann::json &element)
   {
     // numeric_element_type() is non-throwing: it returns the common numeric
     // element type (double for an int/float mix), or an empty typet() when the
-    // list is unknown, empty, or contains any non-numeric / mixed-width element.
-    // Restricting specialisation to all-numeric lists keeps the read sound and
-    // leaves every other case on the previous any_type() path (no regression).
+    // list is unknown, empty, or contains any non-numeric / mixed-width
+    // element. Restricting specialisation to all-numeric lists keeps the read
+    // sound and leaves every other case on the previous any_type() path (no
+    // regression).
     const std::string list_id = iterable_expr.identifier().as_string();
     typet num =
       converter_.get_element_type_registry().numeric_element_type(list_id);
@@ -497,6 +498,15 @@ std::string python_dict_handler::materialize_tuple_key(
   return key_tmp.id.as_string();
 }
 
+/// The Optional<T> value type a literal assigned to \p target stores, from the
+/// target's annotation or, for an argument, the parameter's (#8016).
+typet python_dict_handler::literal_value_type(const exprt &target)
+{
+  const typet declared = resolve_expected_type_for_dict_subscript(target);
+  return type_utils::is_optional_struct(declared) ? declared
+                                                  : literal_value_type_hint;
+}
+
 exprt python_dict_handler::create_dict_from_literal(
   const nlohmann::json &element,
   const exprt &target_symbol)
@@ -600,6 +610,9 @@ exprt python_dict_handler::create_dict_from_literal(
     }
   }
 
+  // An Optional[T] value type stores each value wrapped, as a read expects.
+  const typet expected_value = literal_value_type(target_symbol);
+
   for (size_t i = 0; i < keys.size(); ++i)
   {
     exprt key_expr = converter_.get_expr(keys[i]);
@@ -616,6 +629,7 @@ exprt python_dict_handler::create_dict_from_literal(
       keys_list.id.as_string(), key_elem_id, key_expr.type());
 
     exprt value_expr = converter_.get_expr(values[i]);
+    value_expr = converter_.wrap_if_optional(value_expr, expected_value);
 
     // Convert lambda/function symbol to function pointer for dict storage
     if (value_expr.type().is_code() && value_expr.is_symbol())

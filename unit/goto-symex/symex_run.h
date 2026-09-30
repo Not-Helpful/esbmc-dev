@@ -29,8 +29,8 @@
 
 #include <goto-programs/goto_k_induction.h>
 #include <goto-programs/remove_no_op.h>
-#include <goto-symex/reachability_tree.h>
-#include <goto-symex/symex_target_equation.h>
+#include <goto-symex/scheduler/reachability_tree.h>
+#include <goto-symex/equation/symex_target_equation.h>
 #include <util/symtab/namespace.h>
 
 #include "../testing-utils/goto_factory.h"
@@ -42,12 +42,14 @@ class equation
 public:
   explicit equation(const std::string &src, const char *unwind = "4")
     : source(src),
-      prog(goto_factory::get_goto_functions(
-        source,
-        goto_factory::Architecture::BIT_64)),
+      prog(
+        goto_factory::get_goto_functions(
+          source,
+          goto_factory::Architecture::BIT_64)),
       ns(prog.context),
-      opts(goto_factory::get_default_options(
-        goto_factory::get_default_cmdline("test.c"))),
+      opts(
+        goto_factory::get_default_options(
+          goto_factory::get_default_cmdline("test.c"))),
       rt(
         prog.functions,
         ns,
@@ -98,12 +100,14 @@ public:
     const std::string &src,
     const char *unwind = "4")
     : source(src),
-      prog(goto_factory::get_goto_functions(
-        source,
-        goto_factory::Architecture::BIT_64)),
+      prog(
+        goto_factory::get_goto_functions(
+          source,
+          goto_factory::Architecture::BIT_64)),
       ns(prog.context),
-      opts(goto_factory::get_default_options(
-        goto_factory::get_default_cmdline("test.c"))),
+      opts(
+        goto_factory::get_default_options(
+          goto_factory::get_default_cmdline("test.c"))),
       rt(
         prog.functions,
         ns,
@@ -113,7 +117,7 @@ public:
   {
     // The order `process_goto_program` uses: the pass expects the SKIPs gone.
     remove_no_op(prog.functions);
-    goto_k_induction(prog.functions, ns);
+    goto_k_induction(prog.functions, ns, false);
 
     opts.set_option("unwind", unwind);
     opts.set_option("inductive-step", true);

@@ -57,10 +57,7 @@ static exprt build_shape_tuple_expr(
     converter.get_tuple_handler().create_tuple_struct_type(element_types);
   // V.3: build the tuple value in IREP2, back-migrating once. The operands are
   // already-built int_type() dimension exprs, so a constant_struct2t over them
-  // round-trips exactly through migrate. Re-attach the full struct type
-  // afterwards: migrate_type drops the frontend-only #python_aggregate_kind
-  // marker that the in/membership dispatch reads (python_aggregate_kind) with no
-  // tag fallback — mirroring tuple_handler::get_tuple_expr.
+  // round-trips exactly through migrate.
   std::vector<expr2tc> members;
   members.reserve(dims.size());
   for (const exprt &d : dims)
@@ -71,8 +68,67 @@ static exprt build_shape_tuple_expr(
   }
   exprt tuple_expr =
     migrate_expr_back(constant_struct2tc(migrate_type(tuple_type), members));
-  tuple_expr.type() = tuple_type;
   return tuple_expr;
+}
+
+static exprt build_shape_size_expr(const std::vector<exprt> &dims)
+{
+  exprt total = from_integer(1, int_type());
+  for (const exprt &dim : dims)
+    total = python_expr::build_mul(total, dim, int_type());
+  return total;
+}
+
+static std::vector<exprt> build_dim_exprs(const std::vector<int> &dims)
+{
+  std::vector<exprt> dim_exprs;
+  dim_exprs.reserve(dims.size());
+  for (int dim : dims)
+    dim_exprs.push_back(from_integer(dim, int_type()));
+  return dim_exprs;
+}
+
+static exprt build_runtime_list_len_expr(
+  contextt &symbol_table,
+  const exprt &list_expr,
+  const std::string &diagnostic)
+{
+  const symbolt *size_func = symbol_table.find_symbol("c:@F@__ESBMC_list_size");
+  if (!size_func)
+    throw std::runtime_error(diagnostic);
+
+  expr2tc base2;
+  migrate_expr(list_expr, base2);
+  if (!is_pointer_type(base2->type))
+    base2 = address_of2tc(base2->type, base2);
+  expr2tc size_call = side_effect_function_call2tc(
+    migrate_type(size_type()), symbol_expr2tc(*size_func), {base2});
+  return migrate_expr_back(typecast2tc(migrate_type(int_type()), size_call));
+}
+
+static bool is_python_list_model_type(
+  typet type,
+  const typet &list_type,
+  const namespacet &ns)
+{
+  if (type.id() == "symbol")
+    type = ns.follow(type);
+  if (type == list_type)
+    return true;
+
+  typet list_object_type = list_type;
+  if (list_object_type.is_pointer())
+    list_object_type = ns.follow(list_object_type.subtype());
+
+  if (type == list_object_type)
+    return true;
+  if (!type.is_pointer())
+    return false;
+
+  typet subtype = type.subtype();
+  if (subtype.id() == "symbol")
+    subtype = ns.follow(subtype);
+  return subtype == list_type || subtype == list_object_type;
 }
 
 static nlohmann::json normalize_bool_index_node(const nlohmann::json &node)
@@ -250,6 +306,16 @@ exprt python_converter::make_char_array_expr(
     expr.operands().at(i) = char_value;
   }
 
+  return expr;
+}
+
+exprt python_converter::make_class_object(const std::string &name)
+{
+  std::vector<unsigned char> chars(name.begin(), name.end());
+  chars.push_back('\0');
+  exprt expr = make_char_array_expr(
+    chars, type_handler_.build_array(char_type(), chars.size()));
+  expr.set("value", name);
   return expr;
 }
 /// Convert Python AST literal to expression.
@@ -566,7 +632,191 @@ std::optional<exprt> python_converter::try_get_numpy_pointer_view_shape_attr(
       *this, {from_integer(it->second.length, int_type())});
   if (attr_name == "ndim")
     return from_integer(1, int_type());
+  if (attr_name == "size")
+    return from_integer(it->second.length, int_type());
   return std::nullopt;
+}
+
+std::optional<exprt> python_converter::try_get_numpy_param_shape_attr(
+  const symbolt &symbol,
+  const std::string &attr_name)
+{
+  const std::string symbol_id = symbol.id.as_string();
+  if (numpy_ambiguous_shape_symbols_.count(symbol_id) != 0)
+    throw std::runtime_error(
+      "TypeError: numpy array shape is ambiguous across control-flow branches");
+
+  const auto it = numpy_param_shapes_.find(symbol_id);
+  if (it == numpy_param_shapes_.end())
+    return std::nullopt;
+
+  const std::vector<std::size_t> &shape = it->second;
+
+  if (attr_name == "shape")
+  {
+    std::vector<exprt> dim_exprs;
+    dim_exprs.reserve(shape.size());
+    for (std::size_t dim : shape)
+      dim_exprs.push_back(from_integer(dim, int_type()));
+    return build_shape_tuple_expr(*this, dim_exprs);
+  }
+  if (attr_name == "ndim")
+    return from_integer(shape.size(), int_type());
+  if (attr_name == "size")
+  {
+    std::size_t total = 1;
+    for (std::size_t dim : shape)
+      total *= dim;
+    return from_integer(total, int_type());
+  }
+  return std::nullopt;
+}
+
+// Tries both tracked-shape sources for a `.shape`/`.ndim`/`.size` attribute
+// access: a pointer-view symbol, then a numpy array parameter. One combined
+// check so get_expr's own Attribute dispatch needs a single `if` for both,
+// instead of growing its own decision count by one per source.
+std::optional<exprt> python_converter::try_get_numpy_shape_attr(
+  const symbolt &symbol,
+  const std::string &attr_name)
+{
+  if (
+    std::optional<exprt> view_attr =
+      try_get_numpy_pointer_view_shape_attr(symbol, attr_name))
+    return view_attr;
+  return try_get_numpy_param_shape_attr(symbol, attr_name);
+}
+
+std::optional<exprt> python_converter::try_get_numpy_value_shape_attr(
+  const exprt &base_expr,
+  const nlohmann::json &base_node,
+  const std::string &attr_name)
+{
+  if (attr_name != "shape" && attr_name != "ndim" && attr_name != "size")
+    return std::nullopt;
+
+  if (
+    std::optional<std::vector<std::size_t>> shape =
+      get_numpy_constructor_shape(base_node))
+  {
+    std::vector<exprt> dim_exprs;
+    dim_exprs.reserve(shape->size());
+    for (std::size_t dim : *shape)
+      dim_exprs.push_back(from_integer(dim, int_type()));
+
+    if (attr_name == "shape")
+      return build_shape_tuple_expr(*this, dim_exprs);
+    if (attr_name == "ndim")
+      return from_integer(shape->size(), int_type());
+    return build_shape_size_expr(dim_exprs);
+  }
+
+  typet base_type = base_expr.type();
+  if (base_type.is_pointer())
+    base_type = base_type.subtype();
+  if (base_type.id() == "symbol")
+    base_type = ns.follow(base_type);
+
+  if (base_type.is_array())
+  {
+    std::vector<exprt> dim_exprs =
+      build_dim_exprs(type_handler_.get_array_type_shape(base_type));
+    if (attr_name == "shape")
+      return build_shape_tuple_expr(*this, dim_exprs);
+    if (attr_name == "ndim")
+    {
+      std::vector<int> dims = type_handler_.get_array_type_shape(base_type);
+      ndarray_descriptor descriptor(
+        std::vector<long long>(dims.begin(), dims.end()), "", 0);
+      descriptor.validate();
+      return from_integer(descriptor.rank(), int_type());
+    }
+    return build_shape_size_expr(dim_exprs);
+  }
+
+  return try_get_numpy_bool_mask_rows_shape_attr(
+    base_expr, base_type, attr_name);
+}
+
+void python_converter::reject_numpy_shape_attr_on_nonobject_call_result(
+  const exprt &base_expr,
+  const nlohmann::json &base_node,
+  const std::string &attr_name)
+{
+  if (attr_name != "shape" && attr_name != "ndim" && attr_name != "size")
+    return;
+  if (!base_node.is_object() || base_node.value("_type", "") != "Call")
+    return;
+  if (get_numpy_constructor_shape(base_node))
+    return;
+
+  typet base_type = base_expr.type();
+  if (base_type.is_pointer())
+    base_type = base_type.subtype();
+  if (base_type.id() == "symbol")
+    base_type = ns.follow(base_type);
+
+  const typet list_type = type_handler_.get_list_type();
+  if (
+    base_type.is_array() ||
+    is_python_list_model_type(base_expr.type(), list_type, ns))
+    throw std::runtime_error(
+      fmt::format("Cannot resolve attribute '{}' on Call result", attr_name));
+}
+
+bool python_converter::should_reject_numpy_shape_attr_on_symbol(
+  const symbolt &symbol,
+  const std::string &attr_name)
+{
+  if (attr_name != "shape" && attr_name != "ndim" && attr_name != "size")
+    return false;
+  if (numpy_array_symbols_.count(symbol.id.as_string()) != 0)
+    return false;
+  if (python_list::is_bool_mask_rows_type(symbol.get_type()))
+    return false;
+
+  typet sym_type = symbol.get_type();
+  if (sym_type.is_pointer())
+    sym_type = sym_type.subtype();
+  if (sym_type.id() == "symbol")
+    sym_type = ns.follow(sym_type);
+  if (sym_type.is_array())
+    return true;
+
+  const typet list_type = type_handler_.get_list_type();
+  return is_python_list_model_type(symbol.get_type(), list_type, ns);
+}
+
+std::optional<exprt> python_converter::try_get_numpy_bool_mask_rows_shape_attr(
+  const exprt &base_expr,
+  const typet &base_type,
+  const std::string &attr_name)
+{
+  if (!python_list::is_bool_mask_rows_type(base_type))
+    return std::nullopt;
+
+  if (attr_name == "ndim")
+    return from_integer(2, int_type());
+
+  const struct_typet &result_type = to_struct_type(base_type);
+  const array_typet &rows_type =
+    to_array_type(ns.follow(result_type.components()[0].type()));
+  const BigInt num_cols = binary2integer(
+    to_array_type(ns.follow(rows_type.subtype())).size().value().c_str(),
+    false);
+
+  exprt count_member = python_expr::build_member(
+    base_expr, "count", result_type.components()[1].type());
+  expr2tc count2;
+  migrate_expr(count_member, count2);
+  exprt count_as_int =
+    migrate_expr_back(typecast2tc(migrate_type(int_type()), count2));
+
+  if (attr_name == "shape")
+    return build_shape_tuple_expr(
+      *this, {count_as_int, from_integer(num_cols, int_type())});
+  return python_expr::build_mul(
+    count_as_int, from_integer(num_cols, int_type()), int_type());
 }
 
 std::optional<exprt> python_converter::resolve_subscript_base(
@@ -909,8 +1159,9 @@ python_converter::try_dispatch_fancy_index_via_list_variable(
   // find_var_decl returns the first textual assignment in scope,
   // not necessarily the one reaching this use site; reject any
   // reassignment rather than risk resolving a stale index list.
-  if (json_utils::has_multiple_assignments_in_scope(
-        idx_name, current_func_name_, *ast_json))
+  if (
+    json_utils::has_multiple_assignments_in_scope(
+      idx_name, current_func_name_, *ast_json))
     reject(
       "requires an index variable that is assigned exactly once "
       "(no reassignment) so its literal value can be resolved "
@@ -1235,21 +1486,19 @@ exprt python_converter::get_expr(const nlohmann::json &element)
       // Handle type identifiers (int, str, float, bool, etc.)
       if (type_utils::is_type_identifier(var_name))
       {
-        // Create a string constant containing the type name
-        std::string type_name = var_name;
-        typet str_type =
-          type_handler_.build_array(char_type(), type_name.size() + 1);
-        constant_exprt type_str(type_name, type_name, str_type);
-        expr = type_str;
+        expr = make_class_object(var_name);
         break;
       }
     }
     else if (element["_type"] == "Attribute")
     {
-      // Resolve `<base>.<attr>` after unwrapping Optional[T] / pointer-to-struct
-      // / complex types. Returns nil if the attribute cannot be resolved.
-      auto resolve_member_on_base =
-        [this](exprt base_expr, const std::string &attr_name) -> exprt {
+      // Resolve `<base>.<attr>` after unwrapping Optional[T] /
+      // pointer-to-struct / complex types. Returns nil if the attribute cannot
+      // be resolved.
+      auto resolve_member_on_base = [this](
+                                      exprt base_expr,
+                                      const nlohmann::json &base_node,
+                                      const std::string &attr_name) -> exprt {
         typet base_type = base_expr.type();
         if (base_type.is_pointer())
           base_type = base_type.subtype();
@@ -1304,100 +1553,10 @@ exprt python_converter::get_expr(const nlohmann::json &element)
             return result;
         }
 
-        // NumPy baseline support: expose `.shape` for modelled arrays/lists.
-        // - C arrays: shape is extracted from nested array dimensions.
-        // - ESBMC runtime list model: shape is a 1D tuple (len(list),).
-        if (attr_name == "shape")
-        {
-          if (base_type.is_array())
-          {
-            std::vector<int> dims =
-              type_handler_.get_array_type_shape(base_type);
-            std::vector<exprt> dim_exprs;
-            dim_exprs.reserve(dims.size());
-            for (int dim : dims)
-              dim_exprs.push_back(from_integer(dim, int_type()));
-            return build_shape_tuple_expr(*this, dim_exprs);
-          }
-
-          const typet list_type = type_handler_.get_list_type();
-          if (
-            base_type == list_type || (base_expr.type().is_pointer() &&
-                                       base_expr.type().subtype() == list_type))
-          {
-            const symbolt *size_func =
-              symbol_table_.find_symbol("c:@F@__ESBMC_list_size");
-            if (!size_func)
-              throw std::runtime_error(
-                "__ESBMC_list_size not found for list shape access");
-
-            // (int)__ESBMC_list_size(&base_expr), built in IREP2 (V.3).
-            expr2tc base2;
-            migrate_expr(base_expr, base2);
-            if (!is_pointer_type(base2->type))
-              base2 = address_of2tc(base2->type, base2);
-            expr2tc size_call = side_effect_function_call2tc(
-              migrate_type(size_type()), symbol_expr2tc(*size_func), {base2});
-            exprt list_len = migrate_expr_back(
-              typecast2tc(migrate_type(int_type()), size_call));
-            return build_shape_tuple_expr(*this, {list_len});
-          }
-        }
-
-        // `.ndim`: the rank of the canonical bounded ndarray descriptor
-        // (numpy-architecture-decisions.md). The runtime list model only
-        // ever backs a 1-D array, so its rank is always 1.
-        if (attr_name == "ndim")
-        {
-          if (base_type.is_array())
-          {
-            std::vector<int> dims =
-              type_handler_.get_array_type_shape(base_type);
-            ndarray_descriptor descriptor(
-              std::vector<long long>(dims.begin(), dims.end()), "", 0);
-            descriptor.validate();
-            return from_integer(descriptor.rank(), int_type());
-          }
-
-          const typet list_type = type_handler_.get_list_type();
-          if (
-            base_type == list_type || (base_expr.type().is_pointer() &&
-                                       base_expr.type().subtype() == list_type))
-            return from_integer(1, int_type());
-        }
-
-        // `.shape`/`.ndim` on a boolean-mask row-selection result
-        // (build_bool_mask_row_select_symbolic): shape is `(count, cols)`,
-        // reading the struct's runtime logical row count rather than the
-        // `rows` buffer's physical (worst-case) capacity; rank is always 2
-        // (row selection is only modelled for 2-D arrays).
         if (
-          (attr_name == "shape" || attr_name == "ndim") &&
-          python_list::is_bool_mask_rows_type(base_type))
-        {
-          if (attr_name == "ndim")
-            return from_integer(2, int_type());
-
-          const struct_typet &result_type = to_struct_type(base_type);
-          const array_typet &rows_type =
-            to_array_type(ns.follow(result_type.components()[0].type()));
-          const BigInt num_cols = binary2integer(
-            to_array_type(ns.follow(rows_type.subtype()))
-              .size()
-              .value()
-              .c_str(),
-            false);
-
-          exprt count_member = python_expr::build_member(
-            base_expr, "count", result_type.components()[1].type());
-          expr2tc count2;
-          migrate_expr(count_member, count2);
-          exprt count_as_int =
-            migrate_expr_back(typecast2tc(migrate_type(int_type()), count2));
-
-          return build_shape_tuple_expr(
-            *this, {count_as_int, from_integer(num_cols, int_type())});
-        }
+          std::optional<exprt> numpy_shape_attr =
+            try_get_numpy_value_shape_attr(base_expr, base_node, attr_name))
+          return *numpy_shape_attr;
 
         if (base_type.is_struct())
         {
@@ -1491,7 +1650,8 @@ exprt python_converter::get_expr(const nlohmann::json &element)
           }
         }
 
-        exprt resolved = resolve_member_on_base(base_expr, attr_name);
+        exprt resolved =
+          resolve_member_on_base(base_expr, element["value"], attr_name);
 
         // Flow-sensitive class tracking (#4771/#4772): the usage-site scanner
         // left this attribute as any_type() (void*) because it was assigned
@@ -1514,7 +1674,8 @@ exprt python_converter::get_expr(const nlohmann::json &element)
             exprt cast =
               migrate_expr_back(typecast2tc(migrate_type(cast_t), base2));
             cast.type() = cast_t; // restore #cpp_type that migrate_type drops
-            resolved = resolve_member_on_base(cast, attr_name);
+            resolved =
+              resolve_member_on_base(cast, element["value"], attr_name);
           }
         }
 
@@ -1540,23 +1701,29 @@ exprt python_converter::get_expr(const nlohmann::json &element)
         exprt base_expr = get_expr(element["value"]);
         const std::string &attr_name = element["attr"].get<std::string>();
 
-        exprt resolved = resolve_member_on_base(base_expr, attr_name);
+        reject_numpy_shape_attr_on_nonobject_call_result(
+          base_expr, element["value"], attr_name);
+
+        exprt resolved =
+          resolve_member_on_base(base_expr, element["value"], attr_name);
         if (!resolved.is_nil())
         {
           expr = resolved;
           break;
         }
 
-        throw std::runtime_error(fmt::format(
-          "Cannot resolve attribute '{}' on {} result",
-          attr_name,
-          element["value"]["_type"].get<std::string>()));
+        throw std::runtime_error(
+          fmt::format(
+            "Cannot resolve attribute '{}' on {} result",
+            attr_name,
+            element["value"]["_type"].get<std::string>()));
       }
       else
       {
-        throw std::runtime_error(fmt::format(
-          "Unsupported Attribute value type: {}",
-          element["value"]["_type"].get<std::string>()));
+        throw std::runtime_error(
+          fmt::format(
+            "Unsupported Attribute value type: {}",
+            element["value"]["_type"].get<std::string>()));
       }
 
       // Handle module attribute access (e.g., math.inf) — unless the module
@@ -1593,10 +1760,11 @@ exprt python_converter::get_expr(const nlohmann::json &element)
         symbolt *symbol = find_symbol(module_sid.to_string());
         if (!symbol)
         {
-          throw std::runtime_error(fmt::format(
-            "Module member '{}' not found in module '{}'",
-            attr_name,
-            var_name));
+          throw std::runtime_error(
+            fmt::format(
+              "Module member '{}' not found in module '{}'",
+              attr_name,
+              var_name));
         }
 
         expr = symbol_expr(*symbol);
@@ -1627,7 +1795,8 @@ exprt python_converter::get_expr(const nlohmann::json &element)
     symbolt *symbol = nullptr;
     if (!(symbol = find_symbol(sid_str)))
     {
-      // Fallback for global variables accessed inside functions or class methods
+      // Fallback for global variables accessed inside functions or class
+      // methods
       if (!is_class_attr && element["_type"] == "Name")
       {
         sid.set_function(""); // remove function scope
@@ -1677,9 +1846,7 @@ exprt python_converter::get_expr(const nlohmann::json &element)
             is_class(var_name, *ast_json) ||
             type_utils::is_python_exceptions(var_name))
           {
-            typet str_type =
-              type_handler_.build_array(char_type(), var_name.size() + 1);
-            expr = constant_exprt(var_name, var_name, str_type);
+            expr = make_class_object(var_name);
             expr.location() = get_location_from_decl(element);
             break;
           }
@@ -1740,10 +1907,10 @@ exprt python_converter::get_expr(const nlohmann::json &element)
       const std::string &attr_name = element["attr"].get<std::string>();
 
       if (
-        std::optional<exprt> view_attr =
-          try_get_numpy_pointer_view_shape_attr(*symbol, attr_name))
+        std::optional<exprt> shape_attr =
+          try_get_numpy_shape_attr(*symbol, attr_name))
       {
-        expr = *view_attr;
+        expr = *shape_attr;
         break;
       }
 
@@ -1755,37 +1922,25 @@ exprt python_converter::get_expr(const nlohmann::json &element)
         if (sym_type.id() == "symbol")
           sym_type = ns.follow(sym_type);
 
-        if (sym_type.is_array())
+        if (
+          sym_type.is_array() &&
+          numpy_array_symbols_.count(symbol->id.as_string()) != 0)
         {
-          std::vector<int> dims = type_handler_.get_array_type_shape(sym_type);
-          std::vector<exprt> dim_exprs;
-          dim_exprs.reserve(dims.size());
-          for (int dim : dims)
-            dim_exprs.push_back(from_integer(dim, int_type()));
+          std::vector<exprt> dim_exprs =
+            build_dim_exprs(type_handler_.get_array_type_shape(sym_type));
           expr = build_shape_tuple_expr(*this, dim_exprs);
           break;
         }
 
         const typet list_type = type_handler_.get_list_type();
         if (
-          sym_type == list_type || (symbol->get_type().is_pointer() &&
-                                    symbol->get_type().subtype() == list_type))
+          numpy_array_symbols_.count(symbol->id.as_string()) != 0 &&
+          is_python_list_model_type(symbol->get_type(), list_type, ns))
         {
-          const symbolt *size_func =
-            symbol_table_.find_symbol("c:@F@__ESBMC_list_size");
-          if (!size_func)
-            throw std::runtime_error(
-              "__ESBMC_list_size not found for list shape access");
-
-          // (int)__ESBMC_list_size(&expr), built in IREP2 (V.3).
-          expr2tc base2;
-          migrate_expr(expr, base2);
-          if (!is_pointer_type(base2->type))
-            base2 = address_of2tc(base2->type, base2);
-          expr2tc size_call = side_effect_function_call2tc(
-            migrate_type(size_type()), symbol_expr2tc(*size_func), {base2});
-          exprt list_len =
-            migrate_expr_back(typecast2tc(migrate_type(int_type()), size_call));
+          exprt list_len = build_runtime_list_len_expr(
+            symbol_table_,
+            expr,
+            "__ESBMC_list_size not found for list shape access");
           expr = build_shape_tuple_expr(*this, {list_len});
           break;
         }
@@ -1801,7 +1956,9 @@ exprt python_converter::get_expr(const nlohmann::json &element)
         if (sym_type.id() == "symbol")
           sym_type = ns.follow(sym_type);
 
-        if (sym_type.is_array())
+        if (
+          sym_type.is_array() &&
+          numpy_array_symbols_.count(symbol->id.as_string()) != 0)
         {
           std::vector<int> dims = type_handler_.get_array_type_shape(sym_type);
           ndarray_descriptor descriptor(
@@ -1813,18 +1970,53 @@ exprt python_converter::get_expr(const nlohmann::json &element)
 
         const typet list_type = type_handler_.get_list_type();
         if (
-          sym_type == list_type || (symbol->get_type().is_pointer() &&
-                                    symbol->get_type().subtype() == list_type))
+          numpy_array_symbols_.count(symbol->id.as_string()) != 0 &&
+          is_python_list_model_type(symbol->get_type(), list_type, ns))
         {
           expr = from_integer(1, int_type());
           break;
         }
       }
 
+      if (attr_name == "size")
+      {
+        typet sym_type = symbol->get_type();
+        if (sym_type.is_pointer())
+          sym_type = sym_type.subtype();
+        if (sym_type.id() == "symbol")
+          sym_type = ns.follow(sym_type);
+
+        if (
+          sym_type.is_array() &&
+          numpy_array_symbols_.count(symbol->id.as_string()) != 0)
+        {
+          std::vector<exprt> dim_exprs =
+            build_dim_exprs(type_handler_.get_array_type_shape(sym_type));
+          expr = build_shape_size_expr(dim_exprs);
+          break;
+        }
+
+        const typet list_type = type_handler_.get_list_type();
+        if (
+          numpy_array_symbols_.count(symbol->id.as_string()) != 0 &&
+          is_python_list_model_type(symbol->get_type(), list_type, ns))
+        {
+          expr = build_runtime_list_len_expr(
+            symbol_table_,
+            expr,
+            "__ESBMC_list_size not found for list size access");
+          break;
+        }
+      }
+
+      if (should_reject_numpy_shape_attr_on_symbol(*symbol, attr_name))
+        throw std::runtime_error(
+          fmt::format("Cannot resolve attribute: {}", attr_name));
+
       // `.shape`/`.ndim` on a boolean-mask row-selection result: mirrors the
       // general attribute-access path above.
       if (
-        (attr_name == "shape" || attr_name == "ndim") &&
+        (attr_name == "shape" || attr_name == "ndim" || attr_name == "size") &&
         python_list::is_bool_mask_rows_type(symbol->get_type()))
       {
         if (attr_name == "ndim")
@@ -1847,8 +2039,11 @@ exprt python_converter::get_expr(const nlohmann::json &element)
         exprt count_as_int =
           migrate_expr_back(typecast2tc(migrate_type(int_type()), count2));
 
-        expr = build_shape_tuple_expr(
-          *this, {count_as_int, from_integer(num_cols, int_type())});
+        exprt col_count = from_integer(num_cols, int_type());
+        if (attr_name == "size")
+          expr = build_shape_size_expr({count_as_int, col_count});
+        else
+          expr = build_shape_tuple_expr(*this, {count_as_int, col_count});
         break;
       }
 
@@ -1900,12 +2095,14 @@ exprt python_converter::get_expr(const nlohmann::json &element)
       if (symbol_type.is_array() && symbol_type.subtype() == char_type())
       {
         // For union types, we need to infer which concrete type to use.
-        // Strategy: Look for isinstance checks in the current scope to determine
-        // the expected type, or search for classes that have this attribute.
+        // Strategy: Look for isinstance checks in the current scope to
+        // determine the expected type, or search for classes that have this
+        // attribute.
 
         symbolt *target_class_symbol = nullptr;
 
-        // Search all class types in the symbol table to find one that has this attribute
+        // Search all class types in the symbol table to find one that has this
+        // attribute
         symbol_table_.foreach_operand_in_order([&](const symbolt &s) {
           if (target_class_symbol)
             return; // Already found
@@ -2059,7 +2256,7 @@ exprt python_converter::get_expr(const nlohmann::json &element)
             class_type.tag().as_string(), attr_name, current_element_type);
           class_type.components().push_back(comp);
           // Persist the mutation back to the symbol (read-modify-set).
-          class_symbol->set_type(class_symbol_type);
+          class_symbol->set_type(migrate_type(class_symbol_type));
         }
 
         // Register instance attribute for both regular and normalized keys
@@ -2090,8 +2287,9 @@ exprt python_converter::get_expr(const nlohmann::json &element)
           var_name,
           class_type.tag().as_string());
       }
-      // For RHS (reading): use instance member if explicitly set OR if symbol is a parameter
-      // This allows parameter objects like 'f: Foo' to access instance attributes
+      // For RHS (reading): use instance member if explicitly set OR if symbol
+      // is a parameter This allows parameter objects like 'f: Foo' to access
+      // instance attributes
       else if (
         !is_converting_lhs && class_type.has_component(attr_name) &&
         (instance_has_attr || symbol->is_parameter ||
@@ -2144,10 +2342,11 @@ exprt python_converter::get_expr(const nlohmann::json &element)
             const typet &attr_type = class_type.get_component(attr_name).type();
             expr = build_member_expr_from_class(attr_type);
           }
-          else if (is_property_method(
-                     (*ast_json)["body"],
-                     extract_class_name_from_tag(obj_type_name),
-                     attr_name))
+          else if (
+            is_property_method(
+              (*ast_json)["body"],
+              extract_class_name_from_tag(obj_type_name),
+              attr_name))
           {
             // Reading a @property: invoke its getter. Rewrite `obj.attr` to a
             // call `obj.attr()` and convert that, reusing the method-call

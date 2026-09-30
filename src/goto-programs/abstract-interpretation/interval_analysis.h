@@ -10,17 +10,23 @@
 enum class INTERVAL_INSTRUMENTATION_MODE
 {
   NO_INSTRUMENTATION,
-  ALL_INSTRUCTIONS_FULL, // All instructions with all symbols belonging to the function
-  ALL_INSTRUCTIONS_LOCAL, // All instructions with the symbols affecting the instructions
-  GUARD_INSTRUCTIONS_FULL, // Assume, Asserts, GOTO with all symbols belonging to the function
-  GUARD_INSTRUCTIONS_LOCAL, // Assume, Asserts, GOTO with the symbols affecting the instruction.
-  LOOP_MODE // Adds an assumption before, during and at the end of a loop with all symbols that affect it
+  ALL_INSTRUCTIONS_FULL,   // All instructions with all symbols belonging to the
+                           // function
+  ALL_INSTRUCTIONS_LOCAL,  // All instructions with the symbols affecting the
+                           // instructions
+  GUARD_INSTRUCTIONS_FULL, // Assume, Asserts, GOTO with all symbols belonging
+                           // to the function
+  GUARD_INSTRUCTIONS_LOCAL, // Assume, Asserts, GOTO with the symbols affecting
+                            // the instruction.
+  LOOP_MODE // Adds an assumption before, during and at the end of a loop with
+            // all symbols that affect it
 };
 
 void interval_analysis(
   goto_functionst &goto_functions,
   const namespacet &ns,
   const optionst &options,
+  bool continue_past_failed_assertions,
   const INTERVAL_INSTRUMENTATION_MODE instrument_mode =
     INTERVAL_INSTRUMENTATION_MODE::GUARD_INSTRUCTIONS_LOCAL);
 
@@ -42,6 +48,7 @@ void interval_analysis(
 void instrument_loop_bounds_after_kind(
   goto_functionst &goto_functions,
   const namespacet &ns,
-  const optionst &options);
+  const optionst &options,
+  bool continue_past_failed_assertions);
 
 #endif // CPROVER_ANALYSES_INTERVAL_ANALYSIS_H

@@ -37,8 +37,8 @@
 #include <string>
 #include <utility>
 
-#include <goto-symex/reachability_tree.h>
-#include <goto-symex/symex_target_equation.h>
+#include <goto-symex/scheduler/reachability_tree.h>
+#include <goto-symex/equation/symex_target_equation.h>
 #include <solvers/smt/smt_conv.h>
 #include <solvers/solve.h>
 #include <util/symtab/namespace.h>
@@ -52,12 +52,14 @@ class engine
 public:
   explicit engine(std::string src)
     : source(std::move(src)),
-      prog(goto_factory::get_goto_functions(
-        source,
-        goto_factory::Architecture::BIT_64)),
+      prog(
+        goto_factory::get_goto_functions(
+          source,
+          goto_factory::Architecture::BIT_64)),
       ns(prog.context),
-      opts(goto_factory::get_default_options(
-        goto_factory::get_default_cmdline("test.c")))
+      opts(
+        goto_factory::get_default_options(
+          goto_factory::get_default_cmdline("test.c")))
   {
     // Read by execution_statet's constructor, so it has to be set before the
     // reachability tree builds the initial state.

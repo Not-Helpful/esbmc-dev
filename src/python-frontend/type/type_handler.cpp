@@ -1,4 +1,5 @@
 #include <python-frontend/type/type_handler.h>
+#include <clang-c-frontend/padding.h>
 #include <python-frontend/json_utils.h>
 #include <python-frontend/python_expr_builder.h>
 #include <python-frontend/type/type_utils.h>
@@ -44,7 +45,8 @@ static_assert(
 
 // Phase 4.3 seam (Part IV §5/§6): lower an internally-built IREP2 type to the
 // legacy `typet` the symbol table and shared downstream passes consume,
-// re-attaching the `#cpp_type` hint IREP2 cannot carry (F-P5). The elementary
+// re-attaching attributes the seam still drops (`#cpp_type` itself is now
+// carried, §10). The elementary
 // builders construct `type2tc` via typed factories and pass through here, so
 // the legacy bytes reaching `create_symbol` stay byte-identical to before.
 typet lower_to_seam(const type2tc &t, const irep_idt &cpp_type = irep_idt())
@@ -128,15 +130,18 @@ bool type_handler::is_constructor_call(const nlohmann::json &json) const
   if (func_name == "__init__")
     return true;
 
-  if (type_utils::is_builtin_type(func_name))
+  // Consensus type names (Gwei, uint64, ...) are typed casts, not
+  // constructor calls, even when also declared as a plain user class.
+  if (
+    type_utils::is_builtin_type(func_name) ||
+    type_utils::is_consensus_type(func_name))
     return false;
 
   /* The statement is a constructor call if the function call on the
    * rhs corresponds to the name of a class. */
 
-  // First, check if the class is defined in the AST (handles forward references)
-  // example: class Foo: -> "Bar":
-  // Bar is a class here defined later
+  // First, check if the class is defined in the AST (handles forward
+  // references) example: class Foo: -> "Bar": Bar is a class here defined later
   if (json_utils::is_class(func_name, converter_.ast()))
     return true;
 
@@ -156,7 +161,8 @@ bool type_handler::is_constructor_call(const nlohmann::json &json) const
   return is_ctor_call;
 }
 
-/// This utility maps internal ESBMC types to their corresponding Python type strings
+/// This utility maps internal ESBMC types to their corresponding Python type
+/// strings
 std::string type_handler::type_to_string(const typet &t) const
 {
   if (t == double_type())
@@ -242,16 +248,24 @@ std::string type_handler::get_var_type(const std::string &var_name) const
 
   const auto &annotation = ref["annotation"];
 
+  // A simple `Alias = bytes`-style annotation names the alias, not the
+  // builtin; dispatch decisions elsewhere (e.g. len()'s strlen-vs-
+  // get_object_size choice, builder.cpp) key off the builtin name.
+  auto resolve = [this](const std::string &name) -> std::string {
+    const std::string resolved = resolve_builtin_alias(name);
+    return resolved.empty() ? name : resolved;
+  };
+
   // Handle simple type annotations: int, str, list, etc.
   if (annotation.is_object() && annotation.contains("id"))
-    return annotation["id"].get<std::string>();
+    return resolve(annotation["id"].get<std::string>());
 
   // Handle subscripted types: List[str], Optional[int], etc.
   if (
     annotation.is_object() && annotation.contains("_type") &&
     annotation["_type"] == "Subscript" && annotation.contains("value") &&
     annotation["value"].is_object() && annotation["value"].contains("id"))
-    return annotation["value"]["id"];
+    return resolve(annotation["value"]["id"]);
 
   // Handle Union types (e.g., list[str] | None, str | int)
   // Union is represented as BinOp with BitOr operator
@@ -272,13 +286,13 @@ std::string type_handler::get_var_type(const std::string &var_name) const
       {
         // Recursively extract type from left side
         if (left.contains("id"))
-          return left["id"].get<std::string>();
+          return resolve(left["id"].get<std::string>());
 
         // Handle subscripted types on left: list[str] | None
         if (
           left["_type"] == "Subscript" && left.contains("value") &&
           left["value"].contains("id"))
-          return left["value"]["id"].get<std::string>();
+          return resolve(left["value"]["id"].get<std::string>());
       }
     }
 
@@ -291,12 +305,12 @@ std::string type_handler::get_var_type(const std::string &var_name) const
             right.contains("value") && right["value"].is_null()))
       {
         if (right.contains("id"))
-          return right["id"].get<std::string>();
+          return resolve(right["id"].get<std::string>());
 
         if (
           right["_type"] == "Subscript" && right.contains("value") &&
           right["value"].contains("id"))
-          return right["value"]["id"].get<std::string>();
+          return resolve(right["value"]["id"].get<std::string>());
       }
     }
   }
@@ -372,7 +386,8 @@ bool type_handler::are_types_compatible(const typet &t1, const typet &t2) const
 }
 
 /// Get a normalized/canonical type for list element type inference
-/// This ensures all strings use the same representative type regardless of length
+/// This ensures all strings use the same representative type regardless of
+/// length
 typet type_handler::get_canonical_string_type(const typet &t) const
 {
   // For string types (char arrays), return a canonical string type
@@ -381,7 +396,8 @@ typet type_handler::get_canonical_string_type(const typet &t) const
     const array_typet &arr_type = to_array_type(t);
     if (arr_type.subtype() == char_type())
     {
-      // Return a canonical string type (size 0 array indicates variable length string)
+      // Return a canonical string type (size 0 array indicates variable length
+      // string)
       return build_array(char_type(), 0);
     }
   }
@@ -458,6 +474,23 @@ static void throw_if_unmodelled_builtin_result(const std::string &ast_type)
 /// References:
 /// - Python 3 type system: https://docs.python.org/3/library/stdtypes.html
 /// - ESBMC irep type system: src/util/type.h
+/// The type a generic spelling `Base[...]` names: its base type, except that
+/// "Optional[T]" spelled as one name (a preprocessor-generated or inferred
+/// annotation) resolves like the Optional[T] subscript does (#8016).
+typet type_handler::get_generic_typet(
+  const std::string &ast_type,
+  size_t bracket_pos,
+  size_t type_size) const
+{
+  const std::string base_type = ast_type.substr(0, bracket_pos);
+  const std::string inner =
+    ast_type.substr(bracket_pos + 1, ast_type.size() - bracket_pos - 2);
+  if (base_type == "Optional" && inner.find('[') == std::string::npos)
+    if (const typet t = get_typet(inner); type_utils::is_optional_scalar(t))
+      return build_optional_type(t);
+  return get_typet(base_type, type_size);
+}
+
 typet type_handler::get_typet(const std::string &ast_type, size_t type_size)
   const
 {
@@ -474,8 +507,7 @@ typet type_handler::get_typet(const std::string &ast_type, size_t type_size)
   size_t bracket_pos = ast_type.find('[');
   if (bracket_pos != std::string::npos)
   {
-    std::string base_type = ast_type.substr(0, bracket_pos);
-    return get_typet(base_type, type_size);
+    return get_generic_typet(ast_type, bracket_pos, type_size);
   }
 
   // type: represents Python type objects (int, str, float, bool, etc.)
@@ -522,7 +554,8 @@ typet type_handler::get_typet(const std::string &ast_type, size_t type_size)
   // Python float type: IEEE 754 double-precision mapping
   // Python floats are implemented using C double (IEEE 754 double-precision)
   // as per Python documentation. This ensures proper precision, range, and
-  // compatibility with Python's numeric type promotion (int -> float -> complex).
+  // compatibility with Python's numeric type promotion (int -> float ->
+  // complex).
   if (ast_type == "float")
     return lower_to_seam(double_type2());
 
@@ -573,7 +606,7 @@ typet type_handler::get_typet(const std::string &ast_type, size_t type_size)
       symbolt type_symbol;
       type_symbol.id = complex_type_id;
       type_symbol.name = "complex";
-      type_symbol.set_type(get_complex_struct_type());
+      type_symbol.set_type(migrate_type(get_complex_struct_type()));
       type_symbol.mode = "Python";
       type_symbol.is_type = true;
       symbol_table.move_symbol_to_context(type_symbol);
@@ -591,7 +624,11 @@ typet type_handler::get_typet(const std::string &ast_type, size_t type_size)
   if (ast_type == "bytes")
   {
     // TODO: Refactor to model using unsigned/signed char
-    return build_array(long_long_int_type(), type_size);
+    typet t = build_array(long_long_int_type(), type_size);
+    // Tags this array as `bytes` so `+` on it is recognised as
+    // concatenation (see type_utils::is_bytes_array).
+    type_utils::set_cpp_type(t, "bytes");
+    return t;
   }
 
   // bytearray — the mutable counterpart of bytes — is not modeled. Reject it
@@ -632,7 +669,7 @@ typet type_handler::get_typet(const std::string &ast_type, size_t type_size)
     if (type_size == 1)
     {
       // 8-bit char built IREP2-internal; #cpp_type "char" is re-attached at the
-      // seam for C-backend compatibility (F-P5 — IREP2 cannot carry it).
+      // seam for C-backend compatibility (F-P5; the seam carries it since §10).
       const type2tc char_t = config.ansi_c.char_is_unsigned
                                ? unsignedbv_type2tc(config.ansi_c.char_width)
                                : signedbv_type2tc(config.ansi_c.char_width);
@@ -772,6 +809,26 @@ typet type_handler::get_typet(const std::string &ast_type, size_t type_size)
   return empty_typet();
 }
 
+std::string type_handler::resolve_builtin_alias(const std::string &name) const
+{
+  const nlohmann::json &decl = json_utils::find_var_decl(
+    name, converter_.current_function_name(), converter_.ast());
+  if (decl.empty() || !decl.contains("value") || !decl["value"].is_object())
+    return "";
+
+  const nlohmann::json &value = decl["value"];
+  if (
+    !value.contains("_type") || value["_type"] != "Name" ||
+    !value.contains("id"))
+    return "";
+
+  const std::string &target = value["id"];
+  if (type_utils::is_builtin_type(target))
+    return target;
+
+  return "";
+}
+
 typet type_handler::get_typet_from_call_func(const nlohmann::json &func) const
 {
   std::string func_name;
@@ -854,7 +911,8 @@ typet type_handler::get_typet(const nlohmann::json &elem) const
     // Handle Python AST UnaryOp node (e.g., -1, +1, ~1, not x)
     if (elem["_type"] == "UnaryOp" && elem.contains("operand"))
     {
-      // For unary operations, the result type is typically the same as the operand type
+      // For unary operations, the result type is typically the same as the
+      // operand type
       return get_typet(elem["operand"]);
     }
 
@@ -877,7 +935,8 @@ typet type_handler::get_typet(const nlohmann::json &elem) const
     }
 
     // Handle Python AST Tuple node
-    // Converts tuple expressions such as (1, 2) or ("hello", 42, 3.14) to struct types
+    // Converts tuple expressions such as (1, 2) or ("hello", 42, 3.14) to
+    // struct types
     if (elem["_type"] == "Tuple" && elem.contains("elts"))
     {
       struct_typet tuple_type;
@@ -1011,7 +1070,8 @@ typet type_handler::get_list_type(const nlohmann::json &list_value) const
 
   if (list_value["_type"] == "arg" && list_value.contains("annotation"))
   {
-    // Handle case where annotation is directly a Subscript (e.g., List['Action'])
+    // Handle case where annotation is directly a Subscript (e.g.,
+    // List['Action'])
     if (list_value["annotation"]["_type"] == "Subscript")
     {
       const nlohmann::json &slice = list_value["annotation"]["slice"];
@@ -1236,10 +1296,11 @@ typet type_handler::get_slice_type() const
   return symbol_typet(slice_type_symbol->id);
 }
 
-/// This method inspects the JSON representation of a Python operand node and attempts to
-/// infer its type based on its AST node type (`_type`). It currently supports variable
-/// names, constants (literals), and list subscripts. This type information is used for
-/// symbolic execution or translation within ESBMC.
+/// This method inspects the JSON representation of a Python operand node and
+/// attempts to infer its type based on its AST node type (`_type`). It
+/// currently supports variable names, constants (literals), and list
+/// subscripts. This type information is used for symbolic execution or
+/// translation within ESBMC.
 std::string type_handler::get_operand_type(const nlohmann::json &operand) const
 {
   // Handle variable reference (e.g., `x`)
@@ -1340,14 +1401,16 @@ std::string type_handler::get_operand_type(const nlohmann::json &operand) const
     }
   }
 
-  // Handle call expressions: constructor calls like A() and method calls like B().g()
+  // Handle call expressions: constructor calls like A() and method calls like
+  // B().g()
   else if (operand["_type"] == "Call" && operand.contains("func"))
   {
     const auto &func = operand["func"];
     // Direct constructor call: A() — return the class name as the type
     if (func["_type"] == "Name" && func.contains("id"))
       return func["id"].get<std::string>();
-    // Method call: obj.method() — infer the return type from the class definition
+    // Method call: obj.method() — infer the return type from the class
+    // definition
     if (
       func["_type"] == "Attribute" && func.contains("attr") &&
       func.contains("value"))
@@ -1393,7 +1456,8 @@ std::string type_handler::get_operand_type(const nlohmann::json &operand) const
     }
   }
 
-  // If no known type can be determined, issue a warning and return std::string()
+  // If no known type can be determined, issue a warning and return
+  // std::string()
   log_warning(
     "type_handler::get_operand_type: unable to determine operand type for AST "
     "node: {}",
@@ -1495,7 +1559,7 @@ size_t type_handler::get_type_width(const typet &type) const
   return 32;
 }
 
-typet type_handler::build_optional_type(const typet &base_type)
+typet type_handler::build_optional_type(const typet &base_type) const
 {
   // Create a struct with two fields:
   // 1. is_none: bool - indicates if value is None
@@ -1515,7 +1579,11 @@ typet type_handler::build_optional_type(const typet &base_type)
   value_field.set_access("public");
   optional_type.components().push_back(value_field);
 
-  return optional_type;
+  // Padded here, once: clang_cpp_adjust pads a variable's copy of this inline
+  // struct but not a parameter's, and base_type_eq then rejects the call.
+  typet padded = optional_type;
+  add_padding(padded, converter_.ns);
+  return padded;
 }
 
 bool type_handler::class_derives_from(

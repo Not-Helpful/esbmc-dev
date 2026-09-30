@@ -36,7 +36,7 @@ class irept
 {
 public:
   typedef std::vector<irept> subt;
-  //typedef std::list<irept> subt;
+  // typedef std::list<irept> subt;
 
   typedef std::map<irep_idt, irept> named_subt;
 
@@ -123,7 +123,7 @@ public:
 
   // These methods should be protected; however to make things play nice with
   // the C++ frontend right now, they're made public.
-  //protected:
+  // protected:
   // This class has to be able to fiddle with ireps directly.
   friend class irep_serializationt;
 
@@ -145,7 +145,7 @@ public:
 
   void set(const irep_idt &name, const long value);
   void set(const irep_idt &name, const irept &irep);
-  //public:
+  // public:
   void remove(const irep_idt &name);
   void move_to_sub(irept &irep);
   void move_to_named_sub(const irep_idt &name, irept &irep);
@@ -481,20 +481,25 @@ public:
   }
 
   /// Owning class tag of a member function type, e.g. `tag-MyClass`.
-  /// Written by the clang-cpp, Solidity and Python frontends; read by
-  /// clang_cpp_adjust_code_gen to locate a constructor's class symbol.
-  /// Carriage stays on the legacy irep — see
-  /// docs/roadmap/scope-v2-w3-attribute-carriage.md.
+  /// Written by the Solidity and Python frontends; **no reader left in the
+  /// tree**. clang_cpp_adjust_code_gen used to locate a constructor's class
+  /// symbol through it and now derives that from the `this` argument's pointee
+  /// instead (docs/roadmap/frontends-to-irep2.md §50), so the remaining writes
+  /// are dead and can go with their frontends' own slices.
   inline const irep_idt &member_name() const
   {
     return get(a_member_name);
   }
 
   /// Source-level *spelling* of a type, e.g. `signed char`, `long long`.
-  /// Carries what IREP2's closed type system deliberately normalizes away, so
-  /// its three readers are all presentation consumers (counterexample text,
-  /// generated C, exception-id strings) rather than verifier core. Same
-  /// carriage note as member_name().
+  /// Carries what IREP2's closed type system deliberately normalizes away.
+  /// Three readers are presentation consumers (counterexample text, generated
+  /// C, exception-id strings), but a fourth is not: the python frontend's
+  /// `type_utils::is_char_type` asks whether an 8-bit bitvector is a character
+  /// rather than an `int8`, and seven conversion sites branch on the answer, so
+  /// dropping the spelling changes what is verified
+  /// (docs/roadmap/scope-python-irep2.md §8). Carriage stays on the legacy
+  /// irep.
   inline const irep_idt &cpp_type() const
   {
     return get(a_cpp_type);
@@ -1305,8 +1310,8 @@ public:
   // annotation for typecasting derived class `this` to base class type
   static const irep_idt a_derived_this_arg, a_base_ctor_derived;
   /*
-   * annotation to indicate whether virtual pointer(vptr) has been initialized in contrustor
-   * This is used by implicit IR generation in adjuster
+   * annotation to indicate whether virtual pointer(vptr) has been initialized
+   * in contrustor This is used by implicit IR generation in adjuster
    */
   static const irep_idt a_need_vptr_init;
 

@@ -46,22 +46,25 @@ unsigned int smt_solver_baset::get_member_name_field(
   const type2tc &t,
   const irep_idt &name) const
 {
-  unsigned int idx = 0;
   // Pointer types lower to the synthetic pointer_struct tuple in SMT;
   // for them the named lookup uses pointer_struct's member_names.
-  const std::vector<irep_idt> &names =
-    struct_union_member_names(is_pointer_type(t) ? pointer_struct : t);
+  const type2tc &lookup_type = is_pointer_type(t) ? pointer_struct : t;
+  const std::vector<irep_idt> &names = struct_union_member_names(lookup_type);
 
-  for (const irep_idt &it : names)
-  {
-    if (it == name)
-      break;
-    idx++;
-  }
-  assert(
-    idx != names.size() && "Member name of with expr not found in struct type");
+  for (unsigned int idx = 0; idx < names.size(); idx++)
+    if (names[idx] == name)
+      return idx;
 
-  return idx;
+  // Never fall out returning names.size(): both callers index a tuple with the
+  // result, project() reading and update() writing, so an out-of-range answer
+  // is an out-of-bounds access rather than a diagnosable error. The assert
+  // that used to stand here vanished under NDEBUG.
+  log_error(
+    "Member '{}' is not a field of {}, whose members are: {}",
+    name,
+    struct_union_name(lookup_type),
+    fmt::join(names, ", "));
+  throw std::string("member name not found in struct type");
 }
 
 unsigned int smt_solver_baset::get_member_name_field(
@@ -188,6 +191,7 @@ void smt_solver_baset::push_ctx()
 {
   // Any context change can change the model; drop memoised l_get values.
   l_get_cache.clear();
+  get_ast_cache.clear();
 
   tuple_api->push_tuple_ctx();
   array_api->push_array_ctx();
@@ -247,6 +251,7 @@ void smt_solver_baset::pop_ctx()
 {
   // Any context change can change the model; drop memoised l_get values.
   l_get_cache.clear();
+  get_ast_cache.clear();
 
   // Erase everything in caches added in the current context level. Everything
   // before the push is going to disappear.
@@ -265,6 +270,14 @@ void smt_solver_baset::pop_ctx()
     });
     it = entries.empty() ? uf_ackermann_history.erase(it) : std::next(it);
   }
+
+  std::erase_if(ptr_flatten_history, [this](const ptr_flatten_entry &e) {
+    return e.level >= ctx_level;
+  });
+  std::erase_if(
+    flattened, [this](const auto &kv) { return kv.second.level >= ctx_level; });
+  std::erase_if(
+    ptr_flow, [this](const auto &kv) { return kv.second.first >= ctx_level; });
 
   pointer_logic.pop_back();
   addr_space_sym_num.pop_back();
@@ -1764,8 +1777,9 @@ smt_astt smt_solver_baset::convert_ast_node(const expr2tc &expr)
     // We only want expressions of typecast(address_of(symbol)) or
     // address_of(symbol).
     {
-      if (const typecast2t *tc = try_to_typecast2t(symbol);
-          tc && is_address_of2t(tc->from))
+      if (
+        const typecast2t *tc = try_to_typecast2t(symbol);
+        tc && is_address_of2t(tc->from))
         symbol = to_address_of2t(tc->from).ptr_obj;
 
       else if (is_address_of2t(symbol))
@@ -3031,6 +3045,15 @@ bool smt_solver_baset::decompose_stores(
   return expand_row_stores(w.update_value, origin, stores);
 }
 
+// A subscript of a subscript selects another flattened dimension, except
+// through an infinite array or a vector (get_flattened_array_subtype).
+static bool selects_flattened_dimension(const index2t &index)
+{
+  const type2tc &src_type = index.source_value->type;
+  return is_index2t(index.source_value) && !is_vector_type(src_type) &&
+         !(is_array_type(src_type) && to_array_type(src_type).size_is_infinite);
+}
+
 smt_astt smt_solver_baset::convert_array_index(const expr2tc &expr)
 {
   const index2t &index = to_index2t(expr);
@@ -3044,13 +3067,7 @@ smt_astt smt_solver_baset::convert_array_index(const expr2tc &expr)
   expr2tc src_value = index.source_value;
 
   expr2tc newidx;
-  // Source type might not be an array (e.g. vector); to_array_type() throws
-  // std::bad_cast under -DNDEBUG-off builds. Gate the size_is_infinite probe
-  // on is_array_type() before dereferencing.
-  const bool src_is_infinite_array =
-    is_array_type(index.source_value->type) &&
-    to_array_type(index.source_value->type).size_is_infinite;
-  if (is_index2t(index.source_value) && !src_is_infinite_array)
+  if (selects_flattened_dimension(index))
   {
     // Finite multi-dimensional arrays: flatten via decompose_select_chain.
     newidx = decompose_select_chain(expr, src_value);
@@ -3128,12 +3145,12 @@ smt_astt smt_solver_baset::convert_array_store(const expr2tc &expr)
     newidx = fix_array_idx(with.update_field, with.type);
   }
 
-  assert(is_array_type(expr->type));
   smt_astt src, update;
-  const array_type2t &arrtype = to_array_type(expr->type);
+  // A vector is encoded as an array too (convert_sort).
+  const type2tc &subtype = array_or_vector_subtype(expr->type);
 
   // Workaround for bools-in-arrays.
-  if (is_bool_type(arrtype.subtype) && !array_api->supports_bools_in_arrays)
+  if (is_bool_type(subtype) && !array_api->supports_bools_in_arrays)
   {
     expr2tc cast = typecast2tc(get_uint_type(1), update_val);
     update = convert_ast(cast);
@@ -3169,27 +3186,20 @@ type2tc smt_solver_baset::flatten_array_type(const type2tc &type)
   type2tc subtype = get_flattened_array_subtype(type);
   assert(is_array_type(to_array_type(type).subtype));
 
-  type2tc type_rec = type;
-  expr2tc arr_size1 = to_array_type(type_rec).array_size;
-
-  type_rec = to_array_type(type_rec).subtype;
-  expr2tc arr_size2 = to_array_type(type_rec).array_size;
-
-  /* Every nil array_size is built alongside size_is_infinite, and an infinite
-   * outer level returned above, so none reached here carries one (#7481). */
-  assert(!is_nil_expr(arr_size1) && !is_nil_expr(arr_size2));
-
-  if (arr_size1->type != arr_size2->type)
-    arr_size1 = typecast2tc(arr_size2->type, arr_size1);
-
-  expr2tc arr_size = mul2tc(arr_size1->type, arr_size1, arr_size2);
-
-  while (is_array_type(to_array_type(type_rec).subtype))
+  /* A VLA size keeps its own type (int, long, ...) and a constant level over a
+   * variably-modified element is an int, so the product is taken in size_t:
+   * any narrower type wraps or truncates the stride (R61). Every nil
+   * array_size is built alongside size_is_infinite, and an infinite outer
+   * level returned above, so none reached here carries one (#7481). */
+  expr2tc arr_size;
+  for (type2tc t = type; is_array_type(t); t = to_array_type(t).subtype)
   {
-    type_rec = to_array_type(type_rec).subtype;
-    assert(!is_nil_expr(to_array_type(type_rec).array_size));
-    arr_size =
-      mul2tc(arr_size1->type, to_array_type(type_rec).array_size, arr_size);
+    expr2tc dim_size = to_array_type(t).array_size;
+    assert(!is_nil_expr(dim_size));
+    if (dim_size->type != size_type2())
+      dim_size = typecast2tc(size_type2(), dim_size);
+    arr_size = is_nil_expr(arr_size) ? dim_size
+                                     : mul2tc(size_type2(), dim_size, arr_size);
   }
   simplify(arr_size);
   return array_type2tc(subtype, arr_size, false);
@@ -3273,12 +3283,13 @@ type2tc smt_solver_baset::get_flattened_array_subtype(const type2tc &type)
     is_array_type(to_array_type(type).subtype))
     return to_array_type(type).subtype;
 
+  // A vector inside an array is the element, not a flattened dimension.
+  if (is_vector_type(type))
+    return to_vector_type(type).subtype;
+
   type2tc type_rec = type;
-  while (is_array_type(type_rec) || is_vector_type(type_rec))
-  {
-    type_rec = is_array_type(type_rec) ? to_array_type(type_rec).subtype
-                                       : to_vector_type(type_rec).subtype;
-  }
+  while (is_array_type(type_rec))
+    type_rec = to_array_type(type_rec).subtype;
 
   // type_rec is now the base type.
   return type_rec;
@@ -3288,12 +3299,25 @@ void smt_solver_baset::pre_solve()
 {
   // A new solve produces a fresh model; drop memoised l_get values.
   l_get_cache.clear();
+  get_ast_cache.clear();
 
   // NB: always perform tuple constraint adding first, as it covers tuple
   // arrays too, and might end up generating more ASTs to be encoded in
   // the array api class.
   tuple_api->add_tuple_constraints_for_solving();
   array_api->add_array_constraints_for_solving();
+}
+
+/* An element get_index_value() read from the model is a value already. Walking
+ * its operands would query the object inside an address_of: a function aborts,
+ * data prints as &0. A symbol element (NULL, INVALID<n>) is returned as is. */
+std::optional<expr2tc>
+smt_solver_baset::get_index(const expr2tc &expr, expr2tc &res)
+{
+  std::optional<expr2tc> v = get_index_value(expr, res);
+  if (!v && res != expr)
+    v = is_symbol2t(res) ? res : get(res);
+  return v;
 }
 
 /* get()'s index_id case: read one element out of the solver's array model
@@ -3317,11 +3341,7 @@ smt_solver_baset::get_index_value(const expr2tc &expr, expr2tc &res)
   expr2tc src_value = index.source_value;
 
   expr2tc newidx;
-  // Same NDEBUG-off safety guard as in convert_array_index() above.
-  const bool src_is_infinite_array =
-    is_array_type(index.source_value->type) &&
-    to_array_type(index.source_value->type).size_is_infinite;
-  if (is_index2t(index.source_value) && !src_is_infinite_array)
+  if (selects_flattened_dimension(index))
   {
     newidx = decompose_select_chain(expr, src_value);
   }
@@ -3350,7 +3370,8 @@ smt_solver_baset::get_index_value(const expr2tc &expr, expr2tc &res)
       res = array_api->get_array_elem(
         array,
         to_constant_int2t(idx).value.to_uint64(),
-        get_flattened_array_subtype(res->type));
+        is_vector_type(res->type) ? res->type
+                                  : get_flattened_array_subtype(res->type));
 
     // If we got a nil result, return original expression
     if (is_nil_expr(res))
@@ -3375,7 +3396,7 @@ expr2tc smt_solver_baset::get(const expr2tc &expr)
   switch (res->expr_id)
   {
   case expr2t::index_id:
-    if (auto v = get_index_value(expr, res))
+    if (auto v = get_index(expr, res))
       return *v;
     break;
 
@@ -3564,6 +3585,17 @@ expr2tc smt_solver_baset::get(const expr2tc &expr)
 
 expr2tc smt_solver_baset::get_by_ast(const type2tc &type, smt_astt a)
 {
+  auto cached = get_ast_cache.find(a);
+  if (cached != get_ast_cache.end() && cached->second.first == type)
+    return cached->second.second;
+
+  expr2tc res = get_by_ast_uncached(type, a);
+  get_ast_cache[a] = {type, res};
+  return res;
+}
+
+expr2tc smt_solver_baset::get_by_ast_uncached(const type2tc &type, smt_astt a)
+{
   switch (type->type_id)
   {
   case type2t::bool_id:
@@ -3645,6 +3677,12 @@ expr2tc smt_solver_baset::get_by_ast(const type2tc &type, smt_astt a)
 
   case type2t::array_id:
     return get_array(type, a);
+
+  case type2t::vector_id:
+  {
+    expr2tc arr = get_array(flatten_array_type(type), a);
+    return constant_vector2tc(type, to_constant_array2t(arr).datatype_members);
+  }
 
   default:
     if (!options.get_bool_option("non-supported-models-as-zero"))

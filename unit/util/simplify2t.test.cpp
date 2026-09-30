@@ -1,5 +1,6 @@
 /*
- * SPDX-FileCopyrightText: 2025 Lucas Cordeiro, Jeremy Morse, Bernd Fischer, Mikhail Ramalho
+ * SPDX-FileCopyrightText: 2025 Lucas Cordeiro, Jeremy Morse, Bernd Fischer,
+ * Mikhail Ramalho
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -215,6 +216,33 @@ TEST_CASE(
 }
 
 TEST_CASE(
+  "Vector add of a constant and a symbolic vector adds lane by lane",
+  "[arithmetic][add][vector]")
+{
+  // {1,2,3,4} + v distributes over the constant; each lane must add v's lane,
+  // not the whole vector v, or the SMT layer sees a 32-bit plus a 128-bit add.
+  const type2tc i32 = get_int_type(32);
+  const type2tc vec_type = vector_type2tc(i32, gen_ulong(4));
+  std::vector<expr2tc> members{
+    constant_int2tc(i32, BigInt(1)),
+    constant_int2tc(i32, BigInt(2)),
+    constant_int2tc(i32, BigInt(3)),
+    constant_int2tc(i32, BigInt(4))};
+  const expr2tc vec = constant_vector2tc(vec_type, std::move(members));
+  const expr2tc v = symbol2tc(vec_type, "v");
+
+  const expr2tc result = add2tc(vec_type, vec, v)->simplify();
+
+  REQUIRE(is_constant_vector2t(result));
+  for (const expr2tc &lane : to_constant_vector2t(result).datatype_members)
+  {
+    REQUIRE(lane->type == i32);
+    lane->foreach_operand(
+      [&i32](const expr2tc &e) { REQUIRE(e->type == i32); });
+  }
+}
+
+TEST_CASE(
   "Pointer-add fold: same-width sum widens to index_type2",
   "[arithmetic][add][pointer]")
 {
@@ -389,6 +417,52 @@ TEST_CASE("Multiplication constant folding: 4 * 5 = 20", "[arithmetic][mul]")
 
   REQUIRE(is_constant_int2t(result));
   REQUIRE(to_constant_int2t(result).value == 20);
+}
+
+TEST_CASE(
+  "Overflow shortcut: widened same-signed multiply folds to false",
+  "[arithmetic][mul][overflow]")
+{
+  // (u32)a * (u32)b where a, b are u16: 16 + 16 <= 32, and the cast target
+  // matches the overflow's own operand type, so overflow2t::do_simplify()
+  // (#7840) must fold this without a solver query.
+  const expr2tc from1 = symbol2tc(get_uint_type(16), "a");
+  const expr2tc from2 = symbol2tc(get_uint_type(16), "b");
+  const expr2tc side_1 = typecast2tc(get_uint_type(32), from1);
+  const expr2tc side_2 = typecast2tc(get_uint_type(32), from2);
+  const expr2tc mul = mul2tc(get_uint_type(32), side_1, side_2);
+  const expr2tc overflow = overflow2tc(mul);
+
+  const expr2tc result = overflow->do_simplify();
+
+  REQUIRE(!is_nil_expr(result));
+  REQUIRE(is_constant_bool2t(result));
+  REQUIRE(to_constant_bool2t(result).value == false);
+}
+
+TEST_CASE(
+  "Overflow shortcut: mul type mismatching its cast operands declines",
+  "[arithmetic][mul][overflow]")
+{
+  // Same shape as above, but the mul's own declared type (signed int32) is
+  // not the type its casts actually target (unsigned uint32) -- the pattern
+  // migrate.cpp's mul2tc(op0->type, op0, op1) can produce for "overflow-*",
+  // since assert_arith_2ops_consistency asserts only width, never
+  // signedness. Reading from1/from2's signedness against operand->type here
+  // would see two signed 16-bit sources and a signed 32-bit destination and
+  // fold to false, even though the multiply the cast operands actually
+  // compute is unsigned 32-bit, not signed. The type-match guard in
+  // overflow2t::do_simplify() must decline instead.
+  const expr2tc from1 = symbol2tc(get_int_type(16), "a");
+  const expr2tc from2 = symbol2tc(get_int_type(16), "b");
+  const expr2tc side_1 = typecast2tc(get_uint_type(32), from1);
+  const expr2tc side_2 = typecast2tc(get_uint_type(32), from2);
+  const expr2tc mul = mul2tc(get_int_type(32), side_1, side_2);
+  const expr2tc overflow = overflow2tc(mul);
+
+  const expr2tc result = overflow->do_simplify();
+
+  REQUIRE(is_nil_expr(result));
 }
 
 TEST_CASE("Division simplification: x / 1 = x", "[arithmetic][div]")

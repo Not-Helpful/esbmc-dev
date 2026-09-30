@@ -284,8 +284,8 @@ exprt python_list::handle_comprehension(const nlohmann::json &element)
   // 10. Create while loop: while (i < length), built in IREP2 (V.1k keystone,
   // W). index_var (size_type) and length_expr can have mismatched widths (the
   // array path, length_expr = arr_type.size()), so reconcile with the same
-  // c_implicit_typecast_arithmetic clang_cpp_adjust's adjust_expr_rel applies --
-  // byte-identical, idempotent -- before building lessthan2t.
+  // c_implicit_typecast_arithmetic clang_cpp_adjust's adjust_expr_rel applies
+  // -- byte-identical, idempotent -- before building lessthan2t.
   exprt idx_op = build_symbol(index_var);
   exprt len_op = length_expr;
   namespacet ns(converter_.symbol_table());
@@ -506,8 +506,9 @@ void python_list::handle_list_var_unpacking(
 
     // __ESBMC_list_push_shallow(star_list, tmp_at): preserve element value
     // pointers so nested lists survive the unpack copy uncorrupted (#5102).
-    const symbolt *push_obj_func =
-      converter_.symbol_table().find_symbol("c:@F@__ESBMC_list_push_shallow");
+    const shallow_push_call shallow_push =
+      select_shallow_push(list_expr, from_integer(BigInt(0), size_type()));
+    const symbolt *push_obj_func = shallow_push.func;
     assert(push_obj_func);
 
     // Nested-list elements keep their inner pointer; scalars are byte-copied,
@@ -523,7 +524,7 @@ void python_list::handle_list_var_unpacking(
       {build_symbol(star_list),
        build_symbol(tmp_at),
        star_list_type_id,
-       from_integer(BigInt(0), size_type())});
+       shallow_push.last_arg});
     push_call.location() = loc;
     loop_body.copy_to_operands(
       converter_.convert_expression_to_code(push_call));

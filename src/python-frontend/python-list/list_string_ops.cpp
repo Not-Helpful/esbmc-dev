@@ -230,7 +230,8 @@ exprt python_list::build_split_list(
   bool from_right)
 {
   // For symbolic strings, we create a runtime call to __python_str_split
-  // This function will handle the splitting at runtime with symbolic constraints
+  // This function will handle the splitting at runtime with symbolic
+  // constraints
 
   // The runtime model splits left-to-right, so it only models rsplit() when no
   // maxsplit limits the result (rsplit() == split() then). A right-anchored
@@ -248,7 +249,8 @@ exprt python_list::build_split_list(
 
   if (!func_symbol)
   {
-    // Create function type: PyListObject* __python_str_split(char* str, char* sep, int maxsplit)
+    // Create function type: PyListObject* __python_str_split(char* str, char*
+    // sep, int maxsplit)
     code_typet func_type;
     func_type.return_type() = converter.get_type_handler().get_list_type();
 
@@ -267,7 +269,7 @@ exprt python_list::build_split_list(
     symbolt new_symbol;
     new_symbol.name = func_name;
     new_symbol.id = func_name;
-    new_symbol.set_type(func_type);
+    new_symbol.set_type(migrate_type(func_type));
     new_symbol.mode = "C";
     new_symbol.module = "python";
     new_symbol.location = location;

@@ -119,8 +119,8 @@ bool python_adjust::adjust()
     if (value != original)
       symbol->set_value(value);
 
-    // Post-adjust strong invariant (V.1k B.4): re-enforce what the three relaxed
-    // construction asserts deferred — no member2t/index2t source and no
+    // Post-adjust strong invariant (V.1k B.4): re-enforce what the three
+    // relaxed construction asserts deferred — no member2t/index2t source and no
     // constant_struct2t type may survive as a transient symbol_type2t, and a
     // resolved-struct literal must carry one operand per component. Pre-S2
     // this fired on every flag-on run (the OM exception literals,
@@ -182,8 +182,9 @@ void restore_padding_flags(typet &type)
 }
 
 // Convert each argument to its declared parameter type, mirroring
-// clang_c_adjust::adjust_function_call_arguments (clang_c_adjust_expr.cpp:1069).
-// Callers decide which call forms reach it -- see adjust_expr.
+// clang_c_adjust::adjust_function_call_arguments
+// (clang_c_adjust_expr.cpp:1069). Callers decide which call forms reach it --
+// see adjust_expr.
 //
 // Cast only scalar/pointer kinds; an aggregate argument from an upstream typing
 // bug keeps symex's own per-argument diagnostic rather than an unencodable
@@ -218,6 +219,37 @@ bool convert_call_arguments(const type2tc &callee, std::vector<expr2tc> &args)
     }
   }
   return changed;
+}
+
+/// A pointer target assigned a bare array value: the array->pointer decay at
+/// the assignment seam.
+bool assigns_array_to_pointer(const expr2tc &expr)
+{
+  return is_code_assign2t(expr) &&
+         is_pointer_type(to_code_assign2t(expr).target->type) &&
+         is_array_type(to_code_assign2t(expr).source->type);
+}
+
+/// A declaration whose initialiser is an array while its own type is not.
+bool declares_scalar_from_array(const expr2tc &expr)
+{
+  if (!is_code_decl2t(expr))
+    return false;
+
+  const code_decl2t &d = to_code_decl2t(expr);
+  return !is_nil_expr(d.init) && is_array_type(d.init->type) &&
+         !is_array_type(expr->type);
+}
+
+/// Convert such a declaration's initialiser to the declared type, rebuilding
+/// the (immutable) declaration only when the conversion changed it.
+void decay_scalar_decl_init(expr2tc &expr, const namespacet &ns)
+{
+  const code_decl2t &d = to_code_decl2t(expr);
+  expr2tc init = d.init;
+  c_implicit_typecast(init, expr->type, ns);
+  if (init != d.init)
+    expr = code_decl2tc(expr->type, d.value, init, d.location);
 }
 
 } // namespace
@@ -331,11 +363,11 @@ void python_adjust::adjust_expr(expr2tc &expr)
   {
     const index2t &i = to_index2t(expr);
     // clang_c_adjust::adjust_index casts the index to index_type() before using
-    // it (clang_c_adjust_expr.cpp:591). Without it an index of a different width
-    // or signedness reaches the element computation unconverted — e.g.
+    // it (clang_c_adjust_expr.cpp:591). Without it an index of a different
+    // width or signedness reaches the element computation unconverted — e.g.
     // `float_buf[obj->float_idx]` where legacy emits
-    // `float_buf[(signed long int)obj->float_idx]` — which changes the value read
-    // and can flip a verdict.
+    // `float_buf[(signed long int)obj->float_idx]` — which changes the value
+    // read and can flip a verdict.
     expr2tc idx = i.index;
     if (idx->type != index_type2())
       idx = typecast2tc(index_type2(), idx);
@@ -403,9 +435,10 @@ void python_adjust::adjust_expr(expr2tc &expr)
   {
     // clang_c_adjust::adjust_expr_unary_boolean casts `not`'s operand to bool
     // (clang_c_adjust_expr.cpp:1530-1538). Python's `not x` over a non-boolean
-    // value -- `not (x and True)` where `x` is None, so the short-circuit select
-    // has pointer type -- otherwise reaches the SMT layer as a negation of a
-    // non-boolean sort and trips bitwuzla's mk_not assert. not2t is immutable.
+    // value -- `not (x and True)` where `x` is None, so the short-circuit
+    // select has pointer type -- otherwise reaches the SMT layer as a negation
+    // of a non-boolean sort and trips bitwuzla's mk_not assert. not2t is
+    // immutable.
     expr = not2tc(typecast2tc(get_bool_type(), to_not2t(expr).value));
   }
   else if (is_equality2t(expr) || is_notequal2t(expr))
@@ -476,8 +509,8 @@ void python_adjust::adjust_expr(expr2tc &expr)
     {
       // The expr2tc overload, not the legacy exprt one clang_c_adjust calls:
       // same usual-arithmetic-conversion rule with no migrate round-trip, so an
-      // operand cannot pick up a spurious wrap from a type that fails to compare
-      // equal to itself after migration -- the first of the two "gap-2"
+      // operand cannot pick up a spurious wrap from a type that fails to
+      // compare equal to itself after migration -- the first of the two "gap-2"
       // negative results. Same helper python_math's floor-div/modulo width
       // reconciliation uses (#5725).
       c_implicit_typecast_arithmetic(*ops[0], *ops[1], ns);
@@ -564,23 +597,21 @@ void python_adjust::adjust_expr(expr2tc &expr)
   else if (
     is_address_of2t(expr) && is_array_type(to_address_of2t(expr).ptr_obj->type))
   {
-    // `&array` decays to `&array[0]`, exactly as clang_c_adjust::adjust_address_of
-    // does (clang_c_adjust_expr.cpp:743-754). This is the node-level counterpart
-    // of the assignment-seam decay below: the operand need not be near an
-    // assignment at all -- the OM raise sites build a struct literal
+    // `&array` decays to `&array[0]`, exactly as
+    // clang_c_adjust::adjust_address_of does (clang_c_adjust_expr.cpp:743-754).
+    // This is the node-level counterpart of the assignment-seam decay below:
+    // the operand need not be near an assignment at all -- the OM raise sites
+    // build a struct literal
     // `{ .message = &"math domain error" }` whose member is a `char*`, so
     // without the decay the literal carries a `char(*)[N]` and the member type
-    // silently disagrees with its initialiser. Idempotent: the rewritten operand
-    // is an index2t of element type, so the arm cannot re-fire.
+    // silently disagrees with its initialiser. Idempotent: the rewritten
+    // operand is an index2t of element type, so the arm cannot re-fire.
     const address_of2t &a = to_address_of2t(expr);
     const type2tc &elem = to_array_type(a.ptr_obj->type).subtype;
     expr =
       address_of2tc(elem, index2tc(elem, a.ptr_obj, gen_zero(index_type2())));
   }
-  else if (
-    is_code_assign2t(expr) &&
-    is_pointer_type(to_code_assign2t(expr).target->type) &&
-    is_array_type(to_code_assign2t(expr).source->type))
+  else if (assigns_array_to_pointer(expr))
   {
     // Array→pointer decay at the assignment seam: a `char*` target assigned a
     // bare array value (a Python string literal, e.g. `word = ""` where `""` is
@@ -599,6 +630,19 @@ void python_adjust::adjust_expr(expr2tc &expr)
     expr2tc decayed =
       address_of2tc(pointee, index2tc(elem, a.source, gen_zero(index_type2())));
     expr = code_assign2tc(a.target, decayed, a.location);
+  }
+  else if (declares_scalar_from_array(expr))
+  {
+    // A declaration whose initialiser is an array but whose type is not: a
+    // Python list element is stored as a pointer-sized integer, so appending a
+    // string literal declares `unsigned long v = "…"`. Legacy lowers it to
+    // `(unsigned long)&arr[0]` -- the array→pointer decay of
+    // c_typecastt::do_typecast, then the integer conversion -- and left as a
+    // bare array the declaration and its value reach the solver with different
+    // sorts, which bitwuzla rejects as "terms with mismatching sort"
+    // (docs/roadmap/scope-python-irep2.md §1). This is clang_c_adjust_irep2's
+    // adjust_decl_init narrowed to the one shape the Python converter builds.
+    decay_scalar_decl_init(expr, ns);
   }
   else if (
     is_code_assign2t(expr) &&
@@ -711,13 +755,14 @@ void python_adjust::adjust_expr(expr2tc &expr)
     is_code_ifthenelse2t(expr) &&
     !is_bool_type(to_code_ifthenelse2t(expr).cond->type))
   {
-    // Branch/loop conditions must be boolean before the solver sees them. Python
-    // writes `if x:` on a plain int, and the converter keeps the raw signedbv;
-    // clang_c_adjust casts it (adjust_ifthenelse/adjust_while/adjust_for all call
-    // gen_typecast_bool). Without the cast the guard reaches the SMT layer as a
-    // bitvector where a Boolean is required -- bitwuzla rejects it with "term
-    // with unexpected sort at index 0". This is the statement-level counterpart
-    // of the if2t (ternary) arm above.
+    // Branch/loop conditions must be boolean before the solver sees them.
+    // Python writes `if x:` on a plain int, and the converter keeps the raw
+    // signedbv; clang_c_adjust casts it
+    // (adjust_ifthenelse/adjust_while/adjust_for all call gen_typecast_bool).
+    // Without the cast the guard reaches the SMT layer as a bitvector where a
+    // Boolean is required -- bitwuzla rejects it with "term with unexpected
+    // sort at index 0". This is the statement-level counterpart of the if2t
+    // (ternary) arm above.
     const code_ifthenelse2t &i = to_code_ifthenelse2t(expr);
     expr = code_ifthenelse2tc(
       typecast2tc(get_bool_type(), i.cond),
@@ -1048,8 +1093,13 @@ void python_adjust::derive_exception_ids_rec(
   // "void_ptr". The trailing never-empty fallback mirrors legacy's — callers
   // (remove_exceptions) dereference front(), so an unknown shape must yield
   // a synthetic id that simply never matches a real throw, not an empty
-  // list. (Legacy also appends a `#cpp_type` id when present; that attribute
-  // does not survive migration and Python types never carry it.)
+  // list. (Legacy also appends a `#cpp_type` id when present. That attribute
+  // does now survive migration on the bitvector and floatbv kinds, and Python
+  // types do carry it -- a string subscript is tagged "char" -- so this list
+  // can omit an id clang_cpp_exception_id includes. Deliberate: a python
+  // exception is matched by its class, not by a scalar's spelling, and nothing
+  // raises a bare char. Revisit if that changes. See
+  // docs/roadmap/scope-python-irep2.md §10.)
   if (is_pointer_type(type))
   {
     const type2tc &sub = to_pointer_type(type).subtype;
@@ -1160,7 +1210,13 @@ void python_adjust::adjust_type(type2tc &type)
     adjust_type(ret);
     changed |= ret != ret_before;
     if (changed)
-      type = code_type2tc(args, ret, ct.argument_names, ct.ellipsis);
+      type = code_type2tc(
+        args,
+        ret,
+        ct.argument_names,
+        ct.ellipsis,
+        ct.argument_base_names,
+        ct.argument_defaults);
     return;
   }
 
@@ -1189,7 +1245,16 @@ void python_adjust::adjust_type(type2tc &type)
       {
         const struct_type2t &st = to_struct_type(type);
         type = struct_type2tc(
-          members, st.member_names, st.member_pretty_names, st.name, st.packed);
+          members,
+          st.member_names,
+          st.member_pretty_names,
+          st.name,
+          st.packed,
+          st.member_base_names,
+          st.alignment,
+          st.python_aggregate,
+          st.has_bases,
+          st.bases);
       }
       else
       {
@@ -1204,7 +1269,7 @@ void python_adjust::adjust_type(type2tc &type)
     // and without it add_padding aligns an existing pad member as if it were
     // a regular field (padding.cpp:262 vs :276), double-padding the struct.
     // Re-derive it from the four reserved pad-member names add_padding
-    // assigns: they all contain `$`, which cannot appear in a Python
+    // assigns: they all contain `#`, which cannot appear in a Python
     // identifier, so only add_padding's own members match. (The #bitfield/
     // #extint type flags are likewise dropped by the round-trip, but the
     // Python frontend never emits either, so only #is_padding needs
@@ -1273,9 +1338,9 @@ void python_adjust::collect_unresolved_sources(
   // see an index over a pointer — flag it before it escapes.
   if (is_index2t(expr) && is_pointer_type(to_index2t(expr).source_value->type))
     out.push_back("index over unresolved pointer source");
-  // A constant_struct2t is the third relaxed construction assert (irep2_expr.h):
-  // its own type may be a transient by-name symbol_type2t until the aggregate is
-  // followed. Post-adjust it must be a resolved struct too.
+  // A constant_struct2t is the third relaxed construction assert
+  // (irep2_expr.h): its own type may be a transient by-name symbol_type2t until
+  // the aggregate is followed. Post-adjust it must be a resolved struct too.
   if (is_constant_struct2t(expr) && is_symbol_type(expr->type))
     out.push_back(
       "struct literal with by-name type `" +

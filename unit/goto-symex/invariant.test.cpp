@@ -22,8 +22,8 @@
 #  include <unistd.h>
 #endif
 
-#include <goto-symex/reachability_tree.h>
-#include <goto-symex/renaming.h>
+#include <goto-symex/scheduler/reachability_tree.h>
+#include <goto-symex/state/renaming.h>
 #include <irep2/irep2_expr.h>
 #include <util/lang/c_types.h>
 #include <util/symtab/namespace.h>
@@ -36,12 +36,14 @@ class engine
 {
 public:
   engine()
-    : prog(goto_factory::get_goto_functions(
-        source,
-        goto_factory::Architecture::BIT_64)),
+    : prog(
+        goto_factory::get_goto_functions(
+          source,
+          goto_factory::Architecture::BIT_64)),
       ns(prog.context),
-      opts(goto_factory::get_default_options(
-        goto_factory::get_default_cmdline("test.c"))),
+      opts(
+        goto_factory::get_default_options(
+          goto_factory::get_default_cmdline("test.c"))),
       rt(
         prog.functions,
         ns,

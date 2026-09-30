@@ -2,9 +2,9 @@
 
 #include <esbmc/bmc.h>
 #include <esbmc/esbmc_parseoptions.h>
-#include <goto-symex/goto_symex.h>
-#include <goto-symex/goto_trace.h>
-#include <goto-symex/sarif.h>
+#include <goto-symex/engine/goto_symex.h>
+#include <goto-symex/trace/goto_trace.h>
+#include <goto-symex/trace/sarif.h>
 #include <util/base/cwe_mapping.h>
 #include <solvers/smt/smt_result.h>
 #include <solvers/smtlib/smtlib_conv.h>
@@ -32,6 +32,7 @@
 #include <esbmc/ranking_synthesis.h>
 #include <esbmc/non_termination.h>
 #include <goto-programs/goto_loop_simplify.h>
+#include <goto-programs/goto_invariant_synthesis.h>
 #include <goto-programs/goto_loop_invariant.h>
 #include <goto-programs/abstract-interpretation/interval_analysis.h>
 #include <goto-programs/abstract-interpretation/gcse.h>
@@ -173,6 +174,31 @@ apply_rounding_mode(goto_functionst &goto_functions, const cmdlinet &cmdline)
   return false;
 }
 
+static void apply_gcse(
+  goto_functionst &goto_functions,
+  contextt &context,
+  const cmdlinet &cmdline)
+{
+  // The available-expressions analysis is sequential: another thread may
+  // write between two reads it treats as equal (#8007).
+  if (spawns_threads(goto_functions))
+  {
+    log_warning("--gcse is ignored: the program may create threads");
+    return;
+  }
+
+  auto andersen = std::make_shared<andersent>();
+  log_status("Computing points-to analysis (Andersen)");
+  (*andersen)(goto_functions);
+  std::shared_ptr<value_setst> points_to = andersen;
+
+  if (cmdline.isset("no-library"))
+    log_warning("Using CSE with --no-library might cause huge slowdowns!");
+
+  goto_cse cse(context, points_to);
+  cse.run(goto_functions);
+}
+
 // This method performs various analyses and transformations
 // on the given GOTO program. They involve all the techniques that we class
 // as "static analyses" - performed on the given GOTO program before it is
@@ -199,8 +225,6 @@ bool esbmc_parseoptionst::process_goto_program(
       apply_taylor_terms(goto_functions, cmdline))
       return true;
 
-    bool is_mul =
-      cmdline.isset("multi-property") || cmdline.isset("parallel-solving");
     is_coverage = cmdline.isset("assertion-coverage") ||
                   cmdline.isset("assertion-coverage-claims") ||
                   cmdline.isset("condition-coverage") ||
@@ -222,18 +246,23 @@ bool esbmc_parseoptionst::process_goto_program(
     options.set_option(
       "coverage-measurement", is_coverage && !cmdline.isset("dead-code-check"));
 
+    // Claims after a violation are still checked, so no pass may treat a
+    // failed assertion as the end of its path (#7900).
+    const bool checks_past_violation =
+      options.get_bool_option("multi-property") || is_coverage;
+
     // For coverage mode, treat extra input files (cmdline.args[1:]) as include
     // files so that the coverage location_pool covers all input sources.
     if (is_coverage && cmdline.args.size() > 1)
       for (size_t i = 1; i < cmdline.args.size(); i++)
         config.ansi_c.include_files.push_back(cmdline.args[i]);
 
-    // For Solidity coverage mode: neutralize the multi-transaction harness loop.
-    // The _ESBMC_Main_* functions contain a while(nondet_bool()) loop that calls
-    // user functions repeatedly. This causes massive symex overhead in coverage
-    // mode where we only need each function executed once. Convert backward GOTOs
-    // (loop back-edges) in _ESBMC_Main* functions to SKIPs so the loop body
-    // executes exactly once.
+    // For Solidity coverage mode: neutralize the multi-transaction harness
+    // loop. The _ESBMC_Main_* functions contain a while(nondet_bool()) loop
+    // that calls user functions repeatedly. This causes massive symex overhead
+    // in coverage mode where we only need each function executed once. Convert
+    // backward GOTOs (loop back-edges) in _ESBMC_Main* functions to SKIPs so
+    // the loop body executes exactly once.
     if (is_coverage)
     {
       bool is_sol = cmdline.isset("sol");
@@ -287,12 +316,13 @@ bool esbmc_parseoptionst::process_goto_program(
     if (!(cmdline.isset("no-remove-no-op")))
       remove_no_op(goto_functions);
 
-    // We should skip this 'remove-unreachable' removal in goto-cov and multi-property
+    // We should skip this 'remove-unreachable' removal in goto-cov and
+    // multi-property
     // - multi-property wants to find all the bugs in the src code
     // - assertion-coverage wants to find out unreached codes (asserts)
     // - however, the optimization below will remove codes during the Goto stage
     if (
-      !(cmdline.isset("no-remove-unreachable") || is_mul || is_coverage) ||
+      !(cmdline.isset("no-remove-unreachable") || checks_past_violation) ||
       cmdline.isset("condition-coverage-rm") ||
       cmdline.isset("condition-coverage-claims-rm"))
       remove_unreachable(goto_functions);
@@ -333,24 +363,13 @@ bool esbmc_parseoptionst::process_goto_program(
     }
 
     if (cmdline.isset("gcse"))
-    {
-      auto andersen = std::make_shared<andersent>();
-      log_status("Computing points-to analysis (Andersen)");
-      (*andersen)(goto_functions);
-      std::shared_ptr<value_setst> points_to = andersen;
-
-      if (cmdline.isset("no-library"))
-        log_warning("Using CSE with --no-library might cause huge slowdowns!");
-
-      goto_cse cse(context, points_to);
-      cse.run(goto_functions);
-    }
+      apply_gcse(goto_functions, context, cmdline);
 
     // Under --termination, goto_termination does its own havoc, so
     // goto_k_induction must not also run (#6031).
     bool is_k_induction =
       (cmdline.isset("inductive-step") || cmdline.isset("k-induction") ||
-       cmdline.isset("k-induction-parallel")) &&
+       cmdline.isset("k-induction-parallel") || cmdline.isset("ts-check")) &&
       !options.get_bool_option("termination");
 
     // --termination reuses k-induction's havoc machinery via
@@ -377,7 +396,8 @@ bool esbmc_parseoptionst::process_goto_program(
         wants_kind_pipeline
           ? INTERVAL_INSTRUMENTATION_MODE::GUARD_INSTRUCTIONS_LOCAL
           : INTERVAL_INSTRUMENTATION_MODE::LOOP_MODE;
-      interval_analysis(goto_functions, ns, options, mode);
+      interval_analysis(
+        goto_functions, ns, options, checks_past_violation, mode);
     }
 
     if (cmdline.isset("validate-correctness-witness"))
@@ -407,23 +427,22 @@ bool esbmc_parseoptionst::process_goto_program(
       // ASSUME(INV) injected at end of loop body + k-induction (Branch 2).
       remove_no_op(goto_functions);
       goto_loop_invariant_combined(goto_functions);
-      disable_is_if_unsound(goto_k_induction(goto_functions, ns));
+      disable_is_if_unsound(
+        goto_k_induction(goto_functions, ns, checks_past_violation));
     }
     else
     {
       // --k-induction and --loop-invariant-check are independent and may
       // both be specified.  remove_no_op only needs to run once.
-      if (is_k_induction || cmdline.isset("loop-invariant-check"))
+      if (is_k_induction || wants_loop_invariants())
         remove_no_op(goto_functions);
 
       if (is_k_induction)
-        disable_is_if_unsound(goto_k_induction(goto_functions, ns));
+        disable_is_if_unsound(
+          goto_k_induction(goto_functions, ns, checks_past_violation));
 
-      if (cmdline.isset("loop-invariant-check"))
-      {
-        bool use_frame_rule = cmdline.isset("loop-frame-rule");
-        goto_loop_invariant(goto_functions, context, use_frame_rule);
-      }
+      if (wants_loop_invariants())
+        apply_loop_invariants(goto_functions, context, options, is_k_induction);
     }
 
     // --termination: reduce non-termination to a reachability safety
@@ -482,7 +501,8 @@ bool esbmc_parseoptionst::process_goto_program(
        cmdline.isset("goto-contractor")) &&
       wants_kind_pipeline)
     {
-      instrument_loop_bounds_after_kind(goto_functions, ns, options);
+      instrument_loop_bounds_after_kind(
+        goto_functions, ns, options, checks_past_violation);
     }
 
     if (
@@ -520,12 +540,13 @@ bool esbmc_parseoptionst::process_goto_program(
     bool has_replace_all = cmdline.isset("replace-all-contracts");
     if (has_enforce || has_replace || has_enforce_all || has_replace_all)
     {
-      if (process_function_contracts(
-            goto_functions,
-            has_replace,
-            has_enforce,
-            has_enforce_all,
-            has_replace_all))
+      if (
+        process_function_contracts(
+          goto_functions,
+          has_replace,
+          has_enforce,
+          has_enforce_all,
+          has_replace_all))
         return true;
     }
 
@@ -549,7 +570,7 @@ bool esbmc_parseoptionst::process_goto_program(
     if (!(cmdline.isset("no-remove-no-op") || skip_cleanup_for_termination))
       remove_no_op(goto_functions);
 
-    if (!(cmdline.isset("no-remove-unreachable") || is_mul || is_coverage ||
+    if (!(cmdline.isset("no-remove-unreachable") || checks_past_violation ||
           skip_cleanup_for_termination))
       remove_unreachable(goto_functions);
 
@@ -623,11 +644,12 @@ bool esbmc_parseoptionst::process_goto_program(
       options.set_option("goto-instrumented", false);
 
       //?:
-      // if we do not want expressions like 'if(2 || 3)' get simplified to 'if(1||1)'
-      // we need to enable the options below:
+      // if we do not want expressions like 'if(2 || 3)' get simplified to
+      // 'if(1||1)' we need to enable the options below:
       //    options.set_option("no-simplify", true);
       //    options.set_option("no-propagation", true);
-      // however, this will affect the performance, thus they are not enabled by default
+      // however, this will affect the performance, thus they are not enabled by
+      // default
 
       std::string filename = cmdline.args[0];
       goto_coveraget tmp(ns, goto_functions, filename);
@@ -647,8 +669,10 @@ bool esbmc_parseoptionst::process_goto_program(
       tmp.condition_coverage();
 
       // redo conversion to remove_sideeffect
-      // Due to that we deliberately skip some of the sideeffects removal process when generating the Goto program.
-      // This is to keep the condition/guards format and avoid introducing auxiliary variables, which will affect the coverage calculation.
+      // Due to that we deliberately skip some of the sideeffects removal
+      // process when generating the Goto program. This is to keep the
+      // condition/guards format and avoid introducing auxiliary variables,
+      // which will affect the coverage calculation.
       goto_coverage_rm temp(context, options, goto_functions);
       temp.remove_sideeffect();
     }
@@ -835,4 +859,38 @@ bool esbmc_parseoptionst::process_goto_program(
   }
 
   return false;
+}
+
+/// Whether the run needs the loop-invariant machinery.
+/// --synthesise-loop-invariants supplies the invariants that
+/// --loop-invariant-check discharges, so it implies that mode.
+bool esbmc_parseoptionst::wants_loop_invariants() const
+{
+  return cmdline.isset("loop-invariant-check") ||
+         cmdline.isset("synthesise-loop-invariants");
+}
+
+/// Synthesise the invariants when asked, then run the schema that discharges
+/// them.
+void esbmc_parseoptionst::apply_loop_invariants(
+  goto_functionst &goto_functions,
+  contextt &context,
+  const optionst &options,
+  bool k_induction_ran)
+{
+  if (cmdline.isset("synthesise-loop-invariants"))
+    // Read from `options`, the same object goto_check consults
+    // (goto_check.cpp:34,36). Deciding the same question from `cmdline`
+    // instead happens to agree today only because nothing calls
+    // set_option on these two, which is a property of the current code
+    // rather than an enforced one.
+    goto_synthesise_loop_invariants(
+      goto_functions,
+      overflow_checkst{
+        options.get_bool_option("overflow-check"),
+        options.get_bool_option("unsigned-overflow-check")},
+      k_induction_ran);
+
+  bool use_frame_rule = cmdline.isset("loop-frame-rule");
+  goto_loop_invariant(goto_functions, context, use_frame_rule);
 }

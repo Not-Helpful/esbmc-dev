@@ -16,7 +16,8 @@ exprt jimple_method::to_exprt(
   method_type.return_type() = inner_type;
 
   auto id = get_method_name(class_name, name);
-  auto symbol = create_jimple_symbolt(method_type, class_name, name, id);
+  auto symbol =
+    create_jimple_symbolt(migrate_type(method_type), class_name, name, id);
 
   std::string symbol_name = symbol.id.as_string();
 
@@ -40,8 +41,8 @@ exprt jimple_method::to_exprt(
     param_id = temp;
     param_name = oss.str();
 
-    auto param_symbol =
-      create_jimple_symbolt(this_type, class_name, param_name, param_id, id);
+    auto param_symbol = create_jimple_symbolt(
+      migrate_type(this_type), class_name, param_name, param_id, id);
     param_symbol.lvalue = true;
     param_symbol.is_parameter = true;
     param_symbol.file_local = true;
@@ -74,8 +75,8 @@ exprt jimple_method::to_exprt(
     param.cmt_base_name(param_name);
     param.cmt_identifier(param_id);
 
-    auto param_symbol =
-      create_jimple_symbolt(param_type, class_name, param_name, param_id, id);
+    auto param_symbol = create_jimple_symbolt(
+      migrate_type(param_type), class_name, param_name, param_id, id);
     param_symbol.lvalue = true;
     param_symbol.is_parameter = true;
     param_symbol.file_local = true;
@@ -88,7 +89,7 @@ exprt jimple_method::to_exprt(
   if (!method_type.arguments().size())
     method_type.make_ellipsis();
 
-  added_symbol.set_type(method_type);
+  added_symbol.set_type(migrate_type(method_type));
   added_symbol.set_value(body->to_code2t(ctx, class_name, this->name));
 
   return dummy;
@@ -111,9 +112,8 @@ void jimple_method::from_json(const json &j)
 
   // Method Name
   j.at("name").get_to(this->name);
-  name +=
-    "_" +
-    get_hash_name(); // to handle polymorphism, the method will have an uuid based on its type and arguments
+  name += "_" + get_hash_name(); // to handle polymorphism, the method will have
+                                 // an uuid based on its type and arguments
   try
   {
     j.at("throws").get_to(this->throws);
@@ -134,7 +134,7 @@ std::string jimple_method::to_string() const
   oss << "Class Method"
       << "\n\tName: " << this->name << "\n\t" << this->type.to_string()
       << "\n\t" << this->modifiers.to_string() << "\n\tParameters: "
-      << "[]" //TODO: this->parameters
+      << "[]" // TODO: this->parameters
       << "\n\tThrows: " << this->throws
       << "\n\tBody : " << this->body->to_string();
 

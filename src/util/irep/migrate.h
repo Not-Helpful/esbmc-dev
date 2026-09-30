@@ -9,6 +9,8 @@
 #include <util/irep/std_expr.h>
 #include <util/irep/std_types.h>
 
+class contextt;
+
 // Don't ask
 class namespacet;
 class symbolt;
@@ -18,6 +20,16 @@ extern thread_local const namespacet *migrate_namespace_lookup;
 
 type2tc migrate_type(const typet &type);
 void migrate_expr(const exprt &expr, expr2tc &new_expr);
+
+/// Returning form, for call sites that want an expression rather than an
+/// out-parameter -- `symbol.set_value(migrate_expr(v))` instead of two
+/// statements and a named temporary.
+inline expr2tc migrate_expr(const exprt &expr)
+{
+  expr2tc out;
+  migrate_expr(expr, out);
+  return out;
+}
 
 // IREP2 form of a symbol's type. Named chokepoint for symbol type reads in
 // the migration layer (esbmc/esbmc#4715, B2): returns `sym.get_type2()` which
@@ -56,11 +68,11 @@ exprt migrate_expr_back(const expr2tc &ref);
 // here -- the wiring is Phase 4.3/4.4 work, shipped separately so this
 // infrastructure carries zero coverage-axis risk (the V-track lesson).
 
-// IREP2 form of `symbol_expr(const symbolt&)`: a level-0 `symbol2t` carrying the
-// symbol's IREP2 type (read via migrate_symbol_type, the B2 source of truth)
-// and its identifier. The legacy node also stores a cosmetic display name;
-// IREP2 symbols carry only the identifier, so it is neither represented nor
-// needed (`migrate_expr` drops it on the same path).
+// IREP2 form of `symbol_expr(const symbolt&)`: a level-0 `symbol2t` carrying
+// the symbol's IREP2 type (read via migrate_symbol_type, the B2 source of
+// truth) and its identifier. The legacy node also stores a cosmetic display
+// name; IREP2 symbols carry only the identifier, so it is neither represented
+// nor needed (`migrate_expr` drops it on the same path).
 expr2tc symbol_expr2tc(const symbolt &sym);
 
 // IREP2 form of `side_effect_expr_function_callt`: an expression-context call
@@ -71,5 +83,17 @@ expr2tc side_effect_function_call2tc(
   const type2tc &return_type,
   const expr2tc &function,
   const std::vector<expr2tc> &arguments);
+
+/// Migrate every symbol's type, and its value where it has one, and report what
+/// could not be represented. Migration signals failure by throwing a
+/// `std::string`, so each symbol is wrapped: one unrepresentable construct
+/// names itself and the walk continues, which is what makes this a census
+/// rather than a bisection. Walks the whole linked context, operational models
+/// included, which is the set goto_convert migrates anyway.
+///
+/// Frontend-agnostic on purpose: clang-cpp and solidity share one definition,
+/// so a census taken on either is the same measurement
+/// (docs/roadmap/scope-solidity-irep2.md §3, step S.2).
+void migrate_census(const contextt &context);
 
 #endif /* _ESBMC_UTIL_MIGRATE_H_ */

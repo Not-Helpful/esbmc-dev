@@ -309,27 +309,30 @@ void goto_convertt::convert_throw(const exprt &expr_in, goto_programt &dest)
   // The thrown operand may still carry side effects — most importantly a
   // `temporary_object` that constructs the thrown value — when convert_throw is
   // reached through the code-statement path (a codet("cpp-throw"), as produced
-  // by the --irep2-bodies body round-trip) instead of the side_effect_exprt path
-  // in remove_sideeffects, which lowers operands before dispatching here. Lower
-  // them now so the thrown value is a plain symbol, matching the legacy flag-off
-  // GOTO; otherwise the constructor never runs and the handler reads an
-  // unconstructed object. A no-op when the operand is already side-effect-free.
+  // by the --irep2-bodies body round-trip) instead of the side_effect_exprt
+  // path in remove_sideeffects, which lowers operands before dispatching here.
+  // Lower them now so the thrown value is a plain symbol, matching the legacy
+  // flag-off GOTO; otherwise the constructor never runs and the handler reads
+  // an unconstructed object. A no-op when the operand is already
+  // side-effect-free.
   exprt expr = expr_in;
   Forall_operands (it, expr)
     remove_sideeffects(*it, dest);
 
   // C++ stack unwinding: before the throw, run the destructors of the automatic
   // objects constructed since the nearest enclosing try block, in reverse
-  // construction order ([except.ctor]). throw_stack_size is the destructor-stack
-  // level at that try's entry — or 0 when the throw is not in any try, so an
-  // exception propagating out of the function destroys all of its locals.
+  // construction order ([except.ctor]). throw_stack_size is the
+  // destructor-stack level at that try's entry — or 0 when the throw is not in
+  // any try, so an exception propagating out of the function destroys all of
+  // its locals.
   //
   // The thrown object itself must NOT be unwound: its lifetime is owned by the
-  // exception machinery and it has to survive the throw. It is the most-recently
-  // constructed full-expression temporary, so its destructor entries sit on top
-  // of the stack (above the enclosing try's locals). Detach them, run the
-  // (non-destructive) unwind of the try-block locals, then restore them so the
-  // normal fall-through cleanup after the throw is unchanged.
+  // exception machinery and it has to survive the throw. It is the
+  // most-recently constructed full-expression temporary, so its destructor
+  // entries sit on top of the stack (above the enclosing try's locals). Detach
+  // them, run the (non-destructive) unwind of the try-block locals, then
+  // restore them so the normal fall-through cleanup after the throw is
+  // unchanged.
   destructor_stackt &stack = targets.destructor_stack;
   const irep_idt thrown_id =
     expr.operands().empty() || expr.op0().id() != "symbol"
@@ -461,10 +464,10 @@ void goto_convertt::convert_block(const codet &code, goto_programt &dest)
 void goto_convertt::convert_controlled(const codet &code, goto_programt &dest)
 {
   // A braced block gets its own destructor scope via convert_block; a bare
-  // controlled substatement (e.g. `if (c) throw std::bad_alloc();`) does not, so
-  // full-expression temporaries created in it would leak their destructors onto
-  // the enclosing block's stack and run on sibling paths where the object was
-  // never constructed -> spurious use-after-free (#5950). Wrap a non-block
+  // controlled substatement (e.g. `if (c) throw std::bad_alloc();`) does not,
+  // so full-expression temporaries created in it would leak their destructors
+  // onto the enclosing block's stack and run on sibling paths where the object
+  // was never constructed -> spurious use-after-free (#5950). Wrap a non-block
   // substatement so it is scoped identically to a braced one.
   if (code.get_statement() == "block")
   {
@@ -492,8 +495,8 @@ void goto_convertt::convert_expression(const codet &code, goto_programt &dest)
   // An IREP2 body round-trip (--irep2-bodies, esbmc/esbmc#4715) strips the
   // source location from a side_effect_exprt: sideeffect2t carries no location
   // field, unlike the enclosing code_expression statement (whose location does
-  // survive). remove_function_call copies expr.location() into the lowered call,
-  // so for the function_call side effect that backs the void builtins
+  // survive). remove_function_call copies expr.location() into the lowered
+  // call, so for the function_call side effect that backs the void builtins
   // (__ESBMC_assert / assert, __ESBMC_assume / __VERIFIER_assume, the
   // loop-invariant / requires / ensures contracts) this yields a location-less
   // ASSERT/ASSUME — which in turn makes --assertion-coverage's filename-gated
@@ -649,10 +652,11 @@ void goto_convertt::generate_dynamic_size_vla(
 
   array_typet arr_type = to_array_type(var.type());
   // Use arr_type.size() directly -- rewrite_vla_decl_size has already run and
-  // materialised any side-effecting size expression into an __ESBMC_tmp_ symbol,
-  // so arr_type.size() is a plain symbol (no side effects).  We keep a copy
-  // of the pre-cast expression so the zero-size check operates on the original
-  // (possibly signed) type and correctly catches both zero and negative dimensions.
+  // materialised any side-effecting size expression into an __ESBMC_tmp_
+  // symbol, so arr_type.size() is a plain symbol (no side effects).  We keep a
+  // copy of the pre-cast expression so the zero-size check operates on the
+  // original (possibly signed) type and correctly catches both zero and
+  // negative dimensions.
   exprt dim_expr = arr_type.size();
   exprt size = typecast_exprt(dim_expr, size_type());
 
@@ -714,6 +718,132 @@ void goto_convertt::generate_dynamic_size_vla(
   t_s_s->location = loc;
 }
 
+/// A C++ function-local static with a dynamic initializer is initialized the
+/// first time control passes its declaration, and concurrent callers wait for
+/// it ([stmt.dcl]/3): `atomic { if (!guard) { init; guard = 1; } }`. The guard
+/// is set after the initializer, so one that exits by an exception is retried.
+/// The frontend creates @p guard only for such a static.
+void goto_convertt::convert_dynamic_static_init(
+  const codet &decl,
+  const symbolt &s,
+  const symbolt &guard,
+  goto_programt &dest)
+{
+  const exprt flag = symbol_exprt(guard.id, guard.get_type());
+  expr2tc flag2;
+  migrate_expr(flag, flag2);
+
+  dest.add_instruction(ATOMIC_BEGIN)->location = decl.location();
+  goto_programt::targett skip = dest.add_instruction();
+  skip->location = decl.location();
+
+  const exprt var = decl.op0();
+  exprt initializer = decl.op1();
+  codet new_code(decl);
+  convert_decl_initializer(var, initializer, new_code, s, dest);
+
+  code_assignt set(flag, true_exprt());
+  set.location() = decl.location();
+  copy(set, ASSIGN, dest);
+
+  goto_programt::targett end = dest.add_instruction(ATOMIC_END);
+  end->location = decl.location();
+  skip->make_goto(end, flag2);
+}
+
+/// Lower the initializer of a declaration into @p dest. Kept out of
+/// convert_decl so that neither exceeds the complexity gate.
+void goto_convertt::convert_decl_initializer(
+  const exprt &var,
+  exprt &initializer,
+  const codet &new_code,
+  const symbolt &s,
+  goto_programt &dest)
+{
+  // A temporary_object initializer carrying a constructor (C++ `T t;` or
+  // `T t = T(...)`) constructs the object in place: retarget the
+  // constructor's new_object to `var` and emit it directly, instead of
+  // constructing a separate temporary and copying it. The copy path would
+  // leave that temporary with its own scope-exit destructor -- a spurious
+  // second destructor for what is semantically a single object.
+  if (
+    initializer.id() == "sideeffect" &&
+    initializer.statement() == "temporary_object" &&
+    static_cast<const exprt &>(initializer.initializer()).is_not_nil())
+  {
+    exprt ctor_code = static_cast<const exprt &>(initializer.initializer());
+    replace_new_object(var, ctor_code);
+    convert(to_code(ctor_code), dest);
+  }
+  else if (
+    initializer.id() == "sideeffect" &&
+    initializer.statement() == "temporary_object" &&
+    initializer.operands().size() == 1 &&
+    initializer.op0().id() == "sideeffect" &&
+    initializer.op0().statement() == "function_call")
+  {
+    // A temporary_object wrapping a plain (non-constructor) function call
+    // (C++ `T t = f(...);` where f returns T by value): call it with `var`
+    // as the lhs directly instead of routing the result through a fresh
+    // return_value$ temporary. The generic path below would give that
+    // temporary its own scope-exit destructor for what is semantically the
+    // same object as `var` (github #2306). `var`'s own destructor is
+    // scheduled below via targets.destructor_stack regardless of which
+    // branch above ran; if that destructor appears to not fire for a
+    // function ending in an explicit `return <expr>;`, look at
+    // convert_return's handling of its local unwind program instead of
+    // here -- that path is a separate, pre-existing gap.
+    const exprt &call_expr = initializer.op0();
+    code_function_callt call;
+    call.location() = call_expr.location();
+    call.lhs() = var;
+    call.function() = call_expr.op0();
+    call.arguments() = call_expr.op1().operands();
+    convert_function_call(call, dest);
+  }
+  else
+  {
+    std::size_t stack_size = targets.destructor_stack.size();
+
+    goto_programt sideeffects;
+    // the side effect is not just removed. Actually, it's converted and
+    // removed.
+    remove_sideeffects(initializer, sideeffects);
+    dest.destructive_append(sideeffects);
+
+    code_assignt assign(var, initializer);
+    assign.location() = new_code.location();
+    copy(assign, ASSIGN, dest);
+
+    // Temporaries materialized while lowering the initializer die at the
+    // end of the full expression (C++ [class.temporary]/4, github #6075):
+    // emit their pending scope-exit entries (destructor then DEAD) right
+    // after the assignment. A reference declaration extends its
+    // temporary's lifetime to the scope ([class.temporary]/6) and a
+    // destructor-free tail (plain DEADs of C-style temps) keeps
+    // block-level scope, so both retain the old shape.
+    if (!is_lvalue_or_rvalue_reference(s.get_type()))
+    {
+      bool have_destructor = false;
+      for (std::size_t i = stack_size; i < targets.destructor_stack.size(); i++)
+        if (targets.destructor_stack[i].get_statement() == "function_call")
+        {
+          have_destructor = true;
+          break;
+        }
+
+      if (have_destructor)
+        while (targets.destructor_stack.size() > stack_size)
+        {
+          codet d_code = targets.destructor_stack.back();
+          targets.destructor_stack.pop_back();
+          d_code.location() = new_code.location();
+          convert(d_code, dest);
+        }
+    }
+  }
+}
+
 void goto_convertt::convert_decl(const codet &code, goto_programt &dest)
 {
   if (code.operands().size() != 1 && code.operands().size() != 2)
@@ -740,7 +870,14 @@ void goto_convertt::convert_decl(const codet &code, goto_programt &dest)
   // A static variable will be declared in the global scope and
   // a code type means a function declaration, we ignore both
   if (s->static_lifetime || s->get_type().is_code())
+  {
+    if (new_code.operands().size() == 2)
+      if (
+        const symbolt *guard =
+          context.find_symbol(s->id.as_string() + "$init_guard"))
+        convert_dynamic_static_init(new_code, *s, *guard, dest);
     return; // this is a SKIP!
+  }
 
   // Check if is an VLA declaration and rewrite the declaration
   bool is_vla = rewrite_vla_decl(var.type(), dest);
@@ -770,90 +907,7 @@ void goto_convertt::convert_decl(const codet &code, goto_programt &dest)
     generate_dynamic_size_vla(var, new_code.location(), dest);
 
   if (!initializer.is_nil())
-  {
-    // A temporary_object initializer carrying a constructor (C++ `T t;` or
-    // `T t = T(...)`) constructs the object in place: retarget the
-    // constructor's new_object to `var` and emit it directly, instead of
-    // constructing a separate temporary and copying it. The copy path would
-    // leave that temporary with its own scope-exit destructor -- a spurious
-    // second destructor for what is semantically a single object.
-    if (
-      initializer.id() == "sideeffect" &&
-      initializer.statement() == "temporary_object" &&
-      static_cast<const exprt &>(initializer.initializer()).is_not_nil())
-    {
-      exprt ctor_code = static_cast<const exprt &>(initializer.initializer());
-      replace_new_object(var, ctor_code);
-      convert(to_code(ctor_code), dest);
-    }
-    else if (
-      initializer.id() == "sideeffect" &&
-      initializer.statement() == "temporary_object" &&
-      initializer.operands().size() == 1 &&
-      initializer.op0().id() == "sideeffect" &&
-      initializer.op0().statement() == "function_call")
-    {
-      // A temporary_object wrapping a plain (non-constructor) function call
-      // (C++ `T t = f(...);` where f returns T by value): call it with `var`
-      // as the lhs directly instead of routing the result through a fresh
-      // return_value$ temporary. The generic path below would give that
-      // temporary its own scope-exit destructor for what is semantically the
-      // same object as `var` (github #2306). `var`'s own destructor is
-      // scheduled below via targets.destructor_stack regardless of which
-      // branch above ran; if that destructor appears to not fire for a
-      // function ending in an explicit `return <expr>;`, look at
-      // convert_return's handling of its local unwind program instead of
-      // here -- that path is a separate, pre-existing gap.
-      const exprt &call_expr = initializer.op0();
-      code_function_callt call;
-      call.location() = call_expr.location();
-      call.lhs() = var;
-      call.function() = call_expr.op0();
-      call.arguments() = call_expr.op1().operands();
-      convert_function_call(call, dest);
-    }
-    else
-    {
-      std::size_t stack_size = targets.destructor_stack.size();
-
-      goto_programt sideeffects;
-      // the side effect is not just removed. Actually, it's converted and removed.
-      remove_sideeffects(initializer, sideeffects);
-      dest.destructive_append(sideeffects);
-
-      code_assignt assign(var, initializer);
-      assign.location() = new_code.location();
-      copy(assign, ASSIGN, dest);
-
-      // Temporaries materialized while lowering the initializer die at the
-      // end of the full expression (C++ [class.temporary]/4, github #6075):
-      // emit their pending scope-exit entries (destructor then DEAD) right
-      // after the assignment. A reference declaration extends its
-      // temporary's lifetime to the scope ([class.temporary]/6) and a
-      // destructor-free tail (plain DEADs of C-style temps) keeps
-      // block-level scope, so both retain the old shape.
-      if (!is_lvalue_or_rvalue_reference(s->get_type()))
-      {
-        bool have_destructor = false;
-        for (std::size_t i = stack_size; i < targets.destructor_stack.size();
-             i++)
-          if (targets.destructor_stack[i].get_statement() == "function_call")
-          {
-            have_destructor = true;
-            break;
-          }
-
-        if (have_destructor)
-          while (targets.destructor_stack.size() > stack_size)
-          {
-            codet d_code = targets.destructor_stack.back();
-            targets.destructor_stack.pop_back();
-            d_code.location() = new_code.location();
-            convert(d_code, dest);
-          }
-      }
-    }
-  }
+    convert_decl_initializer(var, initializer, new_code, *s, dest);
 
   // now create a 'dead' instruction -- will be added after the
   // destructor created below as unwind_destructor_stack pops off the
@@ -883,6 +937,51 @@ void goto_convertt::convert_decl(const codet &code, goto_programt &dest)
     destructor.arguments().push_back(this_expr);
 
     targets.destructor_stack.push_back(destructor);
+  }
+  else if (s->name != "array_init$")
+  {
+    // An array of class objects: get_destructor matches a class type, not an
+    // array of one, so no element destructor was ever scheduled and RAII held
+    // in an array never released. Schedule one call per element, recursing so
+    // a multi-dimensional array reaches its leaves. [class.dtor] destroys
+    // elements in reverse order of construction, which is what pushing them
+    // in index order gives once the stack unwinds LIFO.
+    schedule_array_element_destructors(symbol_expr, ns.follow(s->get_type()));
+  }
+}
+
+/// Push a destructor call for every element of an array of class objects,
+/// recursing through nested array types so a multi-dimensional array reaches
+/// its leaves. Does nothing for a non-array, an element type without a
+/// destructor, or an extent that is not a constant.
+void goto_convertt::schedule_array_element_destructors(
+  const exprt &base,
+  const typet &type)
+{
+  if (!type.is_array())
+    return;
+
+  const typet &elem = ns.follow(type.subtype());
+  BigInt count;
+  if (to_integer(to_array_type(type).size(), count) || count <= 0)
+    return;
+
+  code_function_callt elem_destructor;
+  const bool leaf_has_destructor = get_destructor(ns, elem, elem_destructor);
+  if (!leaf_has_destructor && !elem.is_array())
+    return;
+
+  for (BigInt i = 0; i < count; i = i + 1)
+  {
+    index_exprt element(base, from_integer(i, index_type()), type.subtype());
+    if (elem.is_array())
+      schedule_array_element_destructors(element, elem);
+    else
+    {
+      code_function_callt d = elem_destructor;
+      d.arguments().push_back(address_of_exprt(element));
+      targets.destructor_stack.push_back(d);
+    }
   }
 }
 
@@ -967,9 +1066,9 @@ void goto_convertt::convert_assign_atomic(
   }
   subst.replace(working_rhs);
 
-  // Phase 2: emit the store, wrapped in ATOMIC_BEGIN/END only when lhs is _Atomic.
-  // A context switch is allowed between Phase 1 and Phase 2 (between the
-  // ATOMIC_END above and the ATOMIC_BEGIN below), which is exactly the C11
+  // Phase 2: emit the store, wrapped in ATOMIC_BEGIN/END only when lhs is
+  // _Atomic. A context switch is allowed between Phase 1 and Phase 2 (between
+  // the ATOMIC_END above and the ATOMIC_BEGIN below), which is exactly the C11
   // requirement that atomic load and atomic store are separate operations.
   bool lhs_atomic = is_atomic_symbol(lhs, ns);
   if (lhs_atomic)
@@ -1739,8 +1838,8 @@ void goto_convertt::convert_return(
       log_warning(
         "The return of the function {} is missing",
         id2string(code.location().function()));
-      // This might be because the remove_sideeffect removed the undefined function
-      // We replaced it with nondet
+      // This might be because the remove_sideeffect removed the undefined
+      // function We replaced it with nondet
       exprt ret = exprt("sideeffect", code.op0().type());
       ret.statement("nondet");
       new_code.return_value() = ret;
@@ -1910,7 +2009,7 @@ void goto_convertt::generate_ifthenelse(
     true_case.instructions.front().is_assert() &&
     is_false(true_case.instructions.front().guard) &&
     true_case.instructions.front().labels.empty() &&
-    true_case.instructions.back().labels.empty())
+    is_no_op(true_case, std::prev(true_case.instructions.end())))
   {
     expr2tc g;
     migrate_expr(boolean_negate(guard), g);

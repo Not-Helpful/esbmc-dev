@@ -16,7 +16,10 @@ class PreprocessorStateMixin:
         self.enumerate_loop_counter = 0
         self.helper_functions_added = False
         self.functionKwonlyParams = {}
+        self.static_methods = set()
+        self.is_entry_module = False
         self._builtin_shadow_names = None
+        self._unobservable_builtin_keys = frozenset()
         self.functionVarargs = set()
         self._vararg_func_defs = {}
         self._vararg_module_defs = set()

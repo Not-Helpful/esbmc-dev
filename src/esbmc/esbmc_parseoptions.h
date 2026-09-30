@@ -60,6 +60,16 @@ protected:
   virtual bool
   process_goto_program(optionst &options, goto_functionst &goto_functions);
 
+  /// Whether the run needs the loop-invariant machinery.
+  bool wants_loop_invariants() const;
+
+  /// Synthesise the invariants when asked, then run the schema over them.
+  void apply_loop_invariants(
+    goto_functionst &goto_functions,
+    contextt &context,
+    const optionst &options,
+    bool k_induction_ran);
+
   virtual bool
   output_goto_program(optionst &options, goto_functionst &goto_functions);
 
@@ -67,8 +77,10 @@ protected:
   /// \param goto_functions GOTO functions
   /// \param has_replace Whether to replace calls with contracts
   /// \param has_enforce Whether to enforce contracts
-  /// \param has_enforce_all Whether to enforce contracts for all annotated functions
-  /// \param has_replace_all Whether to replace calls for all annotated functions
+  /// \param has_enforce_all Whether to enforce contracts for all annotated
+  /// functions
+  /// \param has_replace_all Whether to replace calls for all annotated
+  /// functions
   /// \return True on a usage error, e.g. a named function that nothing acted on
   bool process_function_contracts(
     goto_functionst &goto_functions,
@@ -78,6 +90,8 @@ protected:
     bool has_replace_all);
 
   int do_bmc_strategy(optionst &options, goto_functionst &goto_functions);
+
+  int do_ts_strategy(optionst &options, goto_functionst &goto_functions);
 
   int do_context_bound_deepening(
     optionst &options,

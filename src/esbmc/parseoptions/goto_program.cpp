@@ -2,9 +2,9 @@
 
 #include <esbmc/bmc.h>
 #include <esbmc/esbmc_parseoptions.h>
-#include <goto-symex/goto_symex.h>
-#include <goto-symex/goto_trace.h>
-#include <goto-symex/sarif.h>
+#include <goto-symex/engine/goto_symex.h>
+#include <goto-symex/trace/goto_trace.h>
+#include <goto-symex/trace/sarif.h>
 #include <util/base/cwe_mapping.h>
 #include <solvers/smt/smt_result.h>
 #include <solvers/smtlib/smtlib_conv.h>
@@ -43,6 +43,20 @@
 #include <goto-programs/read_cbmc_goto_object.h>
 #include <goto-programs/write_goto_binary.h>
 #include <goto-programs/remove_no_op.h>
+#include <c2goto/cprover_library.h>
+#ifdef ENABLE_PYTHON_FRONTEND
+#  include <python-frontend/python_library.h>
+#endif
+
+namespace
+{
+void link_python_model_bodies([[maybe_unused]] goto_functionst &goto_functions)
+{
+#ifdef ENABLE_PYTHON_FRONTEND
+  link_cpython_library_bodies(goto_functions);
+#endif
+}
+} // namespace
 #include <goto-programs/remove_unreachable.h>
 #include <goto-programs/remove_exceptions.h>
 #include <goto-programs/set_claims.h>
@@ -384,8 +398,8 @@ bool esbmc_parseoptionst::has_cbmc_binary_input()
 // type onto the bodyless
 // declaration lets symex resolve the call: argument_assignments binds actual
 // args using the copied type's parameter names, which match the copied body
-// (goto-symex/symex_function.cpp). The string bodies are byte loops, so a call
-// with a symbolic length needs an `--unwind` bound like any other loop.
+// (goto-symex/engine/symex_function.cpp). The string bodies are byte loops, so
+// a call with a symbolic length needs an `--unwind` bound like any other loop.
 static void link_cbmc_libc_bodies(goto_functionst &goto_functions)
 {
   static const char *const libc[] = {
@@ -436,25 +450,27 @@ bool esbmc_parseoptionst::synthesize_cprover_additions(
   file_operations::tmp_file tf =
     file_operations::create_tmp_file("esbmc-cprover-%%%%-%%%%-%%%%.c");
   // Taking the addresses of the bodied libc functions marks them referenced, so
-  // add_cprover_library links their operational-model bodies into the additions;
-  // link_cbmc_libc_bodies then bridges the CBMC binary's plain-named bodyless
-  // declarations to them. Unlike sqrt/fabs (operators rewritten in cbmc_adapter)
-  // these have no ESBMC expression form and must run the C library body -- that
-  // includes the string.h query functions (strlen/strcmp/strncmp), whose bodies
-  // are byte loops. Referencing memcpy/memmove/memset/memcmp additionally
-  // force-links string.c, whose bodies pull in
+  // add_cprover_library links their operational-model bodies into the
+  // additions; link_cbmc_libc_bodies then bridges the CBMC binary's plain-named
+  // bodyless declarations to them. Unlike sqrt/fabs (operators rewritten in
+  // cbmc_adapter) these have no ESBMC expression form and must run the C
+  // library body -- that includes the string.h query functions
+  // (strlen/strcmp/strncmp), whose bodies are byte loops. Referencing
+  // memcpy/memmove/memset/memcmp additionally force-links string.c, whose
+  // bodies pull in
   // __memcpy_impl/__memmove_impl/__memset_impl/__memcmp_impl -- the byte-loop
   // fallbacks intrinsic_memcpy/memmove/memset/memcmp bump to when a size or
   // pointer is symbolic (and, for memmove, when the regions overlap). The
-  // cbmc_adapter retargets CBMC's memcpy/memset/memmove/memcmp calls straight to
-  // the c:@F@__ESBMC_* intrinsics, but those intrinsics still need the *_impl
-  // bodies present for the bump path, so the boilerplate must link them here.
-  // The <ctype.h> classifiers/case-mappers (isdigit/toupper/...) are the same
-  // bodyless-external shape; their ctype.c bodies are straight-line (no unwind).
-  // The <stdlib.h> string-to-integer parsers atoi/atol/strtol likewise bridge
-  // to stdlib.c bodies -- these are byte loops, so they need `--unwind` like the
-  // string.h family. CBMC 6.8.0 models atoi/atol/strtol but not atoll/strtoll,
-  // which stay bodyless (their nondet return already matches CBMC's verdict).
+  // cbmc_adapter retargets CBMC's memcpy/memset/memmove/memcmp calls straight
+  // to the c:@F@__ESBMC_* intrinsics, but those intrinsics still need the
+  // *_impl bodies present for the bump path, so the boilerplate must link them
+  // here. The <ctype.h> classifiers/case-mappers (isdigit/toupper/...) are the
+  // same bodyless-external shape; their ctype.c bodies are straight-line (no
+  // unwind). The <stdlib.h> string-to-integer parsers atoi/atol/strtol likewise
+  // bridge to stdlib.c bodies -- these are byte loops, so they need `--unwind`
+  // like the string.h family. CBMC 6.8.0 models atoi/atol/strtol but not
+  // atoll/strtoll, which stay bodyless (their nondet return already matches
+  // CBMC's verdict).
   static const char boilerplate[] =
     "/* Auto-generated: bundle all ESBMC additions for CBMC gotos. */\n"
     "#include <math.h>\n"
@@ -649,6 +665,8 @@ bool esbmc_parseoptionst::parse_goto_program(
 
     log_progress("Generating GOTO Program");
     goto_convert(context, options, goto_functions);
+    link_python_model_bodies(goto_functions);
+    assert_no_pruned_calls(goto_functions);
   }
 
   catch (const char *e)

@@ -18,9 +18,9 @@ extern "C"
 
 #include <esbmc/bmc.h>
 #include <esbmc/esbmc_parseoptions.h>
-#include <goto-symex/goto_symex.h>
-#include <goto-symex/goto_trace.h>
-#include <goto-symex/sarif.h>
+#include <goto-symex/engine/goto_symex.h>
+#include <goto-symex/trace/goto_trace.h>
+#include <goto-symex/trace/sarif.h>
 #include <util/base/cwe_mapping.h>
 #include <solvers/smt/smt_result.h>
 #include <solvers/smtlib/smtlib_conv.h>
@@ -349,7 +349,7 @@ int esbmc_parseoptionst::doit_k_induction_parallel()
         // Write result
         auto const len = write(backward_pipe[1], &r, sizeof(r));
         assert(len == sizeof(r) && "short write");
-        (void)len; //ndebug
+        (void)len; // ndebug
       }
 
       else if (
@@ -374,7 +374,7 @@ int esbmc_parseoptionst::doit_k_induction_parallel()
         // Write result
         auto const len = write(backward_pipe[1], &r, sizeof(r));
         assert(len == sizeof(r) && "short write");
-        (void)len; //ndebug
+        (void)len; // ndebug
       }
     }
 
@@ -490,7 +490,7 @@ int esbmc_parseoptionst::doit_k_induction_parallel()
         // Write result
         auto const len = write(forward_pipe[1], &r, sizeof(r));
         assert(len == sizeof(r) && "short write");
-        (void)len; //ndebug
+        (void)len; // ndebug
 
         log_status("Base case process finished (bug found).\n");
         return true;
@@ -546,7 +546,7 @@ int esbmc_parseoptionst::doit_k_induction_parallel()
 
     auto const len = write(forward_pipe[1], &r, sizeof(r));
     assert(len == sizeof(r) && "short write");
-    (void)len; //ndebug
+    (void)len; // ndebug
 
     log_status("Base case process finished (no bug found).\n");
     return false;
@@ -606,7 +606,7 @@ int esbmc_parseoptionst::doit_k_induction_parallel()
         // Write result
         auto const len = write(forward_pipe[1], &r, sizeof(r));
         assert(len == sizeof(r) && "short write");
-        (void)len; //ndebug
+        (void)len; // ndebug
 
         log_status("Forward condition process finished (safety proven).");
         return false;
@@ -618,7 +618,7 @@ int esbmc_parseoptionst::doit_k_induction_parallel()
 
     auto const len = write(forward_pipe[1], &r, sizeof(r));
     assert(len == sizeof(r) && "short write");
-    (void)len; //ndebug
+    (void)len; // ndebug
 
     log_status("Forward condition process finished (safety not proven).");
     return true;
@@ -678,7 +678,7 @@ int esbmc_parseoptionst::doit_k_induction_parallel()
         // Write result
         auto const len = write(forward_pipe[1], &r, sizeof(r));
         assert(len == sizeof(r) && "short write");
-        (void)len; //ndebug
+        (void)len; // ndebug
 
         log_status("Inductive process finished (safety proven).");
         return false;
@@ -690,7 +690,7 @@ int esbmc_parseoptionst::doit_k_induction_parallel()
 
     auto const len = write(forward_pipe[1], &r, sizeof(r));
     assert(len == sizeof(r) && "short write");
-    (void)len; //ndebug
+    (void)len; // ndebug
 
     log_status("Inductive process finished (safety not proven).");
     return true;
@@ -892,12 +892,20 @@ tvt esbmc_parseoptionst::is_inductive_step_violated(
 
 // When k-induction exhausts all k-steps without a definitive result, run one
 // final per-VCC inductive-step check at the last k to identify which specific
-// properties could not be resolved, without impacting the main k-induction loop.
+// properties could not be resolved, without impacting the main k-induction
+// loop.
 void esbmc_parseoptionst::diagnose_unknown_properties(
   optionst &options,
   goto_functionst &goto_functions,
   const uint64_t k_step)
 {
+  // Only the multi-property k-induction path leaves per-claim outcomes
+  // undecided at the last k; every other strategy has already concluded.
+  if (
+    !options.get_bool_option("multi-property") ||
+    !options.get_bool_option("k-induction"))
+    return;
+
   if (options.get_bool_option("disable-inductive-step"))
     return;
 

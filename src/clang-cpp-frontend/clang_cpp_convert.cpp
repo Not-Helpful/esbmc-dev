@@ -31,6 +31,7 @@ CC_DIAGNOSTIC_POP()
 #include <iostream>
 
 #include <clang-cpp-frontend/clang_cpp_convert.h>
+#include <clang-cpp-frontend/clang_cpp_exception_id.h>
 #include <util/expr/expr_util.h>
 #include <util/message/message.h>
 #include <util/irep/std_code.h>
@@ -171,15 +172,59 @@ bool clang_cpp_convertert::get_decl(const clang::Decl &decl, exprt &new_expr)
   return false;
 }
 
-bool isLambdaTemplateArgument(const clang::TemplateArgument &Arg)
+// The types of the nullptr template arguments in @p args, which print as a
+// bare `nullptr` whatever their type.
+static bool print_nullptr_arg_types(
+  llvm::ArrayRef<clang::TemplateArgument> args,
+  llvm::raw_ostream &os)
 {
-  if (Arg.getKind() != clang::TemplateArgument::Type)
-    return false;
+  bool found = false;
+  for (const clang::TemplateArgument &arg : args)
+    if (arg.getKind() == clang::TemplateArgument::Pack)
+      found |= print_nullptr_arg_types(arg.getPackAsArray(), os);
+    else if (arg.getKind() == clang::TemplateArgument::NullPtr)
+    {
+      os << "(nullptr:" << arg.getNullPtrType().getCanonicalType().getAsString()
+         << ")";
+      found = true;
+    }
+  return found;
+}
 
-  clang::QualType T = Arg.getAsType();
-  const clang::CXXRecordDecl *RD = T->getAsCXXRecordDecl();
-
-  return RD && RD->isLambda();
+// clang's USR spells a member-pointer type and a nullptr template argument as
+// nothing, so f<int A::*> and f<long B::*>, the members of W<int A::*> and
+// W<long B::*>, overloads f(int A::*) and f(long B::*), and g<(int *)nullptr>
+// and g<(long *)nullptr> share one id and the last body converted wins.
+static std::string
+usr_gap_suffix(const clang::Decl &decl, const clang::ASTContext &ctx)
+{
+  std::string args;
+  llvm::raw_string_ostream os(args);
+  const clang::PrintingPolicy policy = ctx.getPrintingPolicy();
+  bool has_nullptr = false;
+  auto print = [&](llvm::ArrayRef<clang::TemplateArgument> list) {
+    clang::printTemplateArgumentList(os, list, policy);
+    has_nullptr |= print_nullptr_arg_types(list, os);
+  };
+  for (const clang::Decl *d = &decl; !llvm::isa<clang::TranslationUnitDecl>(d);
+       d = clang::Decl::castFromDeclContext(d->getDeclContext()))
+  {
+    if (const auto *fd = llvm::dyn_cast<clang::FunctionDecl>(d))
+    {
+      if (const auto *targs = fd->getTemplateSpecializationArgs())
+        print(targs->asArray());
+      os << "(" << fd->getType().getCanonicalType().getAsString(policy) << ")";
+    }
+    else if (
+      const auto *cs =
+        llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(d))
+      print(cs->getTemplateArgs().asArray());
+    else if (
+      const auto *vs = llvm::dyn_cast<clang::VarTemplateSpecializationDecl>(d))
+      print(vs->getTemplateArgs().asArray());
+  }
+  os.flush();
+  return has_nullptr || args.find("::*") != std::string::npos ? "#" + args : "";
 }
 
 void clang_cpp_convertert::get_decl_name(
@@ -276,6 +321,8 @@ void clang_cpp_convertert::get_decl_name(
 
   default:
     clang_c_convertert::get_decl_name(nd, name, id);
+    if (id.rfind("c:", 0) == 0)
+      id += usr_gap_suffix(nd, *ASTContext);
     /* A lambda's operator(), __invoke and conversion-operator USRs name the
      * enclosing specialisation but not the closure, so siblings in one
      * instantiation share an id and the last body converted wins (#7499); the
@@ -295,9 +342,12 @@ void clang_cpp_convertert::get_decl_name(
   clang::SmallString<128> DeclUSR;
   if (!clang::index::generateUSRForDecl(&nd, DeclUSR))
   {
-    id = DeclUSR.str().str() + id_suffix;
+    id = DeclUSR.str().str() + usr_gap_suffix(nd, *ASTContext) + id_suffix;
     return;
   }
+
+  if (get_mangled_id(nd, id))
+    return;
 
   // Otherwise, abort
   std::ostringstream oss;
@@ -701,6 +751,90 @@ static bool zero_initialises(const clang::Expr &init)
   return false;
 }
 
+/// The id a catch handler matches a throw on. The catch type rides on the
+/// handler block's own type and is read off it exactly once -- here.
+/// clang_cpp_adjust used to do it, which is too late for an IREP2 adjust pass:
+/// code_block2t has no type to carry it across the seam
+/// (docs/roadmap/scope-clang-cpp-irep2.md §3.13).
+static void set_handler_exception_id(const namespacet &ns, exprt &handler)
+{
+  std::vector<irep_idt> ids;
+  convert_exception_id(ns, handler.type(), "", ids);
+  if (!ids.empty())
+    handler.set("exception_id", ids.front());
+}
+
+/// A pseudo-destructor call does nothing but evaluate its base
+/// ([expr.pseudo]/1) -- there is nothing to call. Reduce it where it is built,
+/// so the node never reaches the goto program: IREP2 has no kind for it, and an
+/// adjust pass that migrates first therefore cannot see it at all
+/// (docs/roadmap/scope-clang-cpp-irep2.md §3.15). Applied at get_expr's exit so
+/// it covers every call spelling, as clang_cpp_adjust's arm did.
+static void reduce_pseudo_destructor_call(exprt &expr)
+{
+  // The legacy arm only ever saw a side_effect_expr_function_callt. Say so,
+  // rather than leaning on "two operands whose first carries this id" -- true
+  // of nothing else today, but it states no precondition.
+  if (
+    expr.id() != "sideeffect" || expr.operands().size() != 2 ||
+    expr.op0().id() != "cpp-pseudo-destructor")
+    return;
+
+  assert(expr.op0().operands().size() == 1);
+  expr = expr.op0().op0();
+}
+
+/// Whether a thrown type's exception ids follow from the type alone, *and*
+/// cannot change between here and the adjust pass.
+///
+/// A class type's id is its symbol's name and its bases come from the symbol
+/// table, a lookup this early in conversion cannot rely on; everything else
+/// resolves to the `#cpp_type` spelling, which the IREP2 seam does not carry,
+/// so those ids are recorded at conversion time instead (§7.6). Pointer layers
+/// are stripped because convert_exception_id recurses through them.
+///
+/// An **array** operand is excluded: it decays between here and the legacy
+/// pass, so an id recorded from the pre-decay type is not the one the handler
+/// is matched against. A pointer is fine and is recursed through, as
+/// convert_exception_id does.
+static bool exception_id_needs_no_lookup(const typet &type)
+{
+  if (type.id() == "array")
+    return false;
+
+  if (type.id() == "pointer")
+    return exception_id_needs_no_lookup(type.subtype());
+
+  return type.id() != "symbol" && type.id() != "struct" &&
+         !type.cpp_type().empty();
+}
+
+/// Record a throw's exception ids at conversion time, for the operand types
+/// whose ids follow from the type alone.
+///
+/// A primitive's id is its `#cpp_type` spelling, and the IREP2 seam does not
+/// carry that: computed from a back-migrated type, `throw 1` reads as
+/// `signedbv` while the handler, whose ids never cross the seam, still reads
+/// `signed_int`, and the throw escapes uncaught. A class type is left to the
+/// adjust pass instead: its id is the type symbol's name, which crosses
+/// intact, and resolving its bases needs a lookup this early in conversion
+/// (docs/roadmap/scope-clang-cpp-irep2.md §7.6).
+static void
+record_primitive_exception_ids(exprt &throw_expr, const namespacet &ns)
+{
+  if (!exception_id_needs_no_lookup(throw_expr.op0().type()))
+    return;
+
+  std::vector<irep_idt> ids;
+  convert_exception_id(ns, throw_expr.op0().type(), "", ids);
+
+  irept exception_list("exception_list");
+  exception_list.get_sub().resize(ids.size());
+  for (std::size_t i = 0; i < ids.size(); i++)
+    exception_list.get_sub()[i].id(ids[i]);
+  throw_expr.set("exception_list", exception_list);
+}
+
 bool clang_cpp_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
 {
   locationt location;
@@ -947,78 +1081,17 @@ bool clang_cpp_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
     if (get_type(ne.getType(), t))
       return true;
 
-    // Placement new ([expr.new]/11): no allocation happens; the object is
-    // constructed at the given address, which is also the result. Lower to
-    // comma(<initialize *(T*)place>, (T*)place). Only the reserved
-    // non-allocating ::operator new(size_t, void*) qualifies — a
-    // user-declared pointer-parameter operator new or std::nothrow keeps
-    // the allocating path below. The placement expression appears twice in
-    // the comma, so a side-effecting argument also falls back (with a
-    // warning) rather than being evaluated twice.
+    // Placement new ([expr.new]/11): only the reserved non-allocating
+    // ::operator new(size_t, void*) qualifies — a user-declared
+    // pointer-parameter operator new or std::nothrow keeps the allocating
+    // path below.
     if (
       !ne.isArray() && ne.getOperatorNew() &&
       ne.getOperatorNew()->isReservedGlobalPlacementOperator())
     {
-      if (ne.getPlacementArg(0)->HasSideEffects(*ASTContext))
-        log_warning(
-          "placement-new address with side effects is not modelled; "
-          "treating as allocating new at {}",
-          location.as_string());
-      else
-      {
-        exprt place;
-        if (get_expr(*ne.getPlacementArg(0), place))
-          return true;
-
-        exprt tp("typecast", t);
-        tp.copy_to_operands(place);
-
-        // Default-initialising a non-class type performs no initialisation
-        // ([dcl.init.general]), so clang attaches no initializer and there is
-        // nothing to sequence: `new (p) int;` is just (int *)p. Emitting a
-        // comma here would leave it with a single operand and corrupt every
-        // downstream op1() access (esbmc/esbmc#6184).
-        if (!ne.hasInitializer())
-        {
-          new_expr = tp;
-          break;
-        }
-
-        exprt target("dereference", t.subtype());
-        target.copy_to_operands(tp);
-
-        exprt init;
-        if (get_expr(*ne.getInitializer(), init))
-          return true;
-
-        exprt comma("comma", t);
-        if (
-          init.id() == "sideeffect" && init.statement() == "temporary_object" &&
-          static_cast<const exprt &>(init.initializer()).is_not_nil())
-        {
-          // A class-type initializer arrives as a temporary_object whose
-          // initializer wraps the constructor call carrying an
-          // &new_object placeholder (make_temporary): retarget the call
-          // at the placement address and drop the temporary, so `this`
-          // is the placed object, not a copied-from temp.
-          exprt wrap = static_cast<const exprt &>(init.initializer());
-          assert(
-            wrap.is_code() && to_code(wrap).get_statement() == "expression");
-          exprt call = wrap.op0();
-          replace_new_object_with(target, call);
-          comma.copy_to_operands(call);
-        }
-        else
-        {
-          side_effect_exprt assign("assign");
-          assign.type() = t.subtype();
-          assign.copy_to_operands(target, init);
-          comma.copy_to_operands(assign);
-        }
-        comma.copy_to_operands(tp);
-        new_expr = comma;
-        break;
-      }
+      if (get_placement_new(ne, t, location, new_expr))
+        return true;
+      break;
     }
 
     // A program may replace ::operator new, and a class may supply its own
@@ -1375,6 +1448,7 @@ bool clang_cpp_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
       if (get_expr(*cxxtry.getHandler(i), handler))
         return true;
 
+      set_handler_exception_id(namespacet(context), handler);
       new_expr.move_to_operands(handler);
     }
 
@@ -1426,7 +1500,13 @@ bool clang_cpp_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
         return true;
 
       new_expr.move_to_operands(tmp);
+      // Deliberately the moved-from `tmp`, i.e. empty: a cpp-throw's own type
+      // is set by the adjust pass, and giving it the operand's type here
+      // changes the default path (three try_catch rows stop failing as they
+      // should).
       new_expr.type() = tmp.type();
+
+      record_primitive_exception_ids(new_expr, namespacet(context));
     }
 
     break;
@@ -1800,6 +1880,8 @@ bool clang_cpp_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
       return true;
     break;
   }
+
+  reduce_pseudo_destructor_call(new_expr);
 
   new_expr.location() = location;
   return false;
@@ -2183,11 +2265,77 @@ bool clang_cpp_convertert::build_lambda_static_invoker(
   return false;
 }
 
+/* A prvalue of the member's own class initialises the member itself
+ * ([dcl.init]/17.6.1), so the temporary clang binds it to never exists:
+ * converting that binding constructed or copied into a second object and then
+ * destroyed it. Peels a default member initializer, parentheses, a transparent
+ * braced list ([dcl.init.list]/3.2), a prvalue qualification or converting
+ * cast, and the copy clang marks elidable before C++17, which it elides. */
+static const clang::Expr *peel_initializer_wrapper(const clang::Expr *e)
+{
+  if (const auto *dflt = llvm::dyn_cast<clang::CXXDefaultInitExpr>(e))
+    return dflt->getExpr();
+  if (const auto *ewc = llvm::dyn_cast<clang::ExprWithCleanups>(e))
+    return ewc->getSubExpr();
+  if (const auto *bind = llvm::dyn_cast<clang::CXXBindTemporaryExpr>(e))
+    return bind->getSubExpr();
+  if (const auto *paren = llvm::dyn_cast<clang::ParenExpr>(e))
+    return paren->getSubExpr();
+  if (const auto *ile = llvm::dyn_cast<clang::InitListExpr>(e))
+    return ile->isTransparent() ? ile->getInit(0) : nullptr;
+  if (const auto *cast = llvm::dyn_cast<clang::CastExpr>(e))
+    return !cast->isGLValue() &&
+               (cast->getCastKind() == clang::CK_ConstructorConversion ||
+                cast->getCastKind() == clang::CK_NoOp)
+             ? cast->getSubExpr()
+             : nullptr;
+  return nullptr;
+}
+
+static const clang::Expr *peel_elided_copy(const clang::Expr *e)
+{
+  const auto *ctor = llvm::dyn_cast<clang::CXXConstructExpr>(e);
+  if (!ctor || !ctor->isElidable() || ctor->getNumArgs() != 1)
+    return nullptr;
+  const auto *mte = llvm::dyn_cast<clang::MaterializeTemporaryExpr>(
+    ctor->getArg(0)->IgnoreImpCasts());
+  return mte ? mte->getSubExpr()->IgnoreImpCasts() : nullptr;
+}
+
+static const clang::Expr &member_result_object(const clang::Expr &init)
+{
+  const clang::Expr *e = &init;
+  for (const clang::Expr *next = e; next;)
+  {
+    e = next;
+    next = peel_initializer_wrapper(e);
+    if (!next)
+      next = peel_elided_copy(e);
+  }
+  return *e;
+}
+
+/* The copy clang marks elidable before C++17, of a variable's initializer or
+ * a returned value, is elided: the object is initialised from the copy's
+ * source, as C++17 requires ([dcl.init]/17.6.1, [stmt.return]), and what
+ * remains is the C++17 form. Converting the copy built a second object and
+ * destroyed it. */
+const clang::Expr &
+clang_cpp_convertert::elided_copy_source(const clang::Expr &init)
+{
+  const clang::Expr *e = &init;
+  if (const auto *ewc = llvm::dyn_cast<clang::ExprWithCleanups>(e))
+    e = ewc->getSubExpr();
+  const clang::Expr *source = peel_elided_copy(e);
+  return source ? *source : init;
+}
+
 bool clang_cpp_convertert::get_member_initializer(
-  const clang::Expr &init,
+  const clang::Expr &member_init,
   const typet &member_type,
   exprt &rhs)
 {
+  const clang::Expr &init = member_result_object(member_init);
   const auto *ctor_expr = llvm::dyn_cast<clang::CXXConstructExpr>(&init);
   if (
     ctor_expr && zero_initialises(init) && ctor_expr->getConstructor() &&
@@ -2423,6 +2571,7 @@ bool clang_cpp_convertert::get_function_body(
         }
         else
           build_member_from_component(fd, member);
+        size_flexible_array_member(*member_decl, member.type());
 
         // set #member_init flag again, as it has been cleared between the first
         // call...
@@ -2465,7 +2614,7 @@ bool clang_cpp_convertert::get_function_body(
             symbolt new_symbol;
             new_symbol.name = "array_init$";
             new_symbol.id = id2string(this_ptr.identifier()) + "_array_init$";
-            new_symbol.set_type(this_type);
+            new_symbol.set_type(migrate_type(this_type));
             if (context.move(new_symbol, array_init_sym))
             {
               log_error(
@@ -3071,14 +3220,12 @@ bool clang_cpp_convertert::annotate_class_field(
   const struct_union_typet &type,
   struct_typet::componentt &comp)
 {
-  // set parent in component's type
+  // A field of a tagless class type has no parent to attach it to.
   if (type.tag().empty())
   {
     log_error("Goto empty tag in parent class type in {}", __func__);
     return true;
   }
-  std::string parent_class_id = tag_prefix + type.tag().as_string();
-  comp.type().member_name(parent_class_id);
 
   // set access in component
   if (annotate_class_field_access(field, comp))
@@ -3142,12 +3289,11 @@ bool clang_cpp_convertert::annotate_class_method(
   /*
    * The order of annotations matters.
    */
-  // annotate parent — derive the id via get_decl_name so it matches the
-  // record's symbol id exactly (Clang 22+ prepends the kind name; older
-  // versions don't).
+  // The multi-TU vptr-init fallback below needs the class id; derive it via
+  // get_decl_name so it matches the record's symbol id exactly (Clang 22+
+  // prepends the kind name; older versions don't).
   std::string parent_class_name, parent_class_id;
   get_decl_name(*cxxmdd.getParent(), parent_class_name, parent_class_id);
-  component_type.member_name(parent_class_id);
 
   // annotate ctor and dtor
   if (is_ConstructorOrDestructor(cxxmdd))
@@ -3160,15 +3306,14 @@ bool clang_cpp_convertert::annotate_class_method(
     /*
      * We also have a `component` in class type representing the ctor/dtor.
      * Need to sync the type of this function symbol and its corresponding type
-     * of the component inside the class' symbol
-     * We just need "#member_name" and "return_type" fields to be synced for
-     * later use in the adjuster. So let's do the sync before adding more
-     * annotations.
-     */
+     * of the component inside the class' symbol: the adjuster reads the return
+     * type back to tell a ctor from a dtor.
+     * So let's do the sync before adding more annotations.
+    */
     symbolt *fd_symb = get_fd_symbol(cxxmdd);
     if (fd_symb)
     {
-      fd_symb->set_type(component_type);
+      fd_symb->set_type(migrate_type(component_type));
       /*
        * We indicate the need for vptr initializations in the ctor/dtor;
        * they are added in the adjuster.
@@ -3321,8 +3466,9 @@ void clang_cpp_convertert::gen_typecast_base_ctor_call(
       derived_struct.is_struct() &&
       to_struct_type(derived_struct).has_component(base_comp))
     {
-      dereference_exprt deref(
-        implicit_this_symb, implicit_this_symb.type().subtype());
+      // dereference_exprt(op, tp) types the node tp.subtype(): tp is the
+      // pointer, not the pointee.
+      dereference_exprt deref(implicit_this_symb, implicit_this_symb.type());
       member_exprt m(deref, base_comp, base_ctor_this_type.subtype());
       implicit_this_symb = address_of_exprt(m);
       routed = true;
@@ -3695,6 +3841,103 @@ bool clang_cpp_convertert::get_conditional_class_prvalue(
 
   new_expr = tmp_obj;
   elided = true;
+  return false;
+}
+
+bool clang_cpp_convertert::get_placement_new(
+  const clang::CXXNewExpr &ne,
+  const typet &t,
+  const locationt &location,
+  exprt &new_expr)
+{
+  exprt place;
+  if (get_expr(*ne.getPlacementArg(0), place))
+    return true;
+
+  /* The address is used twice below, as the object and as the result, so a
+   * side-effecting one (e.g. std::addressof(*it)) is evaluated once, before
+   * the initializer ([expr.new]/19), into a local declared inside a statement
+   * expression: every evaluation gets its own, in a constructor's
+   * mem-initializer, under a label, or recursively. */
+  exprt bound = nil_exprt();
+  if (ne.getPlacementArg(0)->HasSideEffects(*ASTContext))
+  {
+    const std::string path = location.file().as_string();
+    symbolt &tmp = anon_symbol.new_symbol(
+      context,
+      place.type(),
+      path + ":" + location.get_line().as_string() + "$placement$");
+    get_default_symbol(
+      tmp,
+      get_modulename_from_path(path),
+      place.type(),
+      tmp.name,
+      tmp.id,
+      location);
+    tmp.file_local = true;
+
+    code_declt decl(symbol_expr(tmp));
+    decl.copy_to_operands(place);
+    decl.location() = location;
+    bound = decl;
+    place = symbol_expr(tmp);
+  }
+
+  exprt tp("typecast", t);
+  tp.copy_to_operands(place);
+  new_expr = tp;
+
+  // Default-initialising a non-class type performs no initialisation
+  // ([dcl.init.general]), so clang attaches no initializer and there is
+  // nothing to sequence: `new (p) int;` is just (int *)p. A comma with a
+  // single operand would corrupt every downstream op1() access
+  // (esbmc/esbmc#6184).
+  if (ne.hasInitializer())
+  {
+    exprt comma("comma", t);
+    exprt target("dereference", t.subtype());
+    target.copy_to_operands(tp);
+
+    exprt init;
+    if (get_expr(*ne.getInitializer(), init))
+      return true;
+
+    if (
+      init.id() == "sideeffect" && init.statement() == "temporary_object" &&
+      static_cast<const exprt &>(init.initializer()).is_not_nil())
+    {
+      // A class-type initializer arrives as a temporary_object whose
+      // initializer wraps the constructor call carrying an &new_object
+      // placeholder (make_temporary): retarget the call at the placement
+      // address and drop the temporary, so `this` is the placed object, not
+      // a copied-from temp.
+      exprt wrap = static_cast<const exprt &>(init.initializer());
+      assert(wrap.is_code() && to_code(wrap).get_statement() == "expression");
+      exprt call = wrap.op0();
+      replace_new_object_with(target, call);
+      comma.copy_to_operands(call);
+    }
+    else
+    {
+      side_effect_exprt assign("assign");
+      assign.type() = t.subtype();
+      assign.copy_to_operands(target, init);
+      comma.copy_to_operands(assign);
+    }
+    comma.copy_to_operands(tp);
+    new_expr = comma;
+  }
+
+  if (bound.is_not_nil())
+  {
+    code_expressiont value;
+    value.op0() = new_expr;
+    code_blockt block;
+    block.move_to_operands(bound, value);
+    side_effect_exprt stmt_expr("statement_expression", t);
+    stmt_expr.move_to_operands(block);
+    new_expr = stmt_expr;
+  }
   return false;
 }
 
