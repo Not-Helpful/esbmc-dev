@@ -410,6 +410,9 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
   struct_union_typet t(c_tag);
   t.tag(name);
 
+  // This struct is still not complete, so dont say it is.
+  t.incomplete(true);
+
   /* update location with that of the type's definition */
   get_location_from_decl(*rd_def, t.location());
 
