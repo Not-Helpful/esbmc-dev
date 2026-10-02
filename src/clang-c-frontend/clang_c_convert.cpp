@@ -457,6 +457,8 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
       sym->set_type(std::move(t));
       return true;
     }
+    // Type is now complete, we can remove the flag
+    t.remove(irept::a_incomplete);
     sym->set_type(std::move(t));
   }
 
