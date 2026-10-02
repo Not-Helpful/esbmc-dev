@@ -457,7 +457,8 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
         sym->set_type(std::move(t));
         return true;
       }
-
+    // Struct is complete
+    t.remove(irept::a_incomplete);
     sym->set_type(std::move(t));
   }
 
