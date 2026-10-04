@@ -20,6 +20,12 @@ CC_DIAGNOSTIC_IGNORE_LLVM_CHECKS()
 #include <clang-c-frontend/clang_ast_dump.h>
 CC_DIAGNOSTIC_POP()
 
+#if LLVM_VERSION_MAJOR >= 23
+#  include <clang/UnifiedSymbolResolution/USRGeneration.h>
+#else
+#  include <clang/Index/USRGeneration.h>
+#endif
+
 #include <ac_config.h>
 #include <clang-c-frontend/clang_c_convert.h>
 #include <clang-c-frontend/typecast.h>
