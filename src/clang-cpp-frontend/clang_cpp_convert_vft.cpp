@@ -53,37 +53,50 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
     if (!md->isVirtual())
       continue;
 
-    bool is_target = (md->getNameAsString() == "get_result_void");
-
+    /*
+     * 1. convert this virtual method and add them to class symbol type
+     */
     struct_typet::componentt comp;
-
     if (get_decl(*md, comp))
-    {
       return true;
-    }
 
+    // additional annotations for virtual/overriding methods
     if (annotate_virtual_overriding_methods(*md, comp))
-    {
       return true;
-    }
     type.methods().push_back(comp);
 
+    /*
+     * 2. If this is the first time we see a virtual method in this class,
+     *  add virtual table type symbol and virtual pointer. Then add a new
+     *  entry in the vtable.
+     */
     symbolt *vtable_type_symbol = check_vtable_type_symbol_existence(type);
     if (!vtable_type_symbol)
     {
+      // first time we create the vtable type for this class
       vtable_type_symbol = add_vtable_type_symbol(comp, type);
       if (vtable_type_symbol == nullptr)
-      {
         return true;
-      }
 
       add_vptr(type);
     }
 
+    /*
+     * 3. add an entry in the existing virtual table type symbol
+     */
     add_vtable_type_entry(type, comp, vtable_type_symbol);
 
+    /*
+     * 4. deal with overriding method
+     */
     if (md->begin_overridden_methods() != md->end_overridden_methods())
     {
+      /*
+       * In a multi-inheritance case(e.g. diamond problem)
+       * a method might overrides multiple base methods in multiple levels.
+       * so we need to create multiple thunk functions for each overriden
+       * method in each level.
+       */
       overriden_map cxxmethods_overriden;
       get_overriden_methods(*md, cxxmethods_overriden);
 
@@ -96,7 +109,6 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
    * Set up virtual function table(vft) variable symbols
    * Each vft is modelled as a struct of function pointers.
    */
-
   setup_vtable_struct_variables(cxxrd, type);
 
   return false;
@@ -199,8 +211,6 @@ clang_cpp_convertert::rtti_name_component(const irep_idt &vtable_type_id)
   c.set_name(rtti_name_component_id(vtable_type_id));
   c.set("base_name", "@rtti_name");
   c.set("pretty_name", "@rtti_name");
-  c.set("access", "public");
-  c.set("is_rtti_name", true);
   return c;
 }
 
@@ -228,13 +238,13 @@ symbolt *clang_cpp_convertert::add_vtable_type_symbol(
   vt_type_symb.mode = mode;
   {
     struct_typet st;
-    st.set("name", vt_type_symb.id);
+    st.tag(vt_type_symb.id);
     // Every vtable leads with the most-derived type's name, the way a real
     // Itanium-ABI vtable leads with a type_info pointer. `typeid` on a
     // polymorphic glvalue reads it through the object's vptr, which is the only
     // way the dynamic type is available at a use site typed by a base (#6310).
     st.components().push_back(rtti_name_component(vt_name));
-    vt_type_symb.set_type(std::move(st));
+    vt_type_symb.set_type(migrate_type(st));
   }
   vt_type_symb.is_type = true;
   vt_type_symb.location = comp.location();
@@ -296,31 +306,34 @@ void clang_cpp_convertert::add_vtable_type_entry(
    */
 
   irep_idt vt_name = vtable_type_prefix + tag_prefix + type.tag().as_string();
-  std::string virtual_name = comp.name().as_string();
-  struct_typet::componentt vt_entry;
-  vt_entry.type() = pointer_typet(comp.type());
-  vt_entry.set_name(vt_name.as_string() + "::" + virtual_name);
-  vt_entry.set("base_name", comp.base_name());
   /*
-   * `pretty_name` gets printed in symbol table:
-   *    virtual_table::BLAH@tag-BLAH={
-   * .<pretty_name>=&<virtual_method_base_class> };
-   *    virtual_table::BLAH@tag-BLEH={
-   * .<pretty_name>=&<thunk_to_overriding_method_in_derived_class> };
-   *    virtual_table::BLEH@tag-BLEH={
-   * .<pretty_name>=&<overriding_function_in_derived_class> };
+   * `pretty_name` is what the symbol table prints for an entry, whether it
+   * resolves to a base's method, a thunk, or a derived override:
+   *    virtual_table::BLAH@tag-BLEH={ .<pretty_name>=&<thunk> };
+   * add_vtable_variable_symbols also keys the override switch map on it, since
+   * a component's `virtual_name` is no part of the IREP2 struct type (#4715).
    */
-  vt_entry.set("pretty_name", comp.get("virtual_name"));
-  vt_entry.set("virtual_name", comp.get("virtual_name"));
-  vt_entry.set("access", "public");
-  vt_entry.location() = comp.location();
-  // add an entry to the virtual table
+  const irep_idt entry_pretty_name = comp.get("virtual_name");
+
   assert(vtable_type_symbol);
   {
-    typet t = vtable_type_symbol->get_type();
-    struct_typet &vtable_type = to_struct_type(t);
-    vtable_type.components().push_back(vt_entry);
-    vtable_type_symbol->set_type(std::move(t));
+    const struct_type2t &vt = to_struct_type(vtable_type_symbol->get_type2());
+    // migrate_type gives one base name per component, and every vtable type is
+    // created from it, so the vectors stay in step as entries are appended.
+    assert(vt.member_base_names.size() == vt.members.size());
+
+    std::vector<type2tc> members = vt.members;
+    std::vector<irep_idt> names = vt.member_names;
+    std::vector<irep_idt> pretty_names = vt.member_pretty_names;
+    std::vector<irep_idt> base_names = vt.member_base_names;
+
+    members.push_back(pointer_type2tc(migrate_type(comp.type())));
+    names.push_back(vt_name.as_string() + "::" + comp.name().as_string());
+    pretty_names.push_back(entry_pretty_name);
+    base_names.push_back(comp.base_name());
+
+    vtable_type_symbol->set_type(struct_type2tc(
+      members, names, pretty_names, vt.name, vt.packed, base_names));
   }
 }
 
@@ -375,7 +388,6 @@ void clang_cpp_convertert::add_thunk_method(
   thunk_func_symb.name = component.base_name();
   thunk_func_symb.mode = mode;
   thunk_func_symb.location = component.location();
-  thunk_func_symb.set_type(component.type());
   thunk_func_symb.module =
     get_modulename_from_path(component.location().file().as_string());
 
@@ -384,9 +396,11 @@ void clang_cpp_convertert::add_thunk_method(
 
   // update the type of `this` argument in thunk
   {
-    typet t = thunk_func_symb.get_type();
+    typet t = component.type();
     update_thunk_this_type(t, base_class_id);
-    thunk_func_symb.set_type(std::move(t));
+    // A code type carries its arguments' base names across the seam, which
+    // add_thunk_method_arguments reads back (frontends-to-irep2.md §44).
+    thunk_func_symb.set_type(migrate_type(t));
   }
 
   // add symbols for arguments of this thunk function
@@ -465,23 +479,30 @@ void clang_cpp_convertert::add_thunk_method_arguments(symbolt &thunk_func_symb)
    * "<thunk_func_symbol_ID>::<argument_base_name>"
    */
 
-  typet thunk_type = thunk_func_symb.get_type();
-  code_typet &code_type = to_code_type(thunk_type);
-  code_typet::argumentst &args = code_type.arguments();
-  for (unsigned i = 0; i < args.size(); i++)
+  const code_type2t &code_type = to_code_type(thunk_func_symb.get_type2());
+  // migrate_type gives one base name per argument, and the thunk's type comes
+  // from it (frontends-to-irep2.md §44).
+  assert(code_type.argument_base_names.size() == code_type.arguments.size());
+  std::vector<irep_idt> identifiers = code_type.argument_names;
+  std::vector<irep_idt> base_names = code_type.argument_base_names;
+
+  for (std::size_t i = 0; i < code_type.arguments.size(); i++)
   {
-    code_typet::argumentt &arg = args[i];
-    irep_idt base_name = arg.get_base_name();
+    // An override declared with unnamed parameters has empty base names,
+    // which would collapse every argument onto one symbol (github #8090).
+    irep_idt &base_name = base_names[i];
+    if (base_name.empty())
+      base_name = "__anon_arg" + std::to_string(i);
 
     symbolt arg_symb;
     arg_symb.id = thunk_func_symb.id.as_string() + "::" + base_name.as_string();
     arg_symb.name = base_name;
     arg_symb.mode = mode;
     arg_symb.location = thunk_func_symb.location;
-    arg_symb.set_type(arg.type());
+    arg_symb.set_type(code_type.arguments[i]);
 
     // Change argument identifier field to thunk function
-    arg.set("#identifier", arg_symb.id);
+    identifiers[i] = arg_symb.id;
 
     // In a multi-file build the same class — and thus the same thunk — can be
     // converted once per translation unit that sees its definition. The thunk
@@ -504,7 +525,13 @@ void clang_cpp_convertert::add_thunk_method_arguments(symbolt &thunk_func_symb)
       abort();
     }
   }
-  thunk_func_symb.set_type(std::move(thunk_type));
+
+  thunk_func_symb.set_type(code_type2tc(
+    code_type.arguments,
+    code_type.ret_type,
+    identifiers,
+    code_type.ellipsis,
+    base_names));
 }
 
 void clang_cpp_convertert::add_thunk_method_body(
@@ -529,12 +556,16 @@ void clang_cpp_convertert::add_thunk_method_body(
   exprt adjusted_this = typecast_exprt(base_this, derived_ptr_type);
   adjusted_this.set("#base_to_derived", true);
 
+  // Both arms store an IREP2 body, and migrate_expr resolves the called method
+  // and the thunk's own arguments through this thread-local namespace (§53).
+  const namespacet *old_ns = std::exchange(migrate_namespace_lookup, &ns);
   if (
     code_type.return_type().id() != "empty" &&
     code_type.return_type().id() != "destructor")
     add_thunk_method_body_return(thunk_func_symb, component, adjusted_this);
   else
     add_thunk_method_body_no_return(thunk_func_symb, component, adjusted_this);
+  migrate_namespace_lookup = old_ns;
 }
 
 void clang_cpp_convertert::add_thunk_method_body_return(
@@ -569,7 +600,9 @@ void clang_cpp_convertert::add_thunk_method_body_return(
   code_returnt code_return;
   code_return.return_value() = expr_call;
 
-  thunk_func_symb.set_value(code_return);
+  expr2tc body;
+  migrate_expr(code_return, body);
+  thunk_func_symb.set_value(body);
 }
 
 void clang_cpp_convertert::add_thunk_method_body_no_return(
@@ -598,7 +631,9 @@ void clang_cpp_convertert::add_thunk_method_body_no_return(
       symbol_expr(*namespacet(context).lookup(args[i].cmt_identifier())));
   }
 
-  thunk_func_symb.set_value(code_func);
+  expr2tc body;
+  migrate_expr(code_func, body);
+  thunk_func_symb.set_value(body);
 }
 
 void clang_cpp_convertert::add_thunk_component_to_type(
@@ -646,6 +681,7 @@ void clang_cpp_convertert::build_vtable_map(
    * This is the virtual function table for this class.
    * This table will be used to create the vtable variable symbols.
    */
+
   for (const auto &method : struct_type.methods())
   {
     if (!method.get_bool("is_virtual"))
@@ -715,80 +751,61 @@ void clang_cpp_convertert::add_vtable_variable_symbols(
     vt_symb_var.module =
       get_modulename_from_path(type.location().file().as_string());
     vt_symb_var.location = vt_symb_type->location;
-    vt_symb_var.set_type(symbol_typet(vt_symb_type->id));
+    vt_symb_var.set_type(symbol_type2tc(vt_symb_type->id));
     vt_symb_var.lvalue = true;
     vt_symb_var.static_lifetime = true;
 
     if (context.move(vt_symb_var))
     {
-      // Already added from previous call
+      // Symbol has already been processed further up
+      // in the call stack. Skip to unprocessed symbols
       continue;
     }
 
     // add vtable variable symbols
     const struct_typet &vt_type = to_struct_type(vt_symb_type->get_type());
     exprt values("struct", symbol_typet(vt_symb_type->id));
+    // Recovered from the name rather than an `is_rtti_name` flag: the name is
+    // exactly what rtti_name_component_id produced from this symbol's own id,
+    // and a flag on a component is no part of the IREP2 struct type (#4715).
+    const irep_idt rtti_name = rtti_name_component_id(vt_symb_type->id);
     for (const auto &compo : vt_type.components())
     {
-      if (compo.get_bool("is_rtti_name"))
+      if (compo.get_name() == rtti_name)
       {
         // The vtable belongs to the most-derived class cxxrd, whatever base
-        // class' vptr selects it, so this is where the dynamic type is
-        // pinned.
+        // class' vptr selects it, so this is where the dynamic type is pinned.
         exprt name = address_of_exprt(string_constantt(rtti_type_name(cxxrd)));
         gen_typecast(ns, name, compo.type());
         values.operands().push_back(name);
         continue;
       }
 
+      // Every other entry's `pretty_name` is the `virtual_name` the switch map
+      // is keyed on: add_vtable_type_entry sets it from that. The rtti entry is
+      // the one component whose two names differ, and it is handled above.
       std::map<irep_idt, exprt>::const_iterator cit2 =
-        switch_map.find(compo.get("virtual_name").as_string());
-
+        switch_map.find(compo.pretty_name());
       if (cit2 == switch_map.end())
       {
-        // KNOWN ISSUE (temporary, do not upstream):
-        // switch_map is missing an entry for this vtable slot. Root cause
-        // still under investigation -- see notes on
-        // future_data_base<future_data_void>::execute_deferred. Log loudly
-        // and substitute a null function pointer so conversion can proceed
-        // instead of aborting here; this class's vtable variable will be
-        // WRONG (this slot won't dispatch correctly), but downstream
-        // passes might crash somewhere more informative, or might not
-        // crash at all, either of which is useful signal.
-        //
-        DBM_PRINT(
-          "MISSING SWITCH_MAP ENTRY (continuing anyway):\n"
-          "  class="
-          << class_id << "\n"
-          << "  late_cast=" << late_cast_symb->id.as_string() << "\n"
-          << "  missing virtual_name=" << compo.get("virtual_name").as_string()
-          << "\n"
-          << "  loc=" << compo.location().file().as_string() << ":"
-          << compo.location().line().as_string());
-        std::cout.flush();
-
-        pointer_typet placeholder_pointer_type(compo.type());
-        exprt placeholder = gen_zero(placeholder_pointer_type);
-        values.operands().push_back(placeholder);
-        continue;
+        log_error(
+          "No virtual table slot for {} in {}",
+          compo.get_name(),
+          vt_symb_type->id);
+        abort();
       }
-
       const exprt &value = cit2->second;
-      if (value.type().id() != compo.type().id())
-      {
-        DBM_PRINT(
-          "TYPE MISMATCH ON SWITCH_MAP ENTRY (continuing anyway):\n"
-          "  class="
-          << class_id << "\n"
-          << "  late_cast=" << late_cast_symb->id.as_string() << "\n"
-          << "  virtual_name=" << compo.get("virtual_name").as_string() << "\n"
-          << "  value.type().id()=" << value.type().id().as_string() << "\n"
-          << "  compo.type().id()=" << compo.type().id().as_string());
-        std::cout.flush();
-      }
+      assert(value.type().id() == compo.type().id());
       values.operands().push_back(value);
     }
-    vt_symb_var.set_value(values);
+    // migrate_expr resolves each referenced method or thunk through this
+    // thread-local namespace; point it at the context being built, since the
+    // one language_ui installed does not see it (§53.2).
+    const namespacet *old_ns = std::exchange(migrate_namespace_lookup, &ns);
+    expr2tc values2;
+    migrate_expr(values, values2);
+    migrate_namespace_lookup = old_ns;
+    vt_symb_var.set_value(values2);
 
     // Record (vptr-class V → concrete class D) so build_dynamic_cast can
     // enumerate candidate D's by direct lookup instead of walking the TU.
@@ -846,22 +863,21 @@ void clang_cpp_convertert::pre_register_inherited_vtables(
     return;
 
   std::function<void(const clang::CXXRecordDecl *)> walk =
-    [&](const clang::CXXRecordDecl *cur)
-  {
-    for (const auto &spec : cur->bases())
-    {
-      if (spec.isVirtual())
-        continue;
-      const auto *base = spec.getType()->getAsCXXRecordDecl();
-      if (!base)
-        continue;
-      std::string base_id, base_name;
-      get_decl_name(*base, base_name, base_id);
-      if (ns.lookup(vtable_type_prefix + base_id))
-        vtable_classes_per_vptr_[base_id].insert(&cxxrd);
-      walk(base);
-    }
-  };
+    [&](const clang::CXXRecordDecl *cur) {
+      for (const auto &spec : cur->bases())
+      {
+        if (spec.isVirtual())
+          continue;
+        const auto *base = spec.getType()->getAsCXXRecordDecl();
+        if (!base)
+          continue;
+        std::string base_id, base_name;
+        get_decl_name(*base, base_name, base_id);
+        if (ns.lookup(vtable_type_prefix + base_id))
+          vtable_classes_per_vptr_[base_id].insert(&cxxrd);
+        walk(base);
+      }
+    };
   walk(&cxxrd);
 }
 
@@ -890,8 +906,7 @@ bool clang_cpp_convertert::build_dynamic_cast(
   if (get_type(cast.getType(), target_type))
     return true;
 
-  auto fallback = [&]()
-  {
+  auto fallback = [&]() {
     gen_typecast(ns, sub, target_type);
     new_expr = sub;
     return false;
@@ -1051,8 +1066,7 @@ bool clang_cpp_convertert::build_dynamic_cast(
 
   // OR-chain: vptr == arm0 || vptr == arm1 || ... — used by the reference
   // form and the T* pointer form. Precondition: arms not empty.
-  auto vptr_match_any = [&]() -> exprt
-  {
+  auto vptr_match_any = [&]() -> exprt {
     exprt match = equality_exprt(vptr_read, arms.front().first);
     for (size_t i = 1; i < arms.size(); ++i)
       match = or_exprt(match, equality_exprt(vptr_read, arms[i].first));
