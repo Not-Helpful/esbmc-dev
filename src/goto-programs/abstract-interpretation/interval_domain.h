@@ -402,15 +402,20 @@ protected:
   void apply_assume_symbol_truth(const symbol2t &sym, bool is_false);
 
   /**
-   * @brief Generates interval with [min, max] using symbol type
+   * @brief Generates interval with [min, max] of type `t`
    *
    * @tparam Interval interval template specialization (Integers, Reals)
-   * @param sym
+   * @param t
    * @return Interval the returned interval is either [min, max] or (-infinity,
    * infinity)
    */
   template <class Interval>
-  Interval generate_modular_interval(const symbol2t sym) const;
+  Interval generate_modular_interval(const type2tc &t) const;
+
+  /// Bring an interval computed over unbounded integers back into the range
+  /// of the bitvector type `t`, as the solver's modular arithmetic would.
+  template <class Interval>
+  Interval wrap_to_type(const Interval &i, const type2tc &t) const;
 
 public:
   /**
@@ -453,6 +458,10 @@ public:
    */
   template <class Interval>
   Interval get_interval_from_const(const expr2tc &sym) const;
+
+  template <class Interval>
+  Interval
+  get_interval_from_typecast(const typecast2t &cast, Interval result) const;
 
   template <class Interval>
   Interval get_top_interval_from_expr(const expr2tc &sym) const;
