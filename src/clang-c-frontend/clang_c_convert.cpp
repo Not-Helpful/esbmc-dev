@@ -14,11 +14,16 @@ CC_DIAGNOSTIC_IGNORE_LLVM_CHECKS()
 #include <clang/AST/Type.h>
 #include <clang/Basic/Version.inc>
 #include <clang/Basic/Builtins.h>
-#include <clang/Index/USRGeneration.h>
 #include <clang/Frontend/ASTUnit.h>
 #include <llvm/Support/raw_os_ostream.h>
 #include <clang-c-frontend/clang_ast_dump.h>
 CC_DIAGNOSTIC_POP()
+
+#if LLVM_VERSION_MAJOR >= 23
+#  include <clang/UnifiedSymbolResolution/USRGeneration.h>
+#else
+#  include <clang/Index/USRGeneration.h>
+#endif
 
 #include <ac_config.h>
 #include <clang-c-frontend/clang_c_convert.h>
@@ -5260,7 +5265,7 @@ getFullyQualifiedName(const clang::QualType &t, const clang::ASTContext &c)
 {
   clang::PrintingPolicy Policy(c.getPrintingPolicy());
   Policy.SuppressScope = false;
-  Policy.AnonymousTagLocations = true;
+  //Policy.AnonymousTagLocations = true;
   Policy.PolishForDeclaration = true;
   Policy.SuppressUnwrittenScope = true;
   return clang::TypeName::getFullyQualifiedName(t, c, Policy);
