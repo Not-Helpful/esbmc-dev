@@ -18,7 +18,6 @@ CC_DIAGNOSTIC_IGNORE_LLVM_CHECKS()
 #  include <clang/Index/USRGeneration.h>
 #endif
 
-
 #include <clang/Frontend/ASTUnit.h>
 #include <clang/AST/ParentMapContext.h>
 #include <llvm/ADT/SmallVector.h>
