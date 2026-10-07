@@ -19,7 +19,12 @@ CC_DIAGNOSTIC_IGNORE_LLVM_CHECKS()
 #include <clang/AST/ExprCXX.h>
 #include <clang/AST/QualTypeNames.h>
 #include <clang/AST/Type.h>
-#include <clang/Index/USRGeneration.h>
+#if LLVM_VERSION_MAJOR >= 23
+#  include <clang/UnifiedSymbolResolution/USRGeneration.h>
+#else
+#  include <clang/Index/USRGeneration.h>
+#endif
+
 #include <clang/Frontend/ASTUnit.h>
 #include <clang/AST/ParentMapContext.h>
 #include <clang/AST/RecordLayout.h>
