@@ -1669,6 +1669,19 @@ bool clang_c_convertert::get_type(const clang::Type &the_type, typet &new_type)
     break;
   }
 
+  case clang::Type::UnaryTransform:
+  {
+    const clang::UnaryTransformType &ut =
+      static_cast<const clang::UnaryTransformType &>(the_type);
+
+    if (get_type(ut.getBaseType(), new_type))
+      return true;
+
+    new_type.dump();    
+
+    break;
+  }
+
   default:
     std::ostringstream oss;
     llvm::raw_os_ostream ross(oss);
@@ -2435,6 +2448,25 @@ bool clang_c_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
     else
       new_expr = false_exprt();
 
+    break;
+  }
+
+  case clang::Stmt::ConceptSpecializationExprClass:
+  {
+    const clang::ConceptSpecializationExpr &concept_expr =
+      static_cast<const clang::ConceptSpecializationExpr &>(stmt);
+
+    if (concept_expr.isSatisfied())
+      new_expr = true_exprt();
+    else
+      new_expr = false_exprt();
+    break;
+  }
+  case clang::Stmt::RequiresExprClass:
+  {
+    const auto &requires_expr = static_cast<const clang::RequiresExpr &>(stmt);
+    new_expr = requires_expr.isSatisfied() ? new_expr = true_exprt()
+                                           : new_expr = false_exprt();
     break;
   }
 
@@ -3926,15 +3958,15 @@ bool clang_c_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
     new_expr = code_skipt();
     break;
 
-  /* According to Clang docs:
-   *
-   * A type trait used in the implementation of various C++11 and Library TR1
-   * trait templates.
-   *   __is_pod(int) == true
-   *   __is_enum(std::string) == false
-   *   __is_trivially_constructible(vector<int>, int*, int*)
-   *
-   * But it is also used for __builtin_types_compatible_p(ty1, ty2). */
+    /* According to Clang docs:
+     *
+     * A type trait used in the implementation of various C++11 and Library TR1
+     * trait templates.
+     *   __is_pod(int) == true
+     *   __is_enum(std::string) == false
+     *   __is_trivially_constructible(vector<int>, int*, int*)
+     *
+     * But it is also used for __builtin_types_compatible_p(ty1, ty2). */
   case clang::Stmt::TypeTraitExprClass:
   {
     const clang::TypeTraitExpr &tte =
@@ -5291,7 +5323,7 @@ getFullyQualifiedName(const clang::QualType &t, const clang::ASTContext &c)
 {
   clang::PrintingPolicy Policy(c.getPrintingPolicy());
   Policy.SuppressScope = false;
-  //Policy.AnonymousTagLocations = true;
+  // Policy.AnonymousTagLocations = true;
   Policy.PolishForDeclaration = true;
   Policy.SuppressUnwrittenScope = true;
   return clang::TypeName::getFullyQualifiedName(t, c, Policy);
