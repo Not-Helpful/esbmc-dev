@@ -1,10 +1,10 @@
 use.hs llvm 24
-cd build/latest/
+cd build/master-24/
 ninja -v src/esbmc/esbmc
 cd ./../../
 
 echo "SUSPECT TEST"
- ./build/latest/src/esbmc/esbmc /home/helpful/.repos/esbmc-dev/regression/esbmc-cpp/cpp/vector_reserve_realloc/main.cpp  \
+ ./build/master-24/src/esbmc/esbmc /home/helpful/.repos/esbmc-dev/regression/esbmc-cpp/cpp/vector_reserve_realloc/main.cpp  \
                                    --std=c++20
 
 # echo "HPX TEST"
