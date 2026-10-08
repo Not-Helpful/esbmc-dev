@@ -166,8 +166,17 @@ bool clang_cpp_convertert::get_vft_binding_expr_function(
   std::string base_class_id, base_class_name;
   get_decl_name(*md->getParent(), base_class_name, base_class_id);
 
+  // NEW
+  std::string md_name, md_id;
+  get_decl_name(*md, md_name, md_id);
+  
   exprt comp;
-  if (get_decl(*member.getMemberDecl(), comp))
+  if (const symbolt *s = context.find_symbol(md_id))
+  {
+    comp.type() = s->get_type();
+    comp.name(s->id); // guess, see below
+  }
+  else if (get_decl(*md, comp))
     return true;
 
   /*

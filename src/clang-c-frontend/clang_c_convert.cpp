@@ -468,6 +468,7 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     sym->set_type(std::move(t));
   }
 
+
   return false;
 }
 
