@@ -852,6 +852,8 @@ bool clang_cpp_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
   locationt location;
   get_start_location_from_stmt(stmt, location);
 
+
+
   switch (stmt.getStmtClass())
   {
   case clang::Stmt::CXXReinterpretCastExprClass:
@@ -912,6 +914,7 @@ bool clang_cpp_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
     break;
   }
 
+  // NEW
   case clang::Stmt::CXXBoolLiteralExprClass:
   {
     const clang::CXXBoolLiteralExpr &bool_literal =

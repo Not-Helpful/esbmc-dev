@@ -41,7 +41,7 @@ set(default_build_type "RelWithDebInfo")
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   message(STATUS "Setting build type to '${default_build_type}' as none was specified.")
   set(CMAKE_BUILD_TYPE "${default_build_type}" CACHE
-      STRING "Choose the type of build." FORCE)
+    STRING "Choose the type of build." FORCE)
 endif()
 
 # Set the possible values of build type for cmake-gui
@@ -52,14 +52,24 @@ mark_as_advanced(
   CMAKE_C_FLAGS_DEBUGOPT
 )
 set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
-             "Debug" "Release" "MinSizeRel" "RelWithDebInfo" "Sanitizer" "DebugOpt")
+  "Debug" "Release" "MinSizeRel" "RelWithDebInfo" "Sanitizer" "DebugOpt")
 
 set(ESBMC_CXX_Clang_DEFAULTS -Wall -Wextra -pipe)
 set(ESBMC_CXX_GNU_DEFAULTS -Wall -Wextra -pipe)
 add_compile_options(${ESBMC_CXX_${CMAKE_CXX_COMPILER_ID}_DEFAULTS})
 
+
+
 include(CheckIncludeFile)
 check_include_file(unistd.h HAVE_UNISTD)
+
+option(ESBMC_PERSONAL_DEBUG "Enable personal debug module" ON)
+if(ESBMC_PERSONAL_DEBUG)
+  add_subdirectory(debug)
+  link_libraries(esbmc_debug)
+  add_compile_options(-include ${CMAKE_SOURCE_DIR}/debug/debug_module.h)
+  add_compile_definitions(ESBMC_PERSONAL_DEBUG)
+endif()
 
 include(Utils)
 include(OSConfiguration)
@@ -78,48 +88,48 @@ endif()
 # On macOS, search Homebrew for keg-only versions of Bison and Flex. Xcode does
 # not provide new enough versions for us to use.
 if(CMAKE_HOST_SYSTEM_NAME MATCHES "Darwin")
-    execute_process(
-        COMMAND brew --prefix bison
-        RESULT_VARIABLE BREW_BISON
-        OUTPUT_VARIABLE BREW_BISON_PREFIX
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-    )
-    if(BREW_BISON EQUAL 0 AND EXISTS "${BREW_BISON_PREFIX}")
-        message(STATUS "Found Bison keg installed by Homebrew at ${BREW_BISON_PREFIX}")
-        set(BISON_EXECUTABLE "${BREW_BISON_PREFIX}/bin/bison")
-    endif()
+  execute_process(
+    COMMAND brew --prefix bison
+    RESULT_VARIABLE BREW_BISON
+    OUTPUT_VARIABLE BREW_BISON_PREFIX
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+  if(BREW_BISON EQUAL 0 AND EXISTS "${BREW_BISON_PREFIX}")
+    message(STATUS "Found Bison keg installed by Homebrew at ${BREW_BISON_PREFIX}")
+    set(BISON_EXECUTABLE "${BREW_BISON_PREFIX}/bin/bison")
+  endif()
 
-    execute_process(
-        COMMAND brew --prefix flex
-        RESULT_VARIABLE BREW_FLEX
-        OUTPUT_VARIABLE BREW_FLEX_PREFIX
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-    )
-    if(BREW_FLEX EQUAL 0 AND EXISTS "${BREW_FLEX_PREFIX}")
-        message(STATUS "Found Flex keg installed by Homebrew at ${BREW_FLEX_PREFIX}")
-        set(FLEX_EXECUTABLE "${BREW_FLEX_PREFIX}/bin/flex")
-    endif()
+  execute_process(
+    COMMAND brew --prefix flex
+    RESULT_VARIABLE BREW_FLEX
+    OUTPUT_VARIABLE BREW_FLEX_PREFIX
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+  if(BREW_FLEX EQUAL 0 AND EXISTS "${BREW_FLEX_PREFIX}")
+    message(STATUS "Found Flex keg installed by Homebrew at ${BREW_FLEX_PREFIX}")
+    set(FLEX_EXECUTABLE "${BREW_FLEX_PREFIX}/bin/flex")
+  endif()
 
-    # Homebrew's static Boost.Iostreams injects bare -l names for its
-    # compression/ICU backends (zstd + icu{data,i18n,uc}) with no search path,
-    # so the static link fails with "library 'zstd' not found" (esbmc/esbmc#6234).
-    # zstd is symlinked into $(brew --prefix)/lib; icu4c is keg-only. Add both as
-    # link dirs — CMAKE_PREFIX_PATH cannot help, the names bypass find_library.
-    if(BUILD_STATIC)
-        foreach(brew_keg "" icu4c)
-            execute_process(
-                COMMAND brew --prefix ${brew_keg}
-                RESULT_VARIABLE BREW_KEG_RESULT
-                OUTPUT_VARIABLE BREW_KEG_PREFIX
-                OUTPUT_STRIP_TRAILING_WHITESPACE
-                ERROR_QUIET
-            )
-            if(BREW_KEG_RESULT EQUAL 0 AND IS_DIRECTORY "${BREW_KEG_PREFIX}/lib")
-                message(STATUS "Adding Homebrew link directory ${BREW_KEG_PREFIX}/lib")
-                link_directories("${BREW_KEG_PREFIX}/lib")
-            endif()
-        endforeach()
-    endif()
+  # Homebrew's static Boost.Iostreams injects bare -l names for its
+  # compression/ICU backends (zstd + icu{data,i18n,uc}) with no search path,
+  # so the static link fails with "library 'zstd' not found" (esbmc/esbmc#6234).
+  # zstd is symlinked into $(brew --prefix)/lib; icu4c is keg-only. Add both as
+  # link dirs — CMAKE_PREFIX_PATH cannot help, the names bypass find_library.
+  if(BUILD_STATIC)
+    foreach(brew_keg "" icu4c)
+      execute_process(
+        COMMAND brew --prefix ${brew_keg}
+        RESULT_VARIABLE BREW_KEG_RESULT
+        OUTPUT_VARIABLE BREW_KEG_PREFIX
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+      )
+      if(BREW_KEG_RESULT EQUAL 0 AND IS_DIRECTORY "${BREW_KEG_PREFIX}/lib")
+        message(STATUS "Adding Homebrew link directory ${BREW_KEG_PREFIX}/lib")
+        link_directories("${BREW_KEG_PREFIX}/lib")
+      endif()
+    endforeach()
+  endif()
 endif()
 
 # This MUST be executed after BuildStatic since it sets Boost Static flags
@@ -128,6 +138,7 @@ endif()
 find_package(Boost REQUIRED
   COMPONENTS date_time program_options iostreams
   OPTIONAL_COMPONENTS system filesystem)
+
 include(SetupLocalLLVM)
 
 include(ExternalDependencies)
@@ -147,12 +158,14 @@ include(EsbmcCommon)
 
 add_subdirectory(src)
 
+
+
 include(Irep2Optimization)
 
 # Generate ac_config.h. This must be generated after solvers
 configure_file(
- "${PROJECT_SOURCE_DIR}/scripts/cmake/cmake_config.in"
- "${PROJECT_BINARY_DIR}/src/ac_config.h"
+  "${PROJECT_SOURCE_DIR}/scripts/cmake/cmake_config.in"
+  "${PROJECT_BINARY_DIR}/src/ac_config.h"
 )
 
 # This should be added after all source files
@@ -160,10 +173,10 @@ include(Docs)
 
 include(CTest) # calls enable_testing()
 if(BUILD_TESTING)
-    add_subdirectory(unit)
-    if(ENABLE_LD_FRONTEND)
-        add_subdirectory(regression/ld)
-    endif()
+  add_subdirectory(unit)
+  if(ENABLE_LD_FRONTEND)
+    add_subdirectory(regression/ld)
+  endif()
 endif()
 # Added after enable_testing() so the ld-verify CLI's own CTest cases register;
 # the binary itself is built whenever the LD front-end is enabled.
@@ -171,6 +184,6 @@ if(ENABLE_LD_FRONTEND)
   add_subdirectory(tools/ld-verify)
 endif()
 if(ENABLE_REGRESSION)
-    add_subdirectory(regression)
+  add_subdirectory(regression)
 endif()
 include(SetupCsmith)

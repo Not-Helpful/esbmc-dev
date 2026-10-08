@@ -3,13 +3,28 @@ cd build/latest/
 ninja -v src/esbmc/esbmc
 cd ./../../
 
-# echo "SUSPECT TEST"
-#  ./build/latest/src/esbmc/esbmc /home/helpful/.repos/esbmc-dev/regression/esbmc-cpp/cpp/vector_reserve_realloc/main.cpp  \
-#                                    --std=c++20
+echo "SUSPECT TEST1"
+./build/latest/src/esbmc/esbmc ./suspects/stackoverflow.cpp \
+                               -DCASE=1 \
+                               --std=c++20
+# echo "SUSPECT TEST2"
+# ./build/latest/src/esbmc/esbmc ./suspects/stackoverflow.cpp \
+#                                -DCASE=2 \
+#                                --std=c++20
+echo "SUSPECT TEST3"
+./build/latest/src/esbmc/esbmc ./suspects/stackoverflow.cpp \
+                               -DCASE=3 \
+                               --std=c++20
 
-echo "HPX TEST"
-cd /home/helpful/.repos/writing/hpx_memory_usage_bug/
-./build.sh
+# echo "CONTROL TEST"
+# ./build/latest/src/esbmc/esbmc ./suspects/pass.cpp \
+#                                --std=c++20
 
-./test.sh
+
+
+# echo "HPX TEST"
+# cd /home/helpful/.repos/writing/hpx_memory_usage_bug/
+# ./build.sh
+
+# ./test.sh
 
