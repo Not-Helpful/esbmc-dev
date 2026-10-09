@@ -1678,8 +1678,6 @@ bool clang_c_convertert::get_type(const clang::Type &the_type, typet &new_type)
     if (get_type(ut.getBaseType(), new_type))
       return true;
 
-    new_type.dump();    
-
     break;
   }
 
