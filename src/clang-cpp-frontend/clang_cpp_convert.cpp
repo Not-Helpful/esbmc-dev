@@ -914,7 +914,6 @@ bool clang_cpp_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
     break;
   }
 
-  // NEW
   case clang::Stmt::CXXBoolLiteralExprClass:
   {
     const clang::CXXBoolLiteralExpr &bool_literal =

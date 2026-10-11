@@ -468,7 +468,6 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     sym->set_type(std::move(t));
   }
 
-
   return false;
 }
 
@@ -2450,6 +2449,7 @@ bool clang_c_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
     break;
   }
 
+  // NEW
   case clang::Stmt::ConceptSpecializationExprClass:
   {
     const clang::ConceptSpecializationExpr &concept_expr =
@@ -2461,11 +2461,14 @@ bool clang_c_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
       new_expr = false_exprt();
     break;
   }
+
+  // NEW
   case clang::Stmt::RequiresExprClass:
   {
     const auto &requires_expr = static_cast<const clang::RequiresExpr &>(stmt);
-    new_expr = requires_expr.isSatisfied() ? new_expr = true_exprt()
+   new_expr = requires_expr.isSatisfied() ? new_expr = true_exprt()
                                            : new_expr = false_exprt();
+
     break;
   }
 
