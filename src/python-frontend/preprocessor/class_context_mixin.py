@@ -1,9 +1,120 @@
 import ast
 import copy
+from collections import Counter
 # pylint: disable=too-many-boolean-expressions
 
 
+def _class_scope_nodes(node):
+    """The nodes of a class-body statement that are evaluated in the class
+    scope: not function or lambda bodies, nested class bodies, or the parts of
+    a comprehension past its first iterable."""
+    yield node
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        args = node.args
+        children = [*node.decorator_list, *args.defaults, *filter(None, args.kw_defaults)]
+        children += [
+            a.annotation
+            for a in (*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg)
+            if a and a.annotation
+        ]
+        children += [node.returns] if node.returns else []
+    elif isinstance(node, ast.Lambda):
+        children = [*node.args.defaults, *filter(None, node.args.kw_defaults)]
+    elif isinstance(node, ast.ClassDef):
+        children = [*node.decorator_list, *node.bases, *node.keywords]
+    elif isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+        children = [node.generators[0].iter]
+    else:
+        children = list(ast.iter_child_nodes(node))
+    for child in children:
+        yield from _class_scope_nodes(child)
+
+
+def _runs_call(node):
+    """Whether evaluating `node` in a class body may call something."""
+    for n in _class_scope_nodes(node):
+        if isinstance(n, ast.Call):
+            return True
+        if isinstance(n, ast.ClassDef) and any(_runs_call(s) for s in n.body):
+            return True
+        if isinstance(n, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)) and any(
+                isinstance(m, ast.Call) for m in ast.walk(n)):
+            return True
+    return False
+
+
+class _QualifyNestedClasses(ast.NodeTransformer):
+    """Rewrite `Outer.Inner` to the hoisted class's module-level name."""
+
+    def __init__(self, renames):
+        self.renames = renames
+
+    def visit_Attribute(self, node):  # pylint: disable=invalid-name,missing-function-docstring
+        self.generic_visit(node)
+        if isinstance(node.value, ast.Name) and isinstance(node.ctx, ast.Load):
+            hoisted = self.renames.get((node.value.id, node.attr))
+            if hoisted:
+                return ast.copy_location(ast.Name(id=hoisted, ctx=ast.Load()), node)
+        return node
+
+
 class ClassContextMixin:
+
+    def hoist_nested_classes(self, module):
+        """Lift each class nested in a module-level class body to module level
+        as `Outer__Inner`, since the converter only builds module-level classes
+        (#8256). `Outer.Inner` is rewritten everywhere, and so is a bare `Inner`
+        that the outer class body's scope resolves to the nested class.
+
+        The rewrite is purely by name, so an outer class whose name is bound
+        anywhere else in the module is left alone."""
+        bound = [name for n in ast.walk(module) for name in self._names_bound_by(n)]
+        taken = set(bound) | {n.id for n in ast.walk(module) if isinstance(n, ast.Name)}
+        renames = {}
+        body = []
+        for stmt in module.body:
+            if isinstance(stmt, ast.ClassDef) and bound.count(stmt.name) == 1:
+                body.extend(self._hoist_from_class(stmt, taken, renames))
+            else:
+                body.append(stmt)
+        if renames:
+            module.body = body
+            _QualifyNestedClasses(renames).visit(module)
+
+    def _hoist_from_class(self, cls, taken, renames):
+        """`cls` preceded by the classes hoisted out of it, recursively."""
+        hoisted = []
+        local = {}
+        kept = []
+        for index, stmt in enumerate(cls.body):
+            for n in _class_scope_nodes(stmt):
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in local:
+                    n.id = local[n.id]
+            if self._can_hoist(cls, index, taken):
+                qualified = f"{cls.name}__{stmt.name}"
+                taken.add(qualified)
+                renames[(cls.name, stmt.name)] = qualified
+                local[stmt.name] = qualified
+                stmt.name = qualified
+                hoisted.extend(self._hoist_from_class(stmt, taken, renames))
+            else:
+                kept.append(stmt)
+        cls.body = kept or [ast.copy_location(ast.Pass(), cls)]
+        return [*hoisted, cls]
+
+    def _can_hoist(self, cls, index, taken):
+        """Whether `cls.body[index]` is a nested class that keeps its meaning
+        at module level: its name is bound by nothing else in the class scope,
+        and moving its definition ahead of the outer class does not reorder
+        two calls."""
+        stmt = cls.body[index]
+        if not isinstance(stmt, ast.ClassDef) or f"{cls.name}__{stmt.name}" in taken:
+            return False
+        if any(n is not stmt and stmt.name in self._names_bound_by(n) for other in cls.body
+               for n in _class_scope_nodes(other)):
+            return False
+        earlier = [*cls.decorator_list, *cls.bases, *cls.keywords, *cls.body[:index]]
+        return not (_runs_call(stmt) and any(_runs_call(e) for e in earlier))
 
     def visit_ClassDef(self, node):
         """Track class context for method definitions."""
@@ -15,7 +126,9 @@ class ClassContextMixin:
         self._collect_class_attr_annotations(node)
         self._record_exit_suppresses_all(node)
         self._record_class_with_exit(node)
+        self._class_stack.append(node)
         self.generic_visit(node)
+        self._class_stack.pop()
 
         self.current_class_name = old_class_name
 
@@ -27,6 +140,36 @@ class ClassContextMixin:
             del self._pending_method_default_inits[inits_before:]
             return [node, *hoisted]
         return node
+
+    def _class_body_binds(self, stmt, name):
+        """Whether a statement directly in a class body binds `name` there."""
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return stmt.name == name
+        if isinstance(stmt, ast.Assign):
+            targets = stmt.targets
+        elif isinstance(stmt, ast.AugAssign) or (isinstance(stmt, ast.AnnAssign)
+                                                 and stmt.value is not None):
+            targets = [stmt.target]
+        else:
+            targets = []
+        return any(name in self._names_bound_by(n) for t in targets for n in ast.walk(t))
+
+    def class_scope_default(self, default_node, method):
+        """A method default naming an attribute its top-level class bound before
+        the method, as `Class.name`: the default is hoisted past the class, where
+        the bare name no longer resolves (#8200)."""
+        if len(self._class_stack) != 1 or not isinstance(default_node, ast.Name):
+            return default_node
+        cls = self._class_stack[0]
+        for stmt in cls.body:
+            if stmt is method:
+                break
+            if self._class_body_binds(stmt, default_node.id):
+                qualified = ast.Attribute(value=ast.Name(id=cls.name, ctx=ast.Load()),
+                                          attr=default_node.id,
+                                          ctx=ast.Load())
+                return ast.copy_location(qualified, default_node)
+        return default_node
 
     @staticmethod
     def _names_bound_by(node):
@@ -172,6 +315,45 @@ class ClassContextMixin:
                     method = copy.deepcopy(template)
                     self._rebind_cls_calls(method, heir.name)
                     heir.body.append(method)
+
+    @staticmethod
+    def _is_name_copy(node):
+        """Whether `node` is a plain `x = y` assignment."""
+        return (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name) and isinstance(node.value, ast.Name))
+
+    @staticmethod
+    def _module_level_nodes(module):
+        """The nodes of `module` outside any function or lambda body."""
+        stack = [module]
+        while stack:
+            node = stack.pop()
+            yield node
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                stack.extend(ast.iter_child_nodes(node))
+
+    def _bind_class_alias_calls(self, module):
+        """Rewrite `alias(...)` to `Class(...)` where a top-level `alias = Class`
+        statement is the only binding of `alias`, to a top-level class the
+        module never rebinds: the converter recognises a constructor call only
+        by the class's own name (#8352). A module-level call before the binding
+        stays as written, since CPython raises NameError there."""
+        counts = Counter(name for n in ast.walk(module) for name in self._names_bound_by(n))
+        classes = {stmt.name for stmt in module.body if isinstance(stmt, ast.ClassDef)}
+        bindings = {
+            n.targets[0].id: n
+            for n in filter(self._is_name_copy, module.body)
+            if n.value.id in classes and counts[n.targets[0].id] == counts[n.value.id] == 1
+        }
+        module_level = set(map(id, self._module_level_nodes(module)))
+        for n in ast.walk(module):
+            if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)):
+                continue
+            binding = bindings.get(n.func.id)
+            if binding is None or (id(n) in module_level and
+                                   (n.lineno, n.col_offset) < (binding.lineno, binding.col_offset)):
+                continue
+            n.func = ast.copy_location(ast.Name(id=binding.value.id, ctx=ast.Load()), n.func)
 
     def _record_exit_suppresses_all(self, class_node):
         """Cache classes whose __exit__ unconditionally returns True."""

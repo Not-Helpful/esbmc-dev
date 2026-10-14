@@ -92,6 +92,16 @@ class ZeroDivisionError(Exception):
         return self.message
 
 
+class OverflowError(Exception):
+    message: str = ""
+
+    def __init__(self, message: str):
+        self.message: str = message
+
+    def __str__(self) -> str:
+        return self.message
+
+
 class AssertionError(Exception):
     message: str = ""
 
@@ -103,6 +113,16 @@ class AssertionError(Exception):
 
 
 class NameError(Exception):
+    message: str = ""
+
+    def __init__(self, message: str):
+        self.message: str = message
+
+    def __str__(self) -> str:
+        return self.message
+
+
+class UnboundLocalError(NameError):
     message: str = ""
 
     def __init__(self, message: str):

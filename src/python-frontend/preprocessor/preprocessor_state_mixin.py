@@ -14,12 +14,16 @@ class PreprocessorStateMixin:
         self.range_loop_counter = 0
         self.iterable_loop_counter = 0
         self.enumerate_loop_counter = 0
+        self._iter_counter = 0
+        self.iterator_classes = set()
         self.helper_functions_added = False
         self.functionKwonlyParams = {}
         self.static_methods = set()
         self.is_entry_module = False
         self._builtin_shadow_names = None
         self._unobservable_builtin_keys = frozenset()
+        self._closed_lambda_bindings = {}
+        self._fixed_length_starred = {}
         self.functionVarargs = set()
         self._vararg_func_defs = {}
         self._vararg_module_defs = set()
@@ -124,3 +128,4 @@ class PreprocessorStateMixin:
         self.exported_range_wrappers = {}
         self.module_dunder_all = None
         self._pending_method_default_inits = []
+        self._class_stack = []

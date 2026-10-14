@@ -391,6 +391,16 @@ void goto_checkt::cast_overflow_check(
     cast_overflow, claim_msg + get_expr_id(expr), "overflow", loc, guard);
 }
 
+static expr2tc overflow_expr(const expr2tc &expr)
+{
+  if (is_neg2t(expr))
+    return overflow_neg2tc(to_neg2t(expr).value);
+  // abs overflows exactly when negating its operand does (C11 7.22.6.1p2).
+  if (is_abs2t(expr))
+    return overflow_neg2tc(to_abs2t(expr).value);
+  return overflow2tc(expr);
+}
+
 void goto_checkt::overflow_check(
   const expr2tc &expr,
   const guard2tc &guard,
@@ -437,8 +447,7 @@ void goto_checkt::overflow_check(
     return;
 
   // add overflow subgoal
-  expr2tc overflow =
-    is_neg2t(expr) ? overflow_neg2tc(to_neg2t(expr).value) : overflow2tc(expr);
+  expr2tc overflow = overflow_expr(expr);
   make_not(overflow);
 
   add_guarded_claim(
@@ -1306,6 +1315,7 @@ void goto_checkt::check_rec(
     /* fallthrough */
 
   case expr2t::neg_id:
+  case expr2t::abs_id:
   case expr2t::add_id:
   case expr2t::sub_id:
   case expr2t::mul_id:
@@ -1357,10 +1367,11 @@ void goto_checkt::clz_zero_check(const expr2tc &code, const locationt &loc)
 
   // A zero argument is undefined for __builtin_clz*/ctz* (GCC); assert it is
   // non-zero. The two-argument clzg/ctzg name their own result at zero, so the
-  // arity test below leaves them alone, and ffs is defined there outright.
+  // arity test below leaves them alone, and ffs and clrsb are defined there
+  // outright.
   const std::string name = to_symbol2t(call.function).thename.as_string();
   const bit_scan_endt kind = bit_scan_builtin(name);
-  if (kind == bit_scan_endt::none || kind == bit_scan_endt::first_set)
+  if (kind != bit_scan_endt::leading && kind != bit_scan_endt::trailing)
     return;
 
   if (call.operands.size() != 1)

@@ -160,6 +160,11 @@ const struct group_opt_templ all_cmd_options[] = {
     {"no-cprover-additions",
      NULL,
      "Do not auto-link ESBMC additions when reading a CBMC goto-binary"},
+    {"ignore-property-class",
+     boost::program_options::value<std::vector<std::string>>()->value_name(
+       "class"),
+     "Skip the assertions a CBMC goto-binary tags with this property class "
+     "(repeatable), e.g. Kani's reachability_check and cover"},
     {"dont-care-about-missing-extensions",
      NULL,
      "Don't crash on unsupported extensions"},
@@ -878,6 +883,10 @@ const struct group_opt_templ all_cmd_options[] = {
     {"force-malloc-success", NULL, "Do not check for malloc/new failure"},
     {"force-realloc-success", NULL, "Do not check for realloc failure"},
     {"malloc-zero-is-null", NULL, "Also explore malloc(0) returning NULL"},
+    {"reserve-first-page",
+     NULL,
+     "Place no object below address 4096, as CBMC does, so a pointer made "
+     "from a small integer never aliases one"},
     {"max-symbolic-realloc-copy",
      boost::program_options::value<int>()->default_value(128)->value_name("nr"),
      "Set maximum number of elements to copy symbolically in realloc (default "

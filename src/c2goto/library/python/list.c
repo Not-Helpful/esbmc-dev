@@ -34,6 +34,10 @@ static PyType __ESBMC_list_type;
 static double __ESBMC_float_buf[__ESBMC_FLOAT_BUF_SIZE];
 static size_t __ESBMC_float_buf_idx = 0;
 
+// Set once a store changes an element's type, which the frontend's per-list
+// element type map does not see; its == fast path holds only while unset.
+bool __ESBMC_list_retyped = false;
+
 /* An 8-byte read of an object whose declared type is not known here. A packed
  * struct has alignment 1, so forming this pointer is defined whatever the
  * object's alignment -- a plain `uint64_t *` cast is not (C23 6.3.2.3p7) --
@@ -652,6 +656,9 @@ bool __ESBMC_list_set_at(
   void *copied_value = __ESBMC_copy_value(
     value, type_size, type_id, float_type_id, &float_idx, ptr_free);
 
+  if (l->items[index].type_id != type_id)
+    __ESBMC_list_retyped = true;
+
   // Update the element at the given index
   l->items[index].value = copied_value;
   l->items[index].float_idx = float_idx;
@@ -1043,8 +1050,12 @@ bool __ESBMC_list_remove_at(PyListObject *l, size_t index)
 
 PyObject *__ESBMC_list_pop(PyListObject *l, int64_t index)
 {
+  // An uncaught IndexError ends the program, so a failed check also ends the
+  // path rather than reporting the reads past it.
   __ESBMC_assert(l != NULL, "IndexError: pop from empty list");
+  __ESBMC_assume(l != NULL);
   __ESBMC_assert(l->size > 0, "IndexError: pop from empty list");
+  __ESBMC_assume(l->size > 0);
 
   // Handle negative index or default (pop last element)
   size_t actual_index;
@@ -1053,12 +1064,14 @@ PyObject *__ESBMC_list_pop(PyListObject *l, int64_t index)
     // Convert negative index to positive
     int64_t positive_index = (int64_t)l->size + index;
     __ESBMC_assert(positive_index >= 0, "IndexError: pop index out of range");
+    __ESBMC_assume(positive_index >= 0);
     actual_index = (size_t)positive_index;
   }
   else
     actual_index = (size_t)index;
 
   __ESBMC_assert(actual_index < l->size, "IndexError: pop index out of range");
+  __ESBMC_assume(actual_index < l->size);
 
   // Make a copy of the element to return before shifting
   PyObject *popped = __ESBMC_alloca(sizeof(PyObject));

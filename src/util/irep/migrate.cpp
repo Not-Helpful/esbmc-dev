@@ -1274,6 +1274,41 @@ static bool migrate_right_shift(const exprt &expr, expr2tc &new_expr_ref)
   return true;
 }
 
+// The parts of a cpp_delete side effect that sideeffect2t has no field for.
+static void migrate_cpp_delete(const exprt &expr, std::vector<expr2tc> &args)
+{
+  const exprt &destructor = static_cast<const exprt &>(expr.find("destructor"));
+  if (destructor.is_not_nil())
+  {
+    expr2tc d;
+    migrate_expr(destructor, d);
+    args.push_back(d);
+  }
+
+  // A replaced operator delete rides in arguments[1], mirroring the
+  // allocation side (github #6494).
+  const exprt &dealloc_function =
+    static_cast<const exprt &>(expr.find("dealloc_function"));
+  if (dealloc_function.is_not_nil())
+  {
+    if (args.empty())
+      args.emplace_back();
+    expr2tc fn;
+    migrate_expr(dealloc_function, fn);
+    args.push_back(fn);
+  }
+
+  // An aligned operator delete's alignment rides in arguments[2].
+  const exprt &dealloc_alignment =
+    static_cast<const exprt &>(expr.find("dealloc_alignment"));
+  if (dealloc_alignment.is_not_nil())
+  {
+    expr2tc align;
+    migrate_expr(dealloc_alignment, align);
+    args.push_back(align);
+  }
+}
+
 // The parts of a cpp_new side effect that sideeffect2t has no field for.
 static void
 migrate_cpp_new(const exprt &expr, expr2tc &thesize, std::vector<expr2tc> &args)
@@ -1335,6 +1370,43 @@ migrate_cpp_new(const exprt &expr, expr2tc &thesize, std::vector<expr2tc> &args)
     migrate_expr(placement, place);
     args.push_back(place);
   }
+
+  // A user-placement operator new's placement arguments ride in
+  // arguments[5] onwards.
+  const exprt &alloc_args =
+    static_cast<const exprt &>(expr.find("alloc_arguments"));
+  if (alloc_args.is_not_nil())
+  {
+    args.resize(5);
+    for (const exprt &a : alloc_args.operands())
+    {
+      expr2tc arg;
+      migrate_expr(a, arg);
+      args.push_back(arg);
+    }
+  }
+}
+
+// Kani pads a union variant into `{ v: T, v_padding: <N-byte bv> }` but
+// initialises the union with the bare T: wrap it, padding left free.
+static void wrap_padded_union_member(
+  const type2tc &type,
+  const irep_idt &component,
+  std::vector<expr2tc> &members)
+{
+  if (!is_union_type(type) || members.size() != 1)
+    return;
+  const auto n = struct_union_get_component_number(type, component);
+  if (!n || !is_struct_type(to_union_type(type).members[*n]))
+    return;
+  const struct_type2t &padded = to_struct_type(to_union_type(type).members[*n]);
+  if (padded.members.empty() || padded.members[0] != members[0]->type)
+    return;
+
+  std::vector<expr2tc> fields{members[0]};
+  for (size_t i = 1; i < padded.members.size(); ++i)
+    fields.push_back(gen_nondet(padded.members[i]));
+  members[0] = constant_struct2tc(to_union_type(type).members[*n], fields);
 }
 
 void migrate_expr(const exprt &expr, expr2tc &new_expr_ref)
@@ -1521,6 +1593,8 @@ void migrate_expr(const exprt &expr, expr2tc &new_expr_ref)
 
       members.push_back(new_ref);
     }
+
+    wrap_padded_union_member(type, expr.component_name(), members);
 
     new_expr_ref = constant_union2tc(type, expr.component_name(), members);
     return;
@@ -2520,27 +2594,7 @@ void migrate_expr(const exprt &expr, expr2tc &new_expr_ref)
       t = expr.statement() == "cpp_delete"
             ? sideeffect2t::allockind::cpp_delete
             : sideeffect2t::allockind::cpp_delete_array;
-      const exprt &destructor =
-        static_cast<const exprt &>(expr.find("destructor"));
-      if (destructor.is_not_nil())
-      {
-        expr2tc d;
-        migrate_expr(destructor, d);
-        args.push_back(d);
-      }
-
-      // A replaced operator delete rides in arguments[1], mirroring the
-      // allocation side (github #6494).
-      const exprt &dealloc_function =
-        static_cast<const exprt &>(expr.find("dealloc_function"));
-      if (dealloc_function.is_not_nil())
-      {
-        if (args.empty())
-          args.emplace_back();
-        expr2tc fn;
-        migrate_expr(dealloc_function, fn);
-        args.push_back(fn);
-      }
+      migrate_cpp_delete(expr, args);
     }
     else if (expr.statement() == "temporary_object")
     {
@@ -3062,7 +3116,10 @@ void migrate_expr(const exprt &expr, expr2tc &new_expr_ref)
     expr2tc theval;
     migrate_expr(expr.op0(), theval);
 
-    new_expr_ref = popcount2tc(theval);
+    // popcount2t is always int; a CBMC binary types the count itself (Kani
+    // emits u32), so keep that type for whatever the count is assigned to.
+    new_expr_ref =
+      coerce_to_type(popcount2tc(theval), migrate_type(expr.type()));
     return;
   }
 
@@ -3610,13 +3667,16 @@ static const char *back_sideeffect_statement(sideeffect2t::allockind kind)
 static void back_sideeffect_cpp_delete(const sideeffect2t &ref2, exprt &theexpr)
 {
   // op0 = pointer (in `operand`); arguments[0] = destructor call, if any,
-  // arguments[1] = replaced operator delete, if any. remove_cpp_delete
-  // asserts exactly one operand and reads both named subs back out.
+  // arguments[1] = replaced operator delete, if any, arguments[2] = its
+  // alignment, if aligned. remove_cpp_delete asserts exactly one operand and
+  // reads the named subs back out.
   theexpr.copy_to_operands(migrate_expr_back(ref2.operand));
   if (!ref2.arguments.empty() && !is_nil_expr(ref2.arguments[0]))
     theexpr.set("destructor", migrate_expr_back(ref2.arguments[0]));
   if (ref2.arguments.size() > 1 && !is_nil_expr(ref2.arguments[1]))
     theexpr.add("dealloc_function") = migrate_expr_back(ref2.arguments[1]);
+  if (ref2.arguments.size() > 2)
+    theexpr.add("dealloc_alignment") = migrate_expr_back(ref2.arguments[2]);
 }
 
 static void back_sideeffect_cpp_new(const sideeffect2t &ref2, exprt &theexpr)
@@ -3624,8 +3684,9 @@ static void back_sideeffect_cpp_new(const sideeffect2t &ref2, exprt &theexpr)
   // cpp_new has no operands in source form (size lives in the size field,
   // handled below; the initializer, if any, is carried in arguments[0], a
   // replaced operator new in arguments[1], the value-initialisation marker in
-  // arguments[2], the braced list's filler in arguments[3], and an array
-  // placement new's address in arguments[4]).
+  // arguments[2], the braced list's filler in arguments[3], an array
+  // placement new's address in arguments[4], and a user-placement operator
+  // new's placement arguments from arguments[5]).
   if (!ref2.arguments.empty() && !is_nil_expr(ref2.arguments[0]))
     theexpr.initializer(migrate_expr_back(ref2.arguments[0]));
   if (ref2.arguments.size() > 1 && !is_nil_expr(ref2.arguments[1]))
@@ -3636,6 +3697,13 @@ static void back_sideeffect_cpp_new(const sideeffect2t &ref2, exprt &theexpr)
     theexpr.add("array_filler") = migrate_expr_back(ref2.arguments[3]);
   if (ref2.arguments.size() > 4)
     theexpr.add("placement") = migrate_expr_back(ref2.arguments[4]);
+  if (ref2.arguments.size() > 5)
+  {
+    exprt alloc_args("arguments");
+    for (std::size_t i = 5; i < ref2.arguments.size(); ++i)
+      alloc_args.copy_to_operands(migrate_expr_back(ref2.arguments[i]));
+    theexpr.add("alloc_arguments") = alloc_args;
+  }
 }
 
 static void back_sideeffect_operands(const sideeffect2t &ref2, exprt &theexpr)

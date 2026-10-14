@@ -938,6 +938,7 @@ exprt function_call_expr::build_constant_from_arg() const
     // Evaluate the operand once so that method-call arguments (e.g.
     // int(d.copy_abs())) are not lowered twice by the branches below.
     exprt operand_expr = converter_.get_expr(first_arg);
+    operand_expr = guard_nonfinite_float_to_int(operand_expr, base_expr);
 
     // Dispatch int() to the operand's __int__ when the operand is a class
     // instance (e.g. Decimal). Under the object-model migration (#3067/#4773)
@@ -994,54 +995,28 @@ exprt function_call_expr::build_constant_from_arg() const
       }
     }
 
+    // A statement-form call left under the conversion's typecast crashes
+    // symex (#8274).
+    operand_expr = to_value_expr(operand_expr, converter_.ns);
+
     // Handle Name type (variable reference)
     if (first_arg["_type"] == "Name")
     {
-      const symbolt *sym = lookup_python_symbol(first_arg["id"]);
-      // The compile-time fast path below decodes the symbol's stored value as
-      // a string; it is only valid for constant *string* symbols. For numeric
-      // symbols (int/float/bool) extract_string_from_symbol misreads the value
-      // — an int 65 decodes to the character 'A' (rejected as non-digit) and a
-      // float yields no string at all — so int(x) wrongly folds to 0. Route
-      // numeric symbols through the general numeric conversion instead, which
-      // truncates floats toward zero and treats ints as identity. (GitHub
-      // #4770)
-      if (
-        sym && sym->get_value().is_constant() &&
-        type_utils::is_string_type(sym->get_type()))
-      {
-        if (base_expr.is_nil())
-        {
-          return handle_str_symbol_to_int(sym);
-        }
-        else
-        {
-          // Convert symbol to expression and use with base
-          exprt value_expr = build_symbol(*sym);
-          return converter_.get_string_handler()
-            .handle_int_conversion_with_base(
-              value_expr, base_expr, converter_.get_location_from_decl(call_));
-        }
-      }
-      else
-      {
-        // Reuse the already-evaluated operand (see hoist above).
-        exprt expr = operand_expr;
+      // Numeric symbols must not take the string fold: an int 65 decodes to
+      // 'A' and a float to no string at all (GitHub #4770).
+      const std::string name = first_arg["id"].get<std::string>();
+      const symbolt *sym = lookup_python_symbol(name);
+      if (base_expr.is_nil() && is_single_assignment_str_symbol(sym, name))
+        if (const auto folded = handle_str_symbol_to_int(sym))
+          return *folded;
 
-        if (base_expr.is_nil())
-        {
-          // No base provided, use general conversion
-          return converter_.get_string_handler().handle_int_conversion(
-            expr, converter_.get_location_from_decl(call_));
-        }
-        else
-        {
-          // Base provided, use conversion with base
-          return converter_.get_string_handler()
-            .handle_int_conversion_with_base(
-              expr, base_expr, converter_.get_location_from_decl(call_));
-        }
-      }
+      // Reuse the already-evaluated operand (see hoist above).
+      const exprt &expr = operand_expr;
+      if (base_expr.is_nil())
+        return converter_.get_string_handler().handle_int_conversion(
+          expr, converter_.get_location_from_decl(call_));
+      return converter_.get_string_handler().handle_int_conversion_with_base(
+        expr, base_expr, converter_.get_location_from_decl(call_));
     }
     // Handle other types (Constant, etc.)
     else
@@ -1155,56 +1130,49 @@ exprt function_call_expr::build_constant_from_arg() const
   // Handle float(): convert string (from symbol) to float
   else if (func_name == "float" && arg["_type"] == "Name")
   {
-    const symbolt *sym = lookup_python_symbol(arg["id"]);
-    // Only take the constant-string fast path when the variable is genuinely
-    // string-typed here. A numeric variable conditionally reassigned a string
-    // (e.g. `if isinstance(x, str): x = x.replace(...)`) leaves a stale string
-    // value on its symbol even on paths where it stays numeric; keying off the
-    // value alone would mis-route float(x) into string parsing and fold it to
-    // 0.0 (#5161). Gate on the declared type so such cases fall through to the
-    // numeric typecast in the else branch.
-    if (
-      sym && sym->get_value().is_constant() &&
-      type_utils::is_string_type(sym->get_type()) &&
-      type_utils::is_string_type(sym->get_value().type()))
-      return handle_str_symbol_to_float(sym);
-    else
+    // A numeric variable conditionally reassigned a string leaves a stale
+    // string value on its symbol (#5161), and a string chosen on a branch
+    // leaves only one of its values (#8251), so fold only a string assigned
+    // once; anything else takes the runtime conversion below.
+    const std::string name = arg["id"].get<std::string>();
+    const symbolt *sym = lookup_python_symbol(name);
+    if (is_single_assignment_str_symbol(sym, name))
+      if (const auto folded = handle_str_symbol_to_float(sym))
+        return *folded;
+    // Try to get the expression type directly, even if symbol lookup failed
+    exprt expr = converter_.get_expr(arg);
+    if (type_utils::is_string_type(expr.type()))
     {
-      // Try to get the expression type directly, even if symbol lookup failed
-      exprt expr = converter_.get_expr(arg);
-      if (type_utils::is_string_type(expr.type()))
-      {
-        // Runtime string -> float. float("10") must succeed, but float() of an
-        // arbitrary string may raise ValueError. Gate the conversion on a
-        // runtime validity check so a concrete valid literal folds away while a
-        // genuinely non-float string still raises a reachable ValueError (the
-        // same exception path used by the string-literal case above).
-        auto &sh = converter_.get_string_handler();
-        auto loc = converter_.get_location_from_decl(call_);
+      // Runtime string -> float. float("10") must succeed, but float() of an
+      // arbitrary string may raise ValueError. Gate the conversion on a
+      // runtime validity check so a concrete valid literal folds away while a
+      // genuinely non-float string still raises a reachable ValueError (the
+      // same exception path used by the string-literal case above).
+      auto &sh = converter_.get_string_handler();
+      auto loc = converter_.get_location_from_decl(call_);
 
-        exprt valid = sh.handle_string_is_float(expr, loc);
-        exprt raise = converter_.get_exception_handler().gen_exception_raise(
-          "ValueError", "could not convert string to float");
-        codet throw_code("expression");
-        throw_code.operands().push_back(raise);
-        code_ifthenelset guard;
-        // V.3: build the "not valid" guard condition in IREP2.
-        expr2tc valid2;
-        migrate_expr(valid, valid2);
-        guard.cond() = migrate_expr_back(not2tc(valid2));
-        guard.then_case() = throw_code;
-        guard.location() = loc;
-        guard.location().property("skipped");
-        converter_.add_instruction(guard);
+      exprt valid = sh.handle_string_is_float(expr, loc);
+      exprt raise = converter_.get_exception_handler().gen_exception_raise(
+        "ValueError", "could not convert string to float");
+      codet throw_code("expression");
+      throw_code.operands().push_back(raise);
+      code_ifthenelset guard;
+      // V.3: build the "not valid" guard condition in IREP2.
+      expr2tc valid2;
+      migrate_expr(valid, valid2);
+      guard.cond() = migrate_expr_back(not2tc(valid2));
+      guard.then_case() = throw_code;
+      guard.location() = loc;
+      guard.location().property("skipped");
+      converter_.add_instruction(guard);
 
-        return sh.handle_string_to_float(expr, loc);
-      }
-      // Numeric variable: emit a proper typecast to avoid mislabeled IR
-      typet float_t = type_handler_.get_typet("float", 0);
-      if (!expr.type().is_floatbv())
-        return build_typecast(expr, float_t);
-      return expr;
+      return sh.handle_string_to_float(expr, loc);
     }
+    // Numeric variable: emit a proper typecast to avoid mislabeled IR
+    typet float_t = type_handler_.get_typet("float", 0);
+    if (!expr.type().is_floatbv())
+      return build_typecast(expr, float_t);
+    return expr;
   }
 
   // Handle float(): convert bool to float
@@ -2698,7 +2666,9 @@ bool function_call_expr::receiver_is_tracked_numpy_view(
 
   const std::string root_id = converter_.resolve_name_symbol_id(
     call_["func"]["value"]["id"].get<std::string>());
-  return !root_id.empty() && converter_.is_tracked_numpy_view_id(root_id);
+  return !root_id.empty() &&
+         (converter_.is_tracked_numpy_view_id(root_id) ||
+          converter_.numpy_pointer_view_info_.count(root_id) != 0);
 }
 
 // pop()/copy()/clear() are each shared between list and dict; disambiguate
@@ -3171,6 +3141,17 @@ exprt function_call_expr::validate_re_module_args() const
 
   return nil_exprt(); // Validation passed
 }
+// `re.match(p, s, flags)` goes to the model's `_match_flags`, which keeps
+// the flag handling out of the matchers themselves (#8223).
+void function_call_expr::route_re_flags_call()
+{
+  bool has_flags = call_["args"].size() > 2;
+  for (const auto &kw : call_.value("keywords", nlohmann::json::array()))
+    has_flags |= kw.value("arg", "") == "flags";
+  if (has_flags)
+    function_id_.set_function("_" + function_id_.get_function() + "_flags");
+}
+
 bool function_call_expr::is_any_call() const
 {
   const std::string &func_name = function_id_.get_function();
@@ -3962,6 +3943,10 @@ function_call_expr::get_dispatch_table()
      },
      "isinstance/hasattr"},
 
+    {[this]() { return is_getattr_call(); },
+     [this]() { return handle_getattr(); },
+     "getattr()"},
+
     // Input function
     {[this]() { return is_input_call(); },
      [this]() { return handle_input(); },
@@ -4230,6 +4215,7 @@ function_call_expr::get_dispatch_table()
        exprt validation_result = validate_re_module_args();
        if (!validation_result.is_nil())
          return validation_result;
+       route_re_flags_call();
 
        // If validation passes, handle as general function call
        return handle_general_function_call();
@@ -4551,6 +4537,14 @@ std::optional<exprt> function_call_expr::try_reduce_numpy_descriptor_method()
     (func_name != "any" && func_name != "all") ||
     call_["func"]["_type"] != "Attribute" || !call_["func"].contains("value"))
     return std::nullopt;
+
+  const nlohmann::json &reduced_operand =
+    call_["args"].empty() ? call_["func"]["value"] : call_["args"][0];
+  if (
+    std::optional<exprt> runtime_result =
+      python_list(converter_, call_)
+        .try_reduce_symbolic_view(func_name, reduced_operand))
+    return runtime_result;
 
   std::optional<any_all_receiver> receiver =
     resolve_any_all_receiver(func_name);
@@ -6430,54 +6424,6 @@ exprt function_call_expr::coerce_tagged_argument(
     "yet supported");
 }
 
-// Whether `node` itself binds `name`, other than as a Store/Del Name.
-static std::size_t binds_by_field(
-  const nlohmann::json &node,
-  const std::string &kind,
-  const std::string &name)
-{
-  static const std::map<std::string, std::string> name_field = {
-    {"arg", "arg"},
-    {"FunctionDef", "name"},
-    {"AsyncFunctionDef", "name"},
-    {"ClassDef", "name"},
-    {"ExceptHandler", "name"},
-    {"MatchAs", "name"},
-    {"MatchStar", "name"},
-    {"Global", "names"},
-    {"Nonlocal", "names"}};
-  const auto it = name_field.find(kind);
-  if (it == name_field.end() || !node.contains(it->second))
-    return 0;
-  const nlohmann::json &field = node[it->second];
-  return field.is_array() ? std::count(field.begin(), field.end(), name)
-                          : field == name;
-}
-
-// Counts every construct under `node` that binds `name`, in any scope: a
-// Store/Del Name (assignment, walrus, loop and with targets), a
-// global/nonlocal declaration, a parameter, a def/class, an import alias.
-static std::size_t
-count_name_bindings(const nlohmann::json &node, const std::string &name)
-{
-  std::size_t n = 0;
-  if (node.is_object())
-  {
-    const std::string kind = node.value("_type", "");
-    if (kind == "Name")
-      n += node.value("id", "") == name &&
-           node["ctx"].value("_type", "") != "Load";
-    else if (kind == "alias")
-      n += (node["asname"].is_null() ? node["name"] : node["asname"]) == name;
-    else
-      n += binds_by_field(node, kind, name);
-  }
-  for (const auto &child : node)
-    if (child.is_structured())
-      n += count_name_bindings(child, name);
-  return n;
-}
-
 static std::optional<std::string> string_literal(const nlohmann::json &node)
 {
   if (node.value("_type", "") == "Constant" && node["value"].is_string())
@@ -6516,7 +6462,7 @@ constant_byteorder(const nlohmann::json &node, const nlohmann::json &module)
     return string_literal(node);
 
   const std::string name = node["id"].get<std::string>();
-  if (count_name_bindings(module, name) != 1)
+  if (json_utils::count_name_bindings(module, name) != 1)
     return std::nullopt;
   const nlohmann::json *value = top_level_value(module, name);
   return value ? string_literal(*value) : std::nullopt;
