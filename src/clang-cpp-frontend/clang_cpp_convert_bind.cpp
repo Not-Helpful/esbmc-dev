@@ -174,7 +174,7 @@ bool clang_cpp_convertert::get_vft_binding_expr_function(
   if (const symbolt *s = context.find_symbol(md_id))
   {
     comp.type() = s->get_type();
-    comp.name(s->id); // guess, see below
+    comp.name(s->id);
   }
   else if (get_decl(*md, comp))
     return true;
