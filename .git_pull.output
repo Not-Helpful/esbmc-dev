@@ -1,1 +1,6 @@
-Already up to date.
+Updating 34f5a4548b..28d1efb667
+Fast-forward
+ src/clang-cpp-frontend/clang_cpp_convert.cpp |  1 -
+ test.sh                                      | 10 +++++-----
+ 2 files changed, 5 insertions(+), 6 deletions(-)
+ mode change 100644 => 100755 test.sh
