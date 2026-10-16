@@ -20,6 +20,7 @@ CXX=clang++ CC=clang cmake -B $BUILD -G Ninja \
             -DCLANG_LINK_CLANG_DYLIB="ON" \
             -DCMAKE_CXX_STANDARD=23 \
             -DBUILD_TESTING=ON \
+            -DENABLE_PYTHON_FRONTEND=ON \
             -DENABLE_Z3="ON" \
             -DLLVM_DIR=$LLVM_PREFIX/lib/cmake/llvm \
             -DClang_DIR=$LLVM_PREFIX/lib/cmake/clang \
