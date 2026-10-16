@@ -15,4 +15,24 @@ target_include_directories(clangcfrontend_stuff
 target_link_libraries(clangcfrontend_stuff PUBLIC esbmc_common gotoprograms ${cheaders_lib} ${ESBMC_CLANG_LIBS})
 
 add_library(clangcfrontend INTERFACE)
-target_link_libraries(clangcfrontend INTERFACE clangcfrontend_stuff clangcfrontendast)
+target_link_libraries(clangcfrontend
+  INTERFACE
+  clangcfrontend_stuff
+  clangcfrontendast
+  clangDriver
+  clangFrontend
+  clangSerialization
+  clangOptions
+  clangLex
+  clangBasic
+  LLVMOption
+  LLVMTargetParser
+  LLVMSupport
+)
+
+if(LLVM_VERSION_MAJOR GREATER_EQUAL 23)
+  target_link_libraries(clangcfrontend
+    INTERFACE
+    clangUnifiedSymbolResolution
+  )
+endif()
