@@ -53,6 +53,64 @@ python_list::list_eq_target python_list::select_list_eq(
      th.tagged_scalar_type_id(bool_type())}};
 }
 
+std::optional<expr2tc> python_list::fast_elem_equality(
+  exprt lhs_val,
+  exprt rhs_val,
+  const typet &lhs_type,
+  const typet &rhs_type) const
+{
+  auto is_numeric = [](const typet &t) {
+    return t.is_signedbv() || t.is_unsignedbv() || t.is_floatbv();
+  };
+  const tuple_handler &tuples = converter_.get_tuple_handler();
+  const bool lhs_tuple = tuples.is_tuple_type(lhs_type);
+  const bool rhs_tuple = tuples.is_tuple_type(rhs_type);
+
+  // Same-type numeric/bool compares directly; mixed numeric promotes both
+  // sides to double first. A tuple compares directly only against the
+  // identical tuple type: two tuples whose string members were padded to
+  // different widths are different struct sorts, which an equality would not
+  // relate. Against a number or a bool a tuple is never equal; the runtime
+  // comparator cannot tell, since it byte-compares elements of distinct
+  // type_ids (#8133).
+  if (
+    lhs_type == rhs_type &&
+    (is_numeric(lhs_type) || lhs_type == bool_type() || lhs_tuple))
+  {
+  }
+  else if (is_numeric(lhs_type) && is_numeric(rhs_type))
+  {
+    lhs_val = build_typecast(lhs_val, double_type());
+    rhs_val = build_typecast(rhs_val, double_type());
+  }
+  else if (lhs_tuple != rhs_tuple)
+    return gen_false_expr();
+  else
+    return std::nullopt;
+
+  expr2tc lhs_val2, rhs_val2;
+  migrate_expr(lhs_val, lhs_val2);
+  migrate_expr(rhs_val, rhs_val2);
+  return equality2tc(lhs_val2, rhs_val2);
+}
+
+expr2tc python_list::stored_element_is(
+  const symbolt &list,
+  std::size_t i,
+  const symbolt &elem)
+{
+  // A frontend temporary is assigned once, where the list was built, so only
+  // a user binding can have moved on since the append.
+  if (converter_.is_frontend_temporary(elem))
+    return gen_true_expr();
+  const exprt at = build_list_at_call(
+    build_symbol(list), from_integer(BigInt(i), size_type()), list_value_);
+  expr2tc stored, current;
+  migrate_expr(extract_pyobject_value(at, elem.get_type()), stored);
+  migrate_expr(build_symbol(elem), current);
+  return equality2tc(stored, current);
+}
+
 exprt python_list::compare(
   const exprt &l1,
   const exprt &l2,
@@ -408,6 +466,11 @@ exprt python_list::compare(
             if (!build_nested_equality(
                   lhs_nested, rhs_nested, depth + 1, elem_equal, sizes_ok))
               return false;
+            sizes_ok = and2tc(
+              sizes_ok,
+              and2tc(
+                stored_element_is(*lhs_list, i, *lhs_nested),
+                stored_element_is(*rhs_list, i, *rhs_nested)));
           }
         }
         else
@@ -498,36 +561,17 @@ exprt python_list::compare(
               build_list_at_call(build_symbol(*lhs_symbol), idx, list_value_);
             exprt rhs_at =
               build_list_at_call(build_symbol(*rhs_symbol), idx, list_value_);
-            exprt lhs_val = extract_pyobject_value(lhs_at, lhs_elem_type);
-            exprt rhs_val = extract_pyobject_value(rhs_at, rhs_elem_type);
-
-            // Same-type numeric/bool compares directly; mixed numeric promotes
-            // both sides to double first. (V.3: built in IREP2.)
-            // A tuple compares directly only against the identical tuple type:
-            // two tuples whose string members were padded to different widths
-            // are different struct sorts, which an equality would not relate.
-            if (
-              lhs_elem_type == rhs_elem_type &&
-              (is_numeric(lhs_elem_type) || is_bool(lhs_elem_type) ||
-               is_tuple(lhs_elem_type)))
-            {
-              // direct compare
-            }
-            else if (is_numeric(lhs_elem_type) && is_numeric(rhs_elem_type))
-            {
-              lhs_val = build_typecast(lhs_val, double_type());
-              rhs_val = build_typecast(rhs_val, double_type());
-            }
-            else
+            const std::optional<expr2tc> elem_equal = fast_elem_equality(
+              extract_pyobject_value(lhs_at, lhs_elem_type),
+              extract_pyobject_value(rhs_at, rhs_elem_type),
+              lhs_elem_type,
+              rhs_elem_type);
+            if (!elem_equal)
             {
               comparable = false;
               break;
             }
-
-            expr2tc lhs_val2, rhs_val2;
-            migrate_expr(lhs_val, lhs_val2);
-            migrate_expr(rhs_val, rhs_val2);
-            all_equal = and2tc(all_equal, equality2tc(lhs_val2, rhs_val2));
+            all_equal = and2tc(all_equal, *elem_equal);
           }
 
           if (comparable)

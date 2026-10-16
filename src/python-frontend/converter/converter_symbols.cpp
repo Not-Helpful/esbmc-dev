@@ -6,7 +6,9 @@
 #include <util/message/message.h>
 
 #include <algorithm>
+#include <functional>
 #include <regex>
+#include <set>
 #include <utility>
 
 void python_converter::update_symbol(const exprt &expr) const
@@ -240,6 +242,15 @@ symbolt *python_converter::find_method_in_imported_base(
   return symbol_table_.find_symbol(base_id.to_string());
 }
 
+symbolt *python_converter::find_method_in_model_base(
+  const std::string &base_class,
+  const std::string &sym_id) const
+{
+  if (!json_utils::find_class((*ast_json)["body"], base_class).is_null())
+    return nullptr;
+  return find_model_symbol(sym_id);
+}
+
 /// Whether import alias @p alias binds @p name: `import a.b` binds `a`, and
 /// `from m import *` may bind any name.
 static bool
@@ -329,13 +340,14 @@ bool python_converter::class_binds_name(
   const std::string &class_name,
   const std::string &name) const
 {
-  const nlohmann::json *node = sole_class_binding(class_name);
+  const nlohmann::json *node = sole_binding(class_name);
   return node &&
          may_bind_name(node->value("body", nlohmann::json()), name, false);
 }
 
-const nlohmann::json *
-python_converter::sole_class_binding(const std::string &name) const
+const nlohmann::json *python_converter::sole_binding(
+  const std::string &name,
+  const std::string &statement) const
 {
   const nlohmann::json *found = nullptr;
   for (const auto &stmt : (*ast_json)["body"])
@@ -343,11 +355,296 @@ python_converter::sole_class_binding(const std::string &name) const
     // Any scope: a name the call site's own function binds is not this class.
     if (!may_bind_name(stmt, name, true))
       continue;
-    if (found || stmt.value("_type", "") != "ClassDef")
+    if (found || stmt.value("_type", "") != statement)
       return nullptr;
     found = &stmt;
   }
   return found;
+}
+
+using scope_bindings = python_converter::scope_bindings;
+
+static bool names_contain(const nlohmann::json &names, const std::string &name)
+{
+  return std::find(names.begin(), names.end(), name) != names.end();
+}
+
+/// Records an import of @p name, or a declaration handing it to an outer
+/// scope. Whether @p node is such a statement.
+static bool record_declaration(
+  const nlohmann::json &node,
+  const std::string &type,
+  const std::string &name,
+  scope_bindings &found)
+{
+  const nlohmann::json names = node.value("names", nlohmann::json::array());
+  if (type == "Import" || type == "ImportFrom")
+  {
+    for (const auto &alias : names)
+      found.by_import = found.by_import || alias_binds_name(alias, name);
+    return true;
+  }
+  if (type == "Global" || type == "Nonlocal")
+  {
+    found.declared_outer = found.declared_outer || names_contain(names, name);
+    return true;
+  }
+  return false;
+}
+
+/// Records how @p node binds @p name in its own scope. Function, class, lambda
+/// and comprehension bodies are scopes of their own and are not entered.
+static void collect_scope_bindings(
+  const nlohmann::json &node,
+  const std::string &name,
+  scope_bindings &found)
+{
+  if (node.is_array())
+  {
+    for (const auto &child : node)
+      collect_scope_bindings(child, name, found);
+    return;
+  }
+  if (!node.is_object())
+    return;
+  const std::string type = node.value("_type", "");
+  if (record_declaration(node, type, name, found))
+    return;
+  if (type == "Name")
+  {
+    found.by_other = found.by_other || may_bind_within(node, type, name, false);
+    return;
+  }
+  found.by_other = found.by_other || binds_by_name(node, type, name, false);
+  static const std::set<std::string> own_scopes = {
+    "FunctionDef",
+    "AsyncFunctionDef",
+    "ClassDef",
+    "Lambda",
+    "ListComp",
+    "SetComp",
+    "DictComp",
+    "GeneratorExp"};
+  // A bare annotation (`m: int`) records a type and binds nothing.
+  if (
+    own_scopes.count(type) ||
+    (type == "AnnAssign" && node.value("value", nlohmann::json()).is_null()))
+    return;
+  for (const auto &child : node)
+    collect_scope_bindings(child, name, found);
+}
+
+static bool declares_global(const nlohmann::json &node, const std::string &name)
+{
+  if (
+    node.is_object() && node.value("_type", "") == "Global" &&
+    names_contain(node["names"], name))
+    return true;
+  return node.is_structured() &&
+         std::any_of(node.begin(), node.end(), [&](const nlohmann::json &c) {
+           return declares_global(c, name);
+         });
+}
+
+static std::runtime_error
+undecided_module_binding(const std::string &name, const nlohmann::json &use)
+{
+  return std::runtime_error(
+    fmt::format(
+      "'{}' at line {} is bound both by an import and by another statement, "
+      "and the Python frontend cannot tell which binding it reads",
+      name,
+      use.value("lineno", 0)));
+}
+
+static std::pair<int, int> source_position(const nlohmann::json &node, bool end)
+{
+  return {
+    node.value(end ? "end_lineno" : "lineno", 0),
+    node.value(end ? "end_col_offset" : "col_offset", 0)};
+}
+
+/// Whether the code at @p at, under @p node, runs only when something defined
+/// there is called or iterated, which need not follow the statements before it.
+static bool deferred_at(const nlohmann::json &node, std::pair<int, int> at)
+{
+  static const std::set<std::string> deferring = {
+    "FunctionDef", "AsyncFunctionDef", "ClassDef", "Lambda", "GeneratorExp"};
+  if (
+    node.is_object() && deferring.count(node.value("_type", "")) &&
+    source_position(node, false) <= at && at <= source_position(node, true))
+    return true;
+  return node.is_structured() &&
+         std::any_of(node.begin(), node.end(), [&](const nlohmann::json &c) {
+           return deferred_at(c, at);
+         });
+}
+
+/// At module level, with every binding of @p name a plain top-level
+/// statement and @p use run in order, the last binding to complete before
+/// @p use is the one it reads. Whether that is an import; throws otherwise.
+static bool module_level_binding_is_import(
+  const nlohmann::json &body,
+  const std::string &name,
+  const nlohmann::json &use)
+{
+  const std::pair<int, int> at = source_position(use, false);
+  if (deferred_at(body, at))
+    throw undecided_module_binding(name, use);
+  std::optional<bool> is_import;
+  for (const auto &stmt : body)
+  {
+    scope_bindings found;
+    collect_scope_bindings(stmt, name, found);
+    if (!found.by_import && !found.by_other)
+      continue;
+    const std::string type = stmt.value("_type", "");
+    const bool definition =
+      type == "FunctionDef" || type == "AsyncFunctionDef" || type == "ClassDef";
+    if (
+      type == "Delete" ||
+      (!definition && (stmt.contains("body") || stmt.contains("cases"))))
+      throw undecided_module_binding(name, use);
+    if (source_position(stmt, true) <= at)
+      is_import = found.by_import;
+  }
+  if (!is_import)
+    throw undecided_module_binding(name, use);
+  return *is_import;
+}
+
+/// How @p function binds @p name: by an import alone (true), as a parameter or
+/// another local (false), or not at all (empty).
+static std::optional<bool> function_binding_is_import(
+  const nlohmann::json &function,
+  const std::string &name,
+  const nlohmann::json &use)
+{
+  if (may_bind_name(function["args"], name, true))
+    return false;
+  scope_bindings local;
+  collect_scope_bindings(function["body"], name, local);
+  if (local.declared_outer || (!local.by_import && !local.by_other))
+    return std::nullopt;
+  if (local.by_import && local.by_other)
+    throw undecided_module_binding(name, use);
+  return local.by_import;
+}
+
+std::optional<bool> python_converter::binding_is_import(
+  const nlohmann::json &module,
+  const scope_bindings &global,
+  const nlohmann::json *function,
+  bool in_class,
+  bool in_order,
+  const std::string &name,
+  const nlohmann::json &use)
+{
+  if (function)
+    if (const auto local = function_binding_is_import(*function, name, use))
+      return local;
+
+  const bool rebound = global.by_other || global.declared_outer;
+  if (!global.by_import)
+    return rebound ? std::optional<bool>(false) : std::nullopt;
+  if (!rebound && !in_order)
+    return true;
+  if (global.declared_outer || function || in_class)
+    throw undecided_module_binding(name, use);
+  return module_level_binding_is_import(module["body"], name, use);
+}
+
+python_converter::scope_bindings python_converter::module_scope_bindings(
+  const nlohmann::json &module,
+  const std::string &name)
+{
+  scope_bindings found;
+  collect_scope_bindings(module["body"], name, found);
+  found.declared_outer = declares_global(module, name);
+  return found;
+}
+
+bool python_converter::name_shadows_module(
+  const nlohmann::json &receiver,
+  const nlohmann::json &use) const
+{
+  if (
+    receiver.value("_type", "") != "Name" ||
+    !receiver.value("id", nlohmann::json()).is_string())
+    return false;
+  const std::string name = receiver["id"].get<std::string>();
+
+  const std::optional<bool> is_import = binding_is_import(
+    *ast_json,
+    module_bindings(name),
+    enclosing_function_node_,
+    !current_class_name_.empty(),
+    false,
+    name,
+    use);
+  return is_import && !*is_import;
+}
+
+const python_converter::scope_bindings &
+python_converter::module_bindings(const std::string &name) const
+{
+  const auto [entry, inserted] =
+    module_bindings_memo_.try_emplace({ast_json, name});
+  if (inserted)
+    entry->second = module_scope_bindings(*ast_json, name);
+  return entry->second;
+}
+
+bool python_converter::is_module_receiver(
+  const std::string &module_name,
+  const nlohmann::json &receiver,
+  const nlohmann::json &use) const
+{
+  return is_imported_module(module_name) && !name_shadows_module(receiver, use);
+}
+
+const nlohmann::json *python_converter::sole_method_def(
+  const std::string &class_name,
+  const std::string &method) const
+{
+  const nlohmann::json *cls = sole_binding(class_name);
+  if (!cls || !cls->contains("body"))
+    return nullptr;
+  const nlohmann::json *found = nullptr;
+  for (const auto &stmt : cls->at("body"))
+  {
+    if (!may_bind_name(stmt, method, false))
+      continue;
+    if (found || stmt.value("_type", "") != "FunctionDef")
+      return nullptr;
+    found = &stmt;
+  }
+  return found;
+}
+
+bool python_converter::overridden_below(
+  const std::string &class_name,
+  const std::string &method) const
+{
+  std::function<bool(const nlohmann::json &)> visit = [&](
+                                                        const nlohmann::json
+                                                          &node) {
+    if (node.is_array())
+      return std::any_of(node.begin(), node.end(), visit);
+    if (!node.is_object())
+      return false;
+    if (
+      node.value("_type", "") == "ClassDef" &&
+      node.value("name", "") != class_name &&
+      may_bind_name(node.value("body", nlohmann::json()), method, false))
+    {
+      const auto mro = class_mro(node["name"].get<std::string>());
+      if (!mro || std::find(mro->begin(), mro->end(), class_name) != mro->end())
+        return true;
+    }
+    return std::any_of(node.begin(), node.end(), visit);
+  };
+  return visit((*ast_json)["body"]);
 }
 
 std::optional<std::vector<std::string>>
@@ -393,7 +690,7 @@ python_converter::class_mro(const std::string &class_name, mro_memo &memo) const
   if (!inserted)
     return entry->second;
 
-  const nlohmann::json *node = sole_class_binding(class_name);
+  const nlohmann::json *node = sole_binding(class_name);
   if (!node)
     return std::nullopt;
 
@@ -427,6 +724,203 @@ python_converter::class_mro(const std::string &class_name) const
 {
   mro_memo memo;
   return class_mro(class_name, memo);
+}
+
+static void collect_class_nodes(
+  const nlohmann::json &node,
+  std::vector<const nlohmann::json *> &classes)
+{
+  if (node.is_object() && node.value("_type", "") == "ClassDef")
+    classes.push_back(&node);
+  if (node.is_object() || node.is_array())
+    for (const auto &child : node)
+      collect_class_nodes(child, classes);
+}
+
+std::set<std::string>
+python_converter::subclasses(const std::string &class_name) const
+{
+  std::vector<const nlohmann::json *> classes;
+  collect_class_nodes((*ast_json)["body"], classes);
+  std::set<std::string> family{class_name};
+  for (bool grew = true; grew;)
+  {
+    grew = false;
+    for (const nlohmann::json *cls : classes)
+      for (const auto &base : (*cls)["bases"])
+        grew |= family.count(base.value("id", "")) &&
+                family.insert((*cls)["name"].get<std::string>()).second;
+  }
+  return family;
+}
+
+std::optional<std::string> python_converter::bound_method_id(
+  const std::string &owner,
+  const std::string &m) const
+{
+  const auto resolve = [&](const std::string &cls) {
+    std::optional<std::string> found;
+    if (const auto mro = class_mro(cls))
+      for (auto c = mro->begin(); c != mro->end() && !found; ++c)
+        if (class_binds_name(*c, m))
+          found = *c;
+    return found;
+  };
+  const std::optional<std::string> defining = resolve(owner);
+  if (!defining)
+    return std::nullopt;
+
+  const nlohmann::json &body = (*sole_binding(*defining))["body"];
+  const auto binds_m = [&](const nlohmann::json &stmt) {
+    return may_bind_name(stmt, m, false);
+  };
+  const auto def = std::find_if(body.begin(), body.end(), binds_m);
+  if (
+    std::count_if(body.begin(), body.end(), binds_m) != 1 ||
+    def->value("_type", "") != "FunctionDef" ||
+    !(*def)["decorator_list"].empty())
+    return std::nullopt;
+
+  // `self.m` binds the method the object's own class resolves, so every
+  // subclass must resolve it to the same one.
+  const std::set<std::string> family = subclasses(owner);
+  if (std::any_of(family.begin(), family.end(), [&](const std::string &cls) {
+        return resolve(cls) != defining;
+      }))
+    return std::nullopt;
+
+  return symbol_id(
+           current_python_file, *defining, m == "__init__" ? *defining : m)
+    .to_string();
+}
+
+std::optional<std::pair<bool, std::string>> python_converter::stored_function(
+  const nlohmann::json &target,
+  const nlohmann::json &value,
+  const std::string &owner,
+  const nlohmann::json *method) const
+{
+  const std::string kind = value.value("_type", "");
+  const std::string name = value.value(kind == "Name" ? "id" : "attr", "");
+  const nlohmann::json *def =
+    kind == "Name" ? sole_binding(name, "FunctionDef") : nullptr;
+  if (def && (*def)["name"] == name)
+    return std::make_pair(
+      false, symbol_id(current_python_file, "", name).to_string());
+  if (
+    kind != "Attribute" || !method || !(*method)["decorator_list"].empty() ||
+    (*method)["args"]["args"].empty())
+    return std::nullopt;
+
+  const std::string self = (*method)["args"]["args"][0].value("arg", "");
+  if (
+    value["value"].value("id", "") != self ||
+    target["value"].value("id", "") != self ||
+    may_bind_name((*method)["body"], self, true))
+    return std::nullopt;
+  if (const auto id = bound_method_id(owner, name))
+    return std::make_pair(true, *id);
+  return std::nullopt;
+}
+
+/// Whether @p node names a hook (setattr, __dict__, ...) that can reach any
+/// attribute.
+static bool names_attribute_hook(const nlohmann::json &node)
+{
+  static const std::set<std::string> hooks{
+    "setattr",
+    "delattr",
+    "__setattr__",
+    "__delattr__",
+    "__dict__",
+    "__getattr__",
+    "__getattribute__"};
+  if (node.is_object())
+    for (const char *key : {"id", "attr", "name"})
+      if (
+        node.contains(key) && node[key].is_string() &&
+        hooks.count(node[key].get<std::string>()))
+        return true;
+  return false;
+}
+
+/// Whether @p node is not known to be only read.
+static bool may_store(const nlohmann::json &node)
+{
+  const nlohmann::json ctx = node.value("ctx", nlohmann::json());
+  return !ctx.is_object() || ctx.value("_type", "") != "Load";
+}
+
+/// The attribute an assignment statement stores a value into, or null.
+static const nlohmann::json *
+attribute_store_target(const nlohmann::json &node, const std::string &type)
+{
+  const nlohmann::json *target =
+    type == "AnnAssign"                               ? &node["target"]
+    : type == "Assign" && node["targets"].size() == 1 ? &node["targets"][0]
+                                                      : nullptr;
+  return target && target->value("_type", "") == "Attribute" &&
+             !node["value"].is_null()
+           ? target
+           : nullptr;
+}
+
+void python_converter::record_function_store(
+  const std::string &attr,
+  const std::pair<bool, std::string> &stored)
+{
+  auto &held = attribute_functions_[ast_json]
+                 ->try_emplace(attr, attribute_functions{stored.first, {}})
+                 .first->second;
+  if (held && held->bound == stored.first)
+    held->ids.push_back(stored.second);
+  else
+    held.reset();
+}
+
+void python_converter::collect_attribute_stores(
+  const nlohmann::json &node,
+  const std::string &owner,
+  const nlohmann::json *method)
+{
+  auto &module = attribute_functions_[ast_json];
+  if (!module || names_attribute_hook(node))
+    return module.reset();
+  const std::string type = node.is_object() ? node.value("_type", "") : "";
+  if (type == "Attribute" && may_store(node))
+    (*module)[node["attr"].get<std::string>()].reset();
+
+  if (type == "ClassDef")
+    return collect_attribute_stores(
+      node["body"], node["name"].get<std::string>(), nullptr);
+  // A def nested in a method sees the method's own `self`.
+  if (type == "FunctionDef" && !method)
+    return collect_attribute_stores(node["body"], owner, &node);
+
+  if (const nlohmann::json *target = attribute_store_target(node, type))
+    if (
+      const auto stored =
+        stored_function(*target, node["value"], owner, method))
+      return record_function_store(
+        (*target)["attr"].get<std::string>(), *stored);
+
+  if (node.is_structured())
+    for (const auto &child : node)
+      collect_attribute_stores(child, owner, method);
+}
+
+const python_converter::attribute_functions *
+python_converter::function_attribute(const std::string &attr)
+{
+  const auto [module, unscanned] =
+    attribute_functions_.try_emplace(ast_json, std::in_place);
+  if (unscanned)
+    collect_attribute_stores((*ast_json)["body"], "", nullptr);
+  if (!module->second)
+    return nullptr;
+  const auto held = module->second->find(attr);
+  return held == module->second->end() || !held->second ? nullptr
+                                                        : &*held->second;
 }
 
 symbolt *python_converter::find_function_in_base_classes(
@@ -472,6 +966,9 @@ symbolt *python_converter::find_function_in_base_classes(
         base_class_node, base_class, method_name, is_ctor))
       return func;
 
+    if (symbolt *func = find_method_in_model_base(base_class, sym_id))
+      return func;
+
     // Not defined directly in this base: descend into its own bases so a
     // method inherited from a grandparent (or higher) still resolves.
     if (
@@ -511,6 +1008,47 @@ import_lookup_name(const std::string &id, const ::symbol_id &parsed)
   if (!parsed.get_function().empty())
     return parsed.get_function();
   return parsed.get_object();
+}
+
+/// The imports of the module being converted, top-level ones first and then
+/// those directly inside its functions. `from pkg import mod` names pkg's own
+/// file, so each submodule it binds follows it as an import of that
+/// submodule's file, held in @p submodules (#8375).
+std::vector<const nlohmann::json *>
+python_converter::import_nodes(std::deque<nlohmann::json> &submodules) const
+{
+  std::vector<const nlohmann::json *> imports;
+  auto add = [&](const nlohmann::json &node) {
+    const std::string type = node.value("_type", "");
+    if (type != "Import" && type != "ImportFrom")
+      return;
+    imports.push_back(&node);
+    if (type != "ImportFrom" || node["module"].is_null())
+      return;
+    for (const auto &alias : node["names"])
+    {
+      const auto submodule = imported_modules.find(
+        node["module"].get<std::string>() + "." +
+        alias["name"].get<std::string>());
+      if (submodule == imported_modules.end())
+        continue;
+      nlohmann::json &import = submodules.emplace_back();
+      import["_type"] = "Import";
+      import["full_path"] = submodule->second;
+      imports.push_back(&import);
+    }
+  };
+
+  const nlohmann::json &body = (*ast_json)["body"];
+  for (const auto &node : body)
+    add(node);
+  for (const auto &node : body)
+    if (
+      node["_type"] == "FunctionDef" && node.contains("body") &&
+      node["body"].is_array())
+      for (const auto &stmt : node["body"])
+        add(stmt);
+  return imports;
 }
 
 symbolt *
@@ -620,26 +1158,10 @@ python_converter::find_imported_symbol(const std::string &symbol_id) const
     return nullptr;
   };
 
-  for (const auto &obj : (*ast_json)["body"])
-  {
-    if (symbolt *func_symbol = find_in_import(obj))
+  std::deque<nlohmann::json> submodules;
+  for (const nlohmann::json *import : import_nodes(submodules))
+    if (symbolt *func_symbol = find_in_import(*import))
       return func_symbol;
-  }
-
-  // Also check imports inside function bodies.
-  for (const auto &obj : (*ast_json)["body"])
-  {
-    if (
-      obj["_type"] == "FunctionDef" && obj.contains("body") &&
-      obj["body"].is_array())
-    {
-      for (const auto &stmt : obj["body"])
-      {
-        if (symbolt *func_symbol = find_in_import(stmt))
-          return func_symbol;
-      }
-    }
-  }
 
   return nullptr;
 }
@@ -783,6 +1305,25 @@ bool python_converter::is_imported_module(const std::string &module_name) const
 std::string python_converter::current_module_name() const
 {
   return std::filesystem::path(current_python_file).stem().string();
+}
+
+std::string python_converter::current_ast_scope() const
+{
+  if (
+    current_class_name_.empty() || current_func_name_.empty() ||
+    current_func_name_.find("@C@") != std::string::npos)
+    return current_func_name_;
+
+  const std::string outer =
+    json_utils::split_function_path(current_func_name_).front();
+  // __init__ is converted under its class's name.
+  const std::string method =
+    current_class_name_ + "@C@" +
+    (outer == current_class_name_ ? "__init__" : outer);
+  // A class nested in a function or class is not reachable as Cls@C@m.
+  if (json_utils::find_function_by_path(*ast_json, {method}).empty())
+    return current_func_name_;
+  return method + current_func_name_.substr(outer.size());
 }
 
 symbolt &python_converter::create_tmp_symbol(

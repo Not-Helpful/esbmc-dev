@@ -1,5 +1,6 @@
 #pragma once
 
+#include <irep2/irep2.h>
 #include <nlohmann/json.hpp>
 #include <python-frontend/type/element_type_registry.h>
 #include <util/irep/type.h>
@@ -547,6 +548,10 @@ public:
     const nlohmann::json &slice_node,
     const nlohmann::json &value_node);
 
+  void handle_subscript_assign_none(
+    const exprt &list_expr,
+    const nlohmann::json &slice_node);
+
   exprt compare(const exprt &l1, const exprt &l2, const std::string &op);
 
   exprt contains(const exprt &item, const exprt &list);
@@ -556,6 +561,33 @@ public:
     const nlohmann::json &right_node,
     const exprt &lhs,
     const exprt &rhs);
+
+  /**
+   * @brief Turn the store @p lhs = @p rhs into a replacement of the element
+   * record when the value cannot be written through the element's type.
+   *
+   * @p lhs is the subscript target `*(T *)item->value` of the list subscript
+   * this handler was built for. When @p rhs is a tuple of another type than T
+   * (or T is a tuple and @p rhs is not), the pair is rewritten into
+   * `*item = *list_at(tmp, 0)`, with tmp a list holding @p rhs, so the slot
+   * gets the new value, type_id and size. Otherwise both are left unchanged.
+   */
+  void retype_element_store(exprt &lhs, exprt &rhs);
+
+  /// Records @p elem_type as the type of the element @p subscript stores to.
+  void record_element_store(
+    const nlohmann::json &subscript,
+    const std::string &elem_id,
+    const typet &elem_type);
+
+  /// Equality of two list elements read as @p lhs_type and @p rhs_type for
+  /// compare()'s fast path, or nullopt when it cannot relate them. Both types
+  /// are numeric, bool or tuple.
+  std::optional<expr2tc> fast_elem_equality(
+    exprt lhs_val,
+    exprt rhs_val,
+    const typet &lhs_type,
+    const typet &rhs_type) const;
 
   exprt build_push_list_call(
     const symbolt &list,
@@ -595,7 +627,16 @@ public:
   typet bare_list_param_elem_type(
     const nlohmann::json &param_node,
     const std::string &param_id,
-    const typet &annotated);
+    const typet &annotated,
+    size_t index);
+
+  /// True when the recorded elements of \p id mix a list with another type.
+  bool mixes_list_and_other(const std::string &id) const;
+
+  /// Refuses a read that no single recorded element type answers (#8472).
+  void reject_unresolved_element_read(
+    const exprt &array,
+    const nlohmann::json &slice_node) const;
 
   /**
    * @brief Create an empty set
@@ -621,6 +662,16 @@ public:
     const symbolt &list,
     const exprt &index,
     const nlohmann::json &element);
+
+  /**
+   * @brief Inside a try body, raises a catchable IndexError ahead of a pop()
+   * whose list is empty or whose index is out of range, before
+   * __ESBMC_list_pop asserts it
+   */
+  void guard_pop_index(
+    const symbolt &list,
+    const exprt &index,
+    const locationt &location);
 
   /// The __ESBMC_list_set_at call storing `rhs` into the list element `lhs`
   /// reads, when `rhs` changes the element's type; nullopt otherwise.
@@ -813,6 +864,18 @@ public:
    */
   BigInt uniform_elem_size(const exprt &list) const;
 
+  /// Whether the list stored at index @p i of @p list is the one @p elem holds
+  /// now. The type map names a nested element by the symbol it was appended
+  /// from, and a later assignment can rebind that symbol when it is a user
+  /// variable.
+  expr2tc
+  stored_element_is(const symbolt &list, std::size_t i, const symbolt &elem);
+
+  /// The element type a subscript's base declares when the type map has no
+  /// record of the list: a name's annotation, or a called function's return
+  /// annotation. Empty when neither gives one.
+  typet unrecorded_base_elem_type();
+
   // True when the list's recorded element types include a tagged scalar, whose
   // payload width is per-element and symbolic (#7716).
   bool has_tagged_elements(const exprt &list) const;
@@ -877,6 +940,40 @@ public:
     codet &target_block);
 
 private:
+  /// Emits `size = len(list_expr)` and a ValueError unless it fits @p fixed
+  /// targets (at least @p fixed when @p starred); returns the size.
+  exprt check_unpack_length(
+    const exprt &list_expr,
+    size_t fixed,
+    bool starred,
+    const locationt &loc,
+    codet &target_block);
+
+  typet unpack_elem_type(
+    const std::string &list_id,
+    size_t i,
+    const typet &fallback) const;
+
+  /// The recorded index @p from_end entries from the end, or SIZE_MAX.
+  size_t
+  recorded_index_from_end(const std::string &list_id, size_t from_end) const;
+
+  void record_starred_elem_types(
+    const std::string &list_id,
+    const std::string &star_id,
+    size_t before_star,
+    size_t after_star,
+    const typet &elem_type);
+
+  /// Binds @p val, element @p i of the list @p list_id, to @p tgt_node.
+  void assign_unpack_target(
+    const nlohmann::json &ast_node,
+    const nlohmann::json &tgt_node,
+    const std::string &list_id,
+    size_t i,
+    const exprt &val,
+    codet &target_block);
+
   friend class python_dict_handler;
 
   // Evaluates value_node once and snapshots it into a fresh temporary, so a
@@ -991,6 +1088,10 @@ private:
     const exprt &array,
     const nlohmann::json &col_index_node);
 
+  std::optional<exprt> try_build_numpy_view_subview(
+    const exprt &array,
+    const nlohmann::json &slice_node);
+
   std::optional<exprt> try_copy_numpy_pointer_view_slice(
     const exprt &array,
     const typet &elem_type,
@@ -1023,8 +1124,9 @@ private:
 
   /// Emits the runtime offset/stride/length of a[lo:hi:st] over a length-n
   /// axis, raising ValueError for st == 0.
-  symbolic_slice_params
-  emit_symbolic_slice_params(const nlohmann::json &slice_node, long long n);
+  symbolic_slice_params emit_symbolic_slice_params(
+    const nlohmann::json &slice_node,
+    const exprt &extent);
 
   /**
    * @brief a[lo:hi:st] with a non-literal step st. Assigned to a bare name it

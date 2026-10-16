@@ -411,6 +411,20 @@ protected:
    */
   virtual void assume(const expr2tc &assumption);
 
+  /**
+   *  Hold back the assume that ends a path at a Python assert (#8242).
+   *  A later Python assert fails whether or not an earlier one ended the
+   *  path, so only other claims need it; claim() emits it before them.
+   *  Keeping it out of the equation until then spares each later
+   *  assertion and guard check the earlier assertions' constraints.
+   *  @param assumption The assert's condition.
+   */
+  virtual void defer_assumption(const expr2tc &assumption);
+
+  /** Before a claim that needs them, emit every deferred assumption into
+   *  the target equation. */
+  void flush_deferred_assumptions();
+
   // gotos
   /**
    *  Merge converging states into current state.
@@ -654,6 +668,10 @@ protected:
     reachability_treet &art);
   /** Perform terminate_thread; Record thread as terminated. */
   void intrinsic_terminate_thread(reachability_treet &art);
+  /** Perform havoc_object; assign nondet to every object the argument may
+   *  point to, whole and of any size. k-induction emits it at a loop head for
+   *  a pointer the loop writes through at offsets it cannot bound. */
+  void intrinsic_havoc_object(const code_function_call2t &call);
   /** Perform init_thread_local; seeds each `__thread`-qualified global
    *  to its static initializer in the active thread's renaming scope. */
   void intrinsic_init_thread_local(reachability_treet &art);
@@ -836,13 +854,16 @@ protected:
    *  @param new_array The newly allocated array symbol.
    *  @param guard Guard condition for this assignment.
    *  @param realloc_size The size parameter passed to realloc.
+   *  @param alloc_fail Failure condition from model_allocation_failure, or
+   *  nil when realloc cannot fail.
    */
   void finalize_realloc_result(
     const expr2tc &lhs,
     const expr2tc &result,
     const expr2tc &new_array,
     const guard2tc &guard,
-    const expr2tc &realloc_size);
+    const expr2tc &realloc_size,
+    const expr2tc &alloc_fail);
 
   /**
    *  Update pointer validity information after realloc.
@@ -865,13 +886,16 @@ protected:
    *  @param result The result pointer from realloc attempt.
    *  @param old_ptr The original pointer being reallocated.
    *  @param guard Guard condition for this modeling.
+   *  @param alloc_fail Set to the failure condition, or nil when realloc
+   *  cannot fail.
    *  @return Expression representing the final result considering failure.
    */
   expr2tc model_allocation_failure(
     const expr2tc &result,
     const expr2tc &old_ptr,
     const guard2tc &guard,
-    const expr2tc &over_cap);
+    const expr2tc &over_cap,
+    expr2tc &alloc_fail);
 
   /**
    *  Bound at PTRDIFF_MAX the object size an assignment records, reporting a
@@ -1422,15 +1446,26 @@ protected:
     const type2tc &char_type,
     std::vector<expr2tc> &chars);
   /** The length of an unrenamed printf-family call's output whose constant
-   *  format holds only text and %d, %i or %u conversions without flags,
+   *  format holds only text and %d, %i, %u or %s conversions without flags,
    *  width or precision, with its largest value in `max_len`; nil for any
    *  other format. */
   expr2tc printf_output_length(
     const code_printf2t &call,
     size_t fmt_idx,
     size_t &max_len);
-  /** Assume a printf-family call's return value equals the length of the
-   *  output stored, when both are known. */
+  /** The characters a %s conversion prints for the unrenamed char pointer
+   *  `ptr`, adding its largest value to `max_len`; nil unless `ptr` resolves
+   *  to one byte array at a constant offset. */
+  expr2tc string_length(const expr2tc &ptr, size_t &max_len);
+  /** Store an unrenamed sprintf-family call's output and return the length
+   *  that call returns: the stored length, or for printf, fprintf and dprintf
+   *  with a used result, printf_output_length. Nil when unknown. */
+  expr2tc printf_return_length(
+    const expr2tc &lhs,
+    const code_printf2t &call,
+    size_t fmt_idx);
+  /** Assume a printf-family call's return value equals the length of its
+   *  output, when both are known. */
   void assume_printf_length(const expr2tc &retval, const expr2tc &len);
   /** Run `formatter` over an unrenamed printf-family call; false when the
    *  format is not a constant. `constant_args` is set when every argument
@@ -1583,6 +1618,19 @@ protected:
    *  away the originals' assignments and degrades counterexamples.
    */
   std::unordered_map<irep_idt, expr2tc> copy_definitions;
+
+  struct deferred_assumptiont
+  {
+    expr2tc guard;
+    expr2tc cond;
+    symex_targett::sourcet source;
+    unsigned loop_number;
+  };
+  /** Assumptions defer_assumption() holds back, in program order. */
+  std::vector<deferred_assumptiont> deferred_assumptions;
+  /** Set while claim() handles a Python assert's own condition, which needs
+   *  no deferred assumption. */
+  bool claim_skips_deferred = false;
 
   /** The renamed byte size each heap object was allocated with, by symbol.
    *  __ESBMC_alloc_size holds it too, but symex cannot read that array back,
