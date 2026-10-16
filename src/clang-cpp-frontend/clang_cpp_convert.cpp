@@ -123,6 +123,23 @@ bool clang_cpp_convertert::get_decl(const clang::Decl &decl, exprt &new_expr)
       return true;
     break;
   }
+  // NEW
+  case clang::Decl::ExplicitInstantiation:
+  {
+    const clang::ExplicitInstantiationDecl &ei =
+      static_cast<const clang::ExplicitInstantiationDecl &>(decl);
+
+
+    if (get_decl(*ei.getSpecialization(), new_expr))
+      return true;
+    break;
+  }
+  // NEW - TODO: Complete
+  case clang::Decl::FileScopeAsm:
+  {
+    DBM_PRINT("ASM ENCOUNTERED");
+    break;
+  }
 
   case clang::Decl::VarTemplate:
   {
@@ -942,8 +959,6 @@ bool clang_cpp_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
   locationt location;
   get_start_location_from_stmt(stmt, location);
 
-
-
   switch (stmt.getStmtClass())
   {
   case clang::Stmt::CXXReinterpretCastExprClass:
@@ -1037,8 +1052,7 @@ bool clang_cpp_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
   // No check is needed because ESBMC filters out dependent nodes
   case clang::Stmt::RequiresExprClass:
   {
-    const auto &requires_expr =
-      static_cast<const clang::RequiresExpr &>(stmt);
+    const auto &requires_expr = static_cast<const clang::RequiresExpr &>(stmt);
 
     if (requires_expr.isSatisfied())
       new_expr = true_exprt();

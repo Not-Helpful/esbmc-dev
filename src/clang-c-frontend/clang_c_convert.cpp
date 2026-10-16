@@ -2473,7 +2473,7 @@ bool clang_c_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
   case clang::Stmt::RequiresExprClass:
   {
     const auto &requires_expr = static_cast<const clang::RequiresExpr &>(stmt);
-   new_expr = requires_expr.isSatisfied() ? new_expr = true_exprt()
+    new_expr = requires_expr.isSatisfied() ? new_expr = true_exprt()
                                            : new_expr = false_exprt();
 
     break;
@@ -6129,13 +6129,25 @@ bool clang_c_convertert::get_APValue_expr(
   {
   case clang::APValue::LValue:
   {
-    // This is probably a string constant
     clang::APValue::LValueBase base = value.getLValueBase();
-    assert(base.is<const clang::Expr *>());
-    const clang::Expr *expr = base.get<const clang::Expr *>();
-    if (get_expr(*expr, new_expr))
-      return true;
-    break;
+
+    if (const auto *e = base.dyn_cast<const clang::Expr *>())
+    {
+      if (get_expr(*e, new_expr))
+        return true;
+      break;
+    }
+
+    // Not an Expr: report what it is and where we are
+    std::string what = "unknown";
+    if (const auto *vd = base.dyn_cast<const clang::ValueDecl *>())
+      DBM_PRINT("ValueDecl");      
+    else if (base.is<clang::TypeInfoLValue>())
+      DBM_PRINT("TypeInfoLValue");      
+    else if (base.is<clang::DynamicAllocLValue>())
+      DBM_PRINT("DynamicAllocLValue");      
+
+    return true;
   }
 
   case clang::APValue::Int:
