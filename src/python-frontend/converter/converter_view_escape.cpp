@@ -19,6 +19,13 @@ namespace
 const char *const view_use_error =
   "TypeError: passing a numpy view to a function that is not a single return "
   "expression over its parameters is not supported";
+const char *const live_copy_call_error =
+  "TypeError: passing a numpy view to a function while a copied view of its "
+  "storage is live is not supported";
+const char *const unnamed_view_argument_error =
+  "TypeError: passing a numpy view expression that is not bound to a name to "
+  "a function that is not a single return expression over its parameters is "
+  "not supported";
 const char *const returned_view_error =
   "TypeError: returning a copied numpy view is not supported";
 const char *const multi_path_return_error =
@@ -100,6 +107,91 @@ bool references_name(const nlohmann::json &node, const std::string &name)
     found = found || id["id"].get<std::string>() == name;
   });
   return found;
+}
+
+// Calls `visit` on every `return` in the scope that owns `node`.
+void for_each_return(
+  const nlohmann::json &node,
+  const std::function<void(const nlohmann::json &)> &visit)
+{
+  if (!node.is_object() && !node.is_array())
+    return;
+  const std::string kind = node.is_object() ? node.value("_type", "") : "";
+  if (
+    kind == "FunctionDef" || kind == "AsyncFunctionDef" || kind == "Lambda" ||
+    kind == "ClassDef")
+    return;
+  if (kind == "Return")
+    visit(node);
+  for (const auto &child : node)
+    for_each_return(child, visit);
+}
+
+std::size_t count_stores(const nlohmann::json &node, const std::string &name)
+{
+  std::size_t stores = 0;
+  for_each_name(node, [&](const nlohmann::json &id) {
+    const std::string ctx =
+      id.contains("ctx") ? id["ctx"].value("_type", "") : "";
+    if (id["id"].get<std::string>() == name && ctx != "Load")
+      ++stores;
+  });
+  return stores;
+}
+
+// Index of the parameter that `name` denotes in `func_node`: a parameter the
+// body never rebinds, or a local bound once, at the top level of the body, to
+// such a parameter.
+std::optional<std::size_t>
+aliased_param_index(const nlohmann::json &func_node, const std::string &name)
+{
+  const nlohmann::json &body = func_node["body"];
+  const nlohmann::json &params = func_node["args"]["args"];
+  const std::size_t stores = count_stores(body, name);
+  if (stores == 0)
+  {
+    for (std::size_t i = 0; i < params.size(); ++i)
+      if (params[i].value("arg", "") == name)
+        return i;
+    return std::nullopt;
+  }
+  if (stores != 1)
+    return std::nullopt;
+  for (const auto &stmt : body)
+  {
+    const std::string kind = stmt.value("_type", "");
+    const nlohmann::json *target = nullptr;
+    if (kind == "Assign" && stmt["targets"].size() == 1)
+      target = &stmt["targets"][0];
+    else if (kind == "AnnAssign")
+      target = &stmt["target"];
+    if (
+      target != nullptr && is_name(*target) &&
+      (*target)["id"].get<std::string>() == name && stmt.contains("value") &&
+      is_name(stmt["value"]) && count_stores(body, stmt["value"]["id"]) == 0)
+      return aliased_param_index(func_node, stmt["value"]["id"]);
+  }
+  return std::nullopt;
+}
+
+// Index of the parameter every `return` of `func_node` yields. The body must
+// end in a `return`, so no path falls off the end and yields None.
+std::optional<std::size_t> returned_param_index(const nlohmann::json &func_node)
+{
+  const nlohmann::json &body = func_node["body"];
+  if (body.empty() || body.back().value("_type", "") != "Return")
+    return std::nullopt;
+  std::optional<std::size_t> result;
+  bool same_param = true;
+  for_each_return(body, [&](const nlohmann::json &ret) {
+    const std::optional<std::size_t> index =
+      ret.contains("value") && is_name(ret["value"])
+        ? aliased_param_index(func_node, ret["value"]["id"])
+        : std::nullopt;
+    same_param = same_param && index && (!result || *result == *index);
+    result = index;
+  });
+  return same_param ? result : std::nullopt;
 }
 
 // Calls whose only use of an array argument is to read it.
@@ -290,22 +382,6 @@ std::optional<nlohmann::json> straight_line_return_value(
   return std::nullopt;
 }
 
-// Every `return` value under `node`, through nested blocks but not nested
-// definitions.
-void collect_return_values(
-  const nlohmann::json &node,
-  std::vector<nlohmann::json> &values)
-{
-  if (!node.is_object() && !node.is_array())
-    return;
-  const std::string type = node.is_object() ? node.value("_type", "") : "";
-  if (type == "FunctionDef" || type == "ClassDef" || type == "Lambda")
-    return;
-  if (type == "Return" && node.contains("value") && !node["value"].is_null())
-    values.push_back(node["value"]);
-  for (const auto &child : node)
-    collect_return_values(child, values);
-}
 } // namespace
 
 std::string
@@ -331,14 +407,37 @@ python_converter::numpy_view_storage_root(const std::string &id) const
   return resolve_numpy_array_storage_alias_id(current);
 }
 
+// Every storage `id` may view: its root, and for a view bound to different
+// arrays on different paths the roots of the others.
+std::set<std::string>
+python_converter::numpy_view_storage_roots(const std::string &id) const
+{
+  std::set<std::string> roots = {numpy_view_storage_root(id)};
+  std::set<std::string> seen;
+  for (std::string current = id; seen.insert(current).second;)
+  {
+    const auto view = numpy_pointer_view_info_.find(current);
+    if (view == numpy_pointer_view_info_.end())
+      break;
+    for (const std::string &other : view->second.other_sources)
+      roots.insert(numpy_view_storage_root(other));
+    current = view->second.source_id;
+  }
+  return roots;
+}
+
 bool python_converter::is_numpy_storage_escaped(
   const nlohmann::json &name) const
 {
   if (numpy_escaped_storage_.empty())
     return false;
   const std::string id = resolve_name_symbol_id(name["id"].get<std::string>());
-  return !id.empty() &&
-         numpy_escaped_storage_.count(numpy_view_storage_root(id)) != 0;
+  if (id.empty())
+    return false;
+  for (const std::string &root : numpy_view_storage_roots(id))
+    if (numpy_escaped_storage_.count(root) != 0)
+      return true;
+  return false;
 }
 
 // True when every name the return expression reads is a parameter, a module
@@ -415,6 +514,9 @@ python_converter::fold_numpy_view_call(const nlohmann::json &call)
   // Fold only where a view is involved: one passed in, or one returned (a
   // subscript that reads a single element returns no view).
   nlohmann::json folded = substitute_call_arguments(*value, call);
+  // Inlining a local view into a call would pass the callee a temporary.
+  if (contains_unnamed_numpy_view_argument(folded))
+    return std::nullopt;
   // A subscript of a numpy call (`np.array(...)[0]`, a local array inlined)
   // is a view of that fresh array.
   std::vector<nlohmann::json> indices;
@@ -448,12 +550,60 @@ bool python_converter::bind_numpy_pointer_view_alias(
   return true;
 }
 
+bool python_converter::returns_bound_numpy_view_param(
+  const nlohmann::json &func_node)
+{
+  const std::optional<std::size_t> index = returned_param_index(func_node);
+  return index && is_bound_numpy_view_param(
+                    func_node["name"].get<std::string>(), *index);
+}
+
+const nlohmann::json *
+python_converter::returned_numpy_view_argument(const nlohmann::json &call)
+{
+  if (!is_named_call(call))
+    return nullptr;
+  const nlohmann::json func_node = json_utils::try_find_function(
+    (*ast_json)["body"], call["func"]["id"].get<std::string>());
+  if (func_node.empty() || !returns_bound_numpy_view_param(func_node))
+    return nullptr;
+  const std::size_t index = *returned_param_index(func_node);
+  if (index >= call["args"].size())
+    return nullptr;
+  const nlohmann::json &arg = call["args"][index];
+  return is_name(arg) && contains_tracked_numpy_view_name(arg) ? &arg : nullptr;
+}
+
+// `ret = f(view)` where f always returns that parameter: run the call for its
+// effects and bind `ret` to the argument, which carries the view metadata.
+bool python_converter::try_bind_returned_numpy_view_param(
+  const nlohmann::json &ast_node,
+  codet &target_block)
+{
+  if (!ast_node.contains("value") || !ast_node["value"].is_object())
+    return false;
+  const nlohmann::json *arg = returned_numpy_view_argument(ast_node["value"]);
+  if (arg == nullptr)
+    return false;
+  numpy_discarded_call_ = &ast_node["value"];
+  exprt call = get_expr(ast_node["value"]);
+  numpy_discarded_call_ = nullptr;
+  if (call != exprt())
+    target_block.copy_to_operands(convert_expression_to_code(call));
+  nlohmann::json alias = ast_node;
+  alias["value"] = *arg;
+  get_var_assign(alias, target_block);
+  return true;
+}
+
 void python_converter::get_folded_var_assign(
   const nlohmann::json &ast_node,
   codet &target_block)
 {
   reject_numpy_view_container_store(ast_node);
-  if (try_bind_numpy_view_container(ast_node, target_block))
+  if (
+    try_bind_numpy_view_container(ast_node, target_block) ||
+    try_bind_returned_numpy_view_param(ast_node, target_block))
     return;
   std::optional<nlohmann::json> folded =
     ast_node.contains("value") ? fold_numpy_view_call(ast_node["value"])
@@ -496,7 +646,7 @@ void python_converter::reject_multi_path_numpy_view_return(
     (*ast_json)["body"], call["func"]["id"].get<std::string>());
   std::vector<nlohmann::json> values;
   if (!func_node.empty())
-    collect_return_values(func_node["body"], values);
+    json_utils::collect_return_values(func_node["body"], values);
   if (values.size() < 2)
     return;
   for (const nlohmann::json &value : values)
@@ -515,7 +665,38 @@ void python_converter::reject_unfoldable_numpy_view_call(
     throw std::runtime_error(returned_view_error);
   if (numpy_fold_only_functions_.count(func_name) != 0)
     throw std::runtime_error(unfolded_call_error);
+  if (&call != numpy_discarded_call_ && returned_numpy_view_argument(call))
+    throw std::runtime_error(returned_view_error);
   reject_multi_path_numpy_view_return(call);
+}
+
+// Whether an argument hands the callee a view: `len(v)`, `v.shape` and an
+// element read name one but pass a scalar.
+bool python_converter::passes_numpy_view(const nlohmann::json &arg)
+{
+  if (arg.is_array())
+    return std::any_of(arg.begin(), arg.end(), [this](const auto &element) {
+      return passes_numpy_view(element);
+    });
+  return contains_tracked_numpy_view_name(arg) && holds_numpy_view(arg) &&
+         !is_scalar_numpy_view_call(arg);
+}
+
+// A call that binds every view it receives as a view parameter returns a
+// view only when it returns that parameter: any other view return is
+// rejected where the callee is converted.
+bool python_converter::is_scalar_numpy_view_call(const nlohmann::json &call)
+{
+  if (!is_named_call(call) || returned_numpy_view_argument(call) != nullptr)
+    return false;
+  const std::string name = call["func"]["id"].get<std::string>();
+  if (!call.value("keywords", nlohmann::json::array()).empty())
+    return false;
+  for (std::size_t i = 0; i < call["args"].size(); ++i)
+    if (
+      passes_numpy_view(call["args"][i]) && !is_bound_numpy_view_param(name, i))
+      return false;
+  return true;
 }
 
 // Only a user function that never touches the parameter can receive a view
@@ -524,31 +705,109 @@ void python_converter::reject_unfoldable_numpy_view_call(
 void python_converter::reject_numpy_view_argument_use(
   const nlohmann::json &call)
 {
-  const nlohmann::json func_node = json_utils::try_find_function(
-    (*ast_json)["body"], call["func"]["id"].get<std::string>());
+  const std::string func_name = call["func"]["id"].get<std::string>();
+  const nlohmann::json func_node =
+    json_utils::try_find_function((*ast_json)["body"], func_name);
   reject_numpy_view_callee(call);
   if (func_node.empty())
     throw std::runtime_error(unknown_function_error);
   const nlohmann::json &params = func_node["args"]["args"];
   for (std::size_t i = 0; i < call["args"].size(); ++i)
     if (
-      contains_tracked_numpy_view_name(call["args"][i]) &&
+      passes_numpy_view(call["args"][i]) &&
       (i >= params.size() ||
        references_name(func_node["body"], params[i].value("arg", ""))))
-      throw std::runtime_error(view_use_error);
+    {
+      if (!is_bound_numpy_view_param(func_name, i))
+        throw std::runtime_error(view_use_error);
+    }
+}
+
+// A callee may write through a bound view parameter, which a copied view of
+// the same storage would not see.
+void python_converter::reject_live_numpy_view_copies_of(
+  const nlohmann::json &args)
+{
+  for_each_name(args, [&](const nlohmann::json &name) {
+    const std::string id =
+      resolve_name_symbol_id(name["id"].get<std::string>());
+    if (id.empty() || numpy_pointer_view_info_.count(id) == 0)
+      return;
+    const std::set<std::string> roots = numpy_view_storage_roots(id);
+    for (const auto &copy : numpy_view_copy_sources_)
+      if (
+        (copy.second == id || roots.count(copy.second) != 0) &&
+        numpy_pointer_view_info_.count(copy.first) == 0)
+        throw std::runtime_error(live_copy_call_error);
+  });
+}
+
+// A bound view parameter aliases its argument only when that argument is a
+// name: any other expression is evaluated into a temporary the callee would
+// write to instead. A body that is one return expression cannot write.
+bool python_converter::passes_unnamed_numpy_view_argument(
+  const nlohmann::json &call)
+{
+  const std::string func_name = call["func"]["id"].get<std::string>();
+  for (std::size_t i = 0; i < call["args"].size(); ++i)
+  {
+    if (is_name(call["args"][i]) || !is_bound_numpy_view_param(func_name, i))
+      continue;
+    const nlohmann::json func_node =
+      json_utils::try_find_function((*ast_json)["body"], func_name);
+    if (
+      !func_node.empty() &&
+      !straight_line_return_value(func_node["body"], imported_modules))
+      return true;
+  }
+  return false;
+}
+
+bool python_converter::contains_unnamed_numpy_view_argument(
+  const nlohmann::json &node)
+{
+  if (!node.is_object() && !node.is_array())
+    return false;
+  if (is_named_call(node) && passes_unnamed_numpy_view_argument(node))
+    return true;
+  return std::any_of(node.begin(), node.end(), [this](const auto &child) {
+    return contains_unnamed_numpy_view_argument(child);
+  });
 }
 
 void python_converter::track_numpy_view_call_escape(const nlohmann::json &call)
 {
   if (!is_named_call(call))
     return;
+  if (passes_unnamed_numpy_view_argument(call))
+    throw std::runtime_error(unnamed_view_argument_error);
+  reject_unbound_runtime_numpy_view_call(call);
   reject_unfoldable_numpy_view_call(call);
   if (
-    !contains_tracked_numpy_view_name(call["args"]) ||
+    !passes_numpy_view(call["args"]) ||
     is_value_builtin(call["func"]["id"].get<std::string>()) ||
     fold_numpy_view_call(call))
     return;
   reject_numpy_view_argument_use(call);
+
+  // Every view arg that maps to a registered view-parameter binding is
+  // handled through the callee's own metadata; its storage does not escape.
+  // Skip the escape loop when all view args in this call are bound.
+  {
+    const std::string fname = call["func"]["id"].get<std::string>();
+    bool all_bound = true;
+    for (std::size_t i = 0; i < call["args"].size() && all_bound; ++i)
+      if (
+        passes_numpy_view(call["args"][i]) &&
+        !is_bound_numpy_view_param(fname, i))
+        all_bound = false;
+    if (all_bound)
+    {
+      reject_numpy_view_argument_type_mismatch(call);
+      reject_live_numpy_view_copies_of(call["args"]);
+      return;
+    }
+  }
 
   // Not assumed read-only: the callee may keep or mutate what it received.
   for_each_name(call["args"], [&](const nlohmann::json &name) {
@@ -558,7 +817,10 @@ void python_converter::track_numpy_view_call_escape(const nlohmann::json &call)
       !id.empty() &&
       (numpy_array_symbols_.count(id) != 0 ||
        numpy_pointer_view_info_.count(id) != 0 || is_tracked_numpy_view_id(id)))
-      numpy_escaped_storage_.insert(numpy_view_storage_root(id));
+    {
+      const std::set<std::string> roots = numpy_view_storage_roots(id);
+      numpy_escaped_storage_.insert(roots.begin(), roots.end());
+    }
   });
 }
 
@@ -914,7 +1176,8 @@ bool python_converter::numpy_subscript_yields_view(
 // subscript that yields one. A scalar read out of a view is not a view.
 bool python_converter::holds_numpy_view(const nlohmann::json &node) const
 {
-  if (!node.is_object() && !node.is_array())
+  // `len(v)` and `v.shape` are scalars, whatever they are taken of.
+  if ((!node.is_object() && !node.is_array()) || is_shape_query(node))
     return false;
   if (is_name(node))
   {
@@ -1172,11 +1435,13 @@ bool python_converter::is_numpy_storage_syntax(
 // each call is folded, so its body is never needed -- and, read on its own,
 // its untyped parameter would be rejected by the numpy consumers it calls.
 bool python_converter::is_fold_only_numpy_function(
-  const nlohmann::json &function_node) const
+  const nlohmann::json &function_node)
 {
   const std::optional<nlohmann::json> returned =
     straight_line_return_value(function_node["body"], imported_modules);
-  if (!current_func_name_.empty() || !returned)
+  if (
+    !current_func_name_.empty() || !returned ||
+    contains_unnamed_numpy_view_argument(*returned))
     return false;
   // A function that returns a view of its argument folds for any array.
   std::vector<nlohmann::json> indices;
@@ -1231,7 +1496,7 @@ bool python_converter::accepts_numpy_view_binding(
   const std::string &lhs_id,
   const numpy_scalar_pointer_view_infot &candidate,
   const typet &view_ptr_type,
-  const exprt &source) const
+  const exprt &source)
 {
   const auto bound = numpy_pointer_view_info_.find(lhs_id);
   if (bound == numpy_pointer_view_info_.end())
@@ -1240,16 +1505,158 @@ bool python_converter::accepts_numpy_view_binding(
   const symbolt *symbol = symbol_table_.find_symbol(lhs_id);
   const bool same_layout =
     symbol && symbol->get_type() == view_ptr_type && !current.is_symbolic() &&
-    current.length == candidate.length && current.stride == candidate.stride &&
-    current.readonly == candidate.readonly &&
-    current.shape == candidate.shape && current.strides == candidate.strides;
+    same_numpy_view_kind(current, candidate) &&
+    same_view_layout({typet(), current}, {typet(), candidate});
   const bool same_storage =
     source.is_symbol() &&
     numpy_view_storage_root(source.identifier().as_string()) ==
       numpy_view_storage_root(lhs_id);
   if (same_layout && same_storage)
     return true;
-  if (block_nesting_ != function_body_depth_ + 1)
+  if (block_nesting_ == function_body_depth_ + 1)
+    return false;
+  merge_numpy_view_binding(
+    lhs_id,
+    symbol && symbol->get_type() == view_ptr_type && source.is_symbol() &&
+      same_numpy_view_kind(current, candidate));
+  return true;
+}
+
+bool python_converter::same_numpy_view_kind(
+  const numpy_scalar_pointer_view_infot &a,
+  const numpy_scalar_pointer_view_infot &b)
+{
+  return a.readonly == b.readonly && a.shape.size() == b.shape.size();
+}
+
+// Marks a view name as holding different views on different paths, or
+// rejects the binding when they are not of the same kind (pointer type,
+// rank, read-only state) or cannot be merged here.
+void python_converter::merge_numpy_view_binding(
+  const std::string &view_id,
+  bool same_kind)
+{
+  if (!same_kind || !can_merge_numpy_view_layouts(view_id))
     throw std::runtime_error(view_path_conflict_error);
+  numpy_merged_views_.insert(view_id);
+  // The builder replaces the metadata; the storages bound so far are kept
+  // aside and put back by record_numpy_view_layout.
+  const std::set<std::string> roots = numpy_view_storage_roots(view_id);
+  numpy_view_other_sources_[view_id].insert(roots.begin(), roots.end());
+}
+
+namespace
+{
+// Whether a function or lambda nested in `node` reads `name`.
+bool read_in_nested_function(
+  const nlohmann::json &node,
+  const std::string &name,
+  bool nested = false)
+{
+  if (!node.is_object() && !node.is_array())
+    return false;
+  if (nested && is_name(node) && node["id"] == name)
+    return true;
+  const std::string type = node.is_object() ? node.value("_type", "") : "";
+  const bool enters = type == "FunctionDef" || type == "Lambda";
+  for (const auto &child : node)
+    if (read_in_nested_function(child, name, nested || enters))
+      return true;
   return false;
+}
+} // namespace
+
+// A view name bound again on another path to a view with a different layout
+// or of another array can keep both: every binding stores its extents and
+// strides in the name's layout variables, which the metadata then refers
+// to, and the storages are all recorded. Code converted before this binding
+// read the earlier layout as constants, so it must not be able to run after it:
+// not in a loop, and not from a nested function.
+bool python_converter::can_merge_numpy_view_layouts(
+  const std::string &view_id) const
+{
+  const symbolt *symbol = symbol_table_.find_symbol(view_id);
+  const nlohmann::json scope =
+    current_func_name_.empty()
+      ? (*ast_json)["body"]
+      : json_utils::find_function_by_path(
+          *ast_json,
+          json_utils::split_function_path(current_func_name_))["body"];
+  return numpy_loop_depth_ == 0 && symbol != nullptr &&
+         numpy_view_layout_vars_.count(view_id) != 0 &&
+         !read_in_nested_function(scope, symbol->name.as_string());
+}
+
+// The variables holding the extent and stride of each axis of the view
+// bound to `view_id`: statics for a module-level name, locals declared at
+// the top of the function otherwise.
+const python_converter::numpy_runtime_view_layoutt &
+python_converter::numpy_view_layout_vars(
+  const std::string &view_id,
+  std::size_t rank)
+{
+  numpy_runtime_view_layoutt &vars = numpy_view_layout_vars_[view_id];
+  const symbolt &view = *symbol_table_.find_symbol(view_id);
+  const typet ll_type = signedbv_typet(64);
+  for (std::size_t axis = vars.extents.size(); axis < rank; ++axis)
+    for (std::vector<std::string> *ids : {&vars.extents, &vars.strides})
+    {
+      const std::string suffix = "$numpy_view$" + std::to_string(axis) +
+                                 (ids == &vars.extents ? "$extent" : "$stride");
+      symbolt symbol = create_symbol(
+        current_python_file,
+        view.name.as_string() + suffix,
+        view_id + suffix,
+        view.location,
+        ll_type);
+      symbol.lvalue = true;
+      symbol.file_local = true;
+      symbol.static_lifetime = current_func_name_.empty();
+      if (symbol.static_lifetime)
+        symbol.set_value(migrate_expr(gen_zero(ll_type)));
+      else
+        numpy_view_layout_locals_.push_back(view_id + suffix);
+      symbol_table_.add(symbol);
+      ids->push_back(view_id + suffix);
+    }
+  return vars;
+}
+
+// Stores the layout a view name was just bound to in its layout variables
+// and, once the name holds different layouts on different paths, points its
+// metadata at them.
+void python_converter::record_numpy_view_layout(
+  const std::string &view_id,
+  const std::string &storage_id)
+{
+  numpy_scalar_pointer_view_infot &info = numpy_pointer_view_info_.at(view_id);
+  // A view of a view may point wherever its parent may.
+  const auto parent = numpy_pointer_view_info_.find(storage_id);
+  if (parent != numpy_pointer_view_info_.end() && storage_id != view_id)
+    info.other_sources = parent->second.other_sources;
+  const symbolt *symbol = symbol_table_.find_symbol(view_id);
+  if (symbol == nullptr || symbol->is_parameter || !current_block)
+    return;
+  const std::size_t rank = std::max<std::size_t>(info.shape.size(), 1);
+  const numpy_runtime_view_layoutt &vars =
+    numpy_view_layout_vars(view_id, rank);
+  for (std::size_t axis = 0; axis < rank; ++axis)
+  {
+    current_block->copy_to_operands(code_assignt(
+      symbol_expr(*symbol_table_.find_symbol(vars.extents[axis])),
+      numpy_view_extent(info, axis)));
+    current_block->copy_to_operands(code_assignt(
+      symbol_expr(*symbol_table_.find_symbol(vars.strides[axis])),
+      numpy_view_stride(info, axis)));
+  }
+  if (numpy_merged_views_.count(view_id) == 0)
+    return;
+  const std::string root = numpy_view_storage_root(view_id);
+  for (const std::string &other : numpy_view_other_sources_[view_id])
+    if (other != root)
+      info.other_sources.insert(other);
+  info.shape.resize(rank);
+  info.strides.resize(rank, 1);
+  info.shape_symbols.assign(vars.extents.begin(), vars.extents.begin() + rank);
+  info.stride_symbols.assign(vars.strides.begin(), vars.strides.begin() + rank);
 }

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <goto-programs/destructor.h>
 #include <goto-programs/goto_convert_class.h>
 #include <irep2/irep2_utils.h>
 #include <util/arith/arith_tools.h>
@@ -1357,15 +1358,14 @@ void goto_convertt::make_temp_symbol(exprt &expr, goto_programt &dest)
   expr = symbol_expr(new_symbol);
 }
 
-bool goto_convertt::has_short_circuit_sideeffect(const exprt &expr)
+bool goto_convertt::has_destructible_sideeffect(const exprt &expr)
 {
-  if (
-    (expr.is_and() || expr.is_or() || expr.id() == "if") &&
-    has_sideeffect(expr))
+  code_function_callt destructor;
+  if (expr.id() == "sideeffect" && get_destructor(ns, expr.type(), destructor))
     return true;
 
   forall_operands (it, expr)
-    if (has_short_circuit_sideeffect(*it))
+    if (has_destructible_sideeffect(*it))
       return true;
 
   return false;
@@ -1376,17 +1376,13 @@ void goto_convertt::remove_condition_sideeffects(
   goto_programt &dest)
 {
   const locationt location = cond.find_location();
-  const bool short_circuit =
-    in_short_circuit || has_short_circuit_sideeffect(cond);
   const std::size_t stack_size = targets.destructor_stack.size();
   remove_sideeffects(cond, dest);
 
   destructor_stackt &stack = targets.destructor_stack;
   if (
-    short_circuit ||
-    std::none_of(stack.begin() + stack_size, stack.end(), [](const codet &d) {
-      return d.get_statement() == "function_call";
-    }))
+    in_short_circuit ||
+    std::none_of(stack.begin() + stack_size, stack.end(), is_destructor_entry))
     return;
 
   // The temporaries may be read by the condition, so its value is taken
@@ -1723,13 +1719,7 @@ void goto_convertt::remove_sideeffects(
           remove_sideeffects(result, dest, true);
         }
         else
-        {
-          remove_sideeffects(*it, dest, false);
-
-          // remember these for later checks
-          if (it->is_not_nil())
-            convert(code_expressiont(*it), dest);
-        }
+          remove_comma_operand(*it, dest);
       }
 
       expr.swap(result);
@@ -1737,13 +1727,7 @@ void goto_convertt::remove_sideeffects(
     else // result not used
     {
       Forall_operands (it, expr)
-      {
-        remove_sideeffects(*it, dest, false);
-
-        // remember as expression statement for later checks
-        if (it->is_not_nil())
-          convert(code_expressiont(*it), dest);
-      }
+        remove_comma_operand(*it, dest);
 
       expr = nil_exprt();
     }
@@ -2025,6 +2009,33 @@ void goto_convertt::remove_sideeffects(
   migrate_expr(legacy, expr);
 }
 
+static irep_idt
+compound_assign_operator(const irep_idt &statement, bool is_float)
+{
+  if (statement == "assign+")
+    return is_float ? "ieee_add" : "+";
+  if (statement == "assign-")
+    return is_float ? "ieee_sub" : "-";
+  if (statement == "assign*")
+    return is_float ? "ieee_mul" : "*";
+  if (statement == "assign_div")
+    return is_float ? "ieee_div" : "/";
+  if (statement == "assign_mod")
+    return "mod";
+  if (statement == "assign_shl")
+    return "shl";
+  if (statement == "assign_ashr")
+    return "ashr";
+  if (statement == "assign_lshr")
+    return "lshr";
+  if (statement == "assign_bitand")
+    return "bitand";
+  if (statement == "assign_bitxor")
+    return "bitxor";
+  assert(statement == "assign_bitor");
+  return "bitor";
+}
+
 bool goto_convertt::is_destructor_entry(const codet &entry)
 {
   return entry.get_statement() == "function_call" ||
@@ -2099,88 +2110,10 @@ void goto_convertt::remove_assignment(
       abort();
     }
 
-    exprt rhs;
-
-    if (statement == "assign+")
-    {
-      if (expr_has_floatbv(expr))
-      {
-        rhs.id("ieee_add");
-      }
-      else
-      {
-        rhs.id("+");
-      }
-    }
-    else if (statement == "assign-")
-    {
-      if (expr_has_floatbv(expr))
-      {
-        rhs.id("ieee_sub");
-      }
-      else
-      {
-        rhs.id("-");
-      }
-    }
-    else if (statement == "assign*")
-    {
-      if (expr_has_floatbv(expr))
-      {
-        rhs.id("ieee_mul");
-      }
-      else
-      {
-        rhs.id("*");
-      }
-    }
-    else if (statement == "assign_div")
-    {
-      if (expr_has_floatbv(expr))
-      {
-        rhs.id("ieee_div");
-      }
-      else
-      {
-        rhs.id("/");
-      }
-    }
-    else if (statement == "assign_mod")
-    {
-      rhs.id("mod");
-    }
-    else if (statement == "assign_shl")
-    {
-      rhs.id("shl");
-    }
-    else if (statement == "assign_ashr")
-    {
-      rhs.id("ashr");
-    }
-    else if (statement == "assign_lshr")
-    {
-      rhs.id("lshr");
-    }
-    else if (statement == "assign_bitand")
-    {
-      rhs.id("bitand");
-    }
-    else if (statement == "assign_bitxor")
-    {
-      rhs.id("bitxor");
-    }
-    else if (statement == "assign_bitor")
-    {
-      rhs.id("bitor");
-    }
-    else
-    {
-      std::ostringstream str;
-      str << statement << " not yet supported\n";
-      str << "Location: " << expr.location();
-      log_error("{}", str.str());
-      abort();
-    }
+    // The operation runs in the computation type (C11 6.5.16.2p3), which is
+    // floating-point when E2 is even if E1 is an integer: `i /= 3.5`.
+    exprt rhs(compound_assign_operator(
+      statement, expr_has_floatbv(expr) || expr_has_floatbv(expr.op1())));
 
     rhs.copy_to_operands(expr.op0(), expr.op1());
     rhs.type() = expr.op0().type();
@@ -2645,6 +2578,7 @@ void goto_convertt::remove_cpp_delete(exprt &expr, goto_programt &dest)
   tmp.copy_to_operands(to_unary_expr(expr).op0());
   tmp.set("destructor", expr.find("destructor"));
   tmp.set("dealloc_function", expr.find("dealloc_function"));
+  tmp.set("dealloc_alignment", expr.find("dealloc_alignment"));
 
   convert_cpp_delete(tmp, dest);
 

@@ -27,6 +27,7 @@ CC_DIAGNOSTIC_POP()
 
 #include <ac_config.h>
 #include <clang-c-frontend/clang_c_convert.h>
+#include <clang-c-frontend/builtin_names.h>
 #include <clang-c-frontend/typecast.h>
 #include <irep2/irep2_utils.h>
 #include <util/arith/arith_tools.h>
@@ -827,6 +828,45 @@ bool clang_c_convertert::get_var(const clang::VarDecl &vd, exprt &new_expr)
   return false;
 }
 
+bool clang_c_convertert::get_function_signature(
+  const clang::FunctionDecl &fd,
+  code_typet &type)
+{
+  if (get_type(fd.getReturnType(), type.return_type()))
+    return true;
+
+  if (fd.isVariadic())
+    type.make_ellipsis();
+
+  if (fd.isInlined())
+    type.inlined(true);
+
+  if (get_function_params(fd, type.arguments()))
+    return true;
+
+  // Check for __ESBMC_contract annotation
+  if (fd.hasAttrs())
+  {
+    for (const auto *attr : fd.getAttrs())
+    {
+      if (const auto *annot = llvm::dyn_cast<clang::AnnotateAttr>(attr))
+      {
+        if (annot->getAnnotation().str() == "__ESBMC_contract")
+        {
+          type.set("#annotated_contract", true);
+          break;
+        }
+      }
+    }
+  }
+
+  // Record the C++ exception specification (noexcept / dynamic throw(...)) as
+  // function-boundary metadata on the type. No-op for C.
+  annotate_exception_specification(fd, type);
+
+  return false;
+}
+
 bool clang_c_convertert::get_function(
   const clang::FunctionDecl &fd,
   exprt &new_expr)
@@ -858,18 +898,9 @@ bool clang_c_convertert::get_function(
   // This will be reset every time a function is parsed
   current_scope_var_num = 1;
 
-  // Build function's type
   code_typet type;
-
-  // Return type
-  if (get_type(fd.getReturnType(), type.return_type()))
+  if (get_function_signature(fd, type))
     return true;
-
-  if (fd.isVariadic())
-    type.make_ellipsis();
-
-  if (fd.isInlined())
-    type.inlined(true);
 
   locationt location_begin;
   get_location_from_decl(fd, location_begin);
@@ -891,32 +922,8 @@ bool clang_c_convertert::get_function(
                      fd.getStorageClass() == clang::SC_PrivateExtern;
   symbol.file_local = (fd.getStorageClass() == clang::SC_Static);
 
+  // Publish the function only after its parameter types are complete.
   symbolt &added_symbol = *context.move_symbol_to_context(symbol);
-
-  // We convert the parameters first so their symbol are added to context
-  // before converting the body, as they may appear on the function body
-  if (get_function_params(fd, type.arguments()))
-    return true;
-
-  // Check for __ESBMC_contract annotation
-  if (fd.hasAttrs())
-  {
-    for (const auto *attr : fd.getAttrs())
-    {
-      if (const auto *annot = llvm::dyn_cast<clang::AnnotateAttr>(attr))
-      {
-        if (annot->getAnnotation().str() == "__ESBMC_contract")
-        {
-          type.set("#annotated_contract", true);
-          break;
-        }
-      }
-    }
-  }
-
-  // Record the C++ exception specification (noexcept / dynamic throw(...)) as
-  // function-boundary metadata on the type. No-op for C.
-  annotate_exception_specification(fd, type);
 
   // A bodyless re-declaration must not clobber the type of a function that is
   // already defined. The definition's argument list carries the parameter
@@ -4262,6 +4269,24 @@ bool clang_c_convertert::get_decl_ref(const clang::Decl &d, exprt &new_expr)
   log_error("{}", oss.str());
   return true;
 }
+
+/// `__builtin_copysign` and the other `__builtin_` spellings of a <math.h>
+/// function have no body; the plain name has an operational model. Those
+/// that clang_c_adjust lowers by their own spelling keep it.
+bool clang_c_convertert::is_unlowered_math_builtin(
+  const std::string &name) const
+{
+  llvm::StringRef lib_name(name);
+  if (
+    is_name_matched_builtin(name) || compare_unscore_builtin(name, "nan") ||
+    !lib_name.consume_front("__builtin_"))
+    return false;
+
+  unsigned lib_id = ASTContext->Idents.get(lib_name).getBuiltinID();
+  return lib_id && llvm::StringRef(
+                     ASTContext->BuiltinInfo.getHeaderName(lib_id)) == "math.h";
+}
+
 void clang_c_convertert::rewrite_builtin_ref(
   const clang::Decl &d,
   std::string &name,
@@ -4285,8 +4310,10 @@ void clang_c_convertert::rewrite_builtin_ref(
     unsigned builtin_id = fd->getBuiltinID();
     if (
       builtin_id && ASTContext->BuiltinInfo.isLibFunction(builtin_id) &&
-      std::find(builtins_to_rewrite.begin(), builtins_to_rewrite.end(), name) !=
-        builtins_to_rewrite.end())
+      (std::find(
+         builtins_to_rewrite.begin(), builtins_to_rewrite.end(), name) !=
+         builtins_to_rewrite.end() ||
+       is_unlowered_math_builtin(name)))
     {
       boost::replace_all(name, "__builtin_", "");
       boost::replace_all(id, "__builtin_", "");

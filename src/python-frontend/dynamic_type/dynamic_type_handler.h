@@ -90,6 +90,17 @@ public:
     const locationt &location);
 
   /**
+   * @brief Inside a try body, raises a catchable TypeError ahead of an
+   * Add/Sub/Div or ordered comparison on the path where the operands' runtime
+   * types do not support it. Elsewhere the scalar helper's assert reports it.
+   */
+  void guard_type_error(
+    const std::string &op,
+    const exprt &lhs,
+    const exprt &rhs,
+    const locationt &location);
+
+  /**
    * @brief Builds unary minus on a tagged-scalar operand, as `0 - tagged`
    */
   exprt build_neg_tagged(const exprt &tagged);
@@ -107,9 +118,10 @@ public:
   /**
    * @brief True if a function's top-level if/elif/else chain -- including
    * an early return with no else, falling through to the next statement --
-   * can return genuinely incompatible literal kinds (num vs str)
+   * can return genuinely incompatible kinds (num vs str) of literals or
+   * scalar-annotated parameters
    */
-  bool detect_dynamic_return_type(const nlohmann::json &function_body) const;
+  bool detect_dynamic_return_type(const nlohmann::json &function_node) const;
 
   /**
    * @brief True if some top-level `If` in `scope_body` (a function body or
@@ -118,7 +130,8 @@ public:
    */
   bool scope_assigns_divergent_literal_types(
     const std::string &name,
-    const nlohmann::json &scope_body) const;
+    const nlohmann::json &scope_body,
+    const nlohmann::json &module_body = nlohmann::json()) const;
 
   /**
    * @brief Builds a tagged-object temporary from an already-converted
@@ -217,6 +230,15 @@ private:
     const exprt &lhs,
     const exprt &rhs,
     const locationt &location);
+
+  /**
+   * @brief Whether `op` on `lhs` and `rhs` raises no TypeError, as the
+   * matching helper in scalar.c decides it
+   */
+  exprt operands_type_ok(
+    const std::string &op,
+    const exprt &lhs,
+    const exprt &rhs) const;
 
   /**
    * @brief Emits a catchable ZeroDivisionError raise, guarded so it only
