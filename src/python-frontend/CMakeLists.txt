@@ -18,10 +18,12 @@ add_library(pythonfrontend STATIC
             converter/converter_compare.cpp
             converter/converter_dunder.cpp
             converter/converter_expr.cpp
+            converter/value_kinds.cpp
             converter/converter_funcall.cpp
             converter/converter_funcdef.cpp
             converter/converter_stmt.cpp
             converter/converter_view_escape.cpp
+            converter/converter_view_builtins.cpp
             converter/converter_view_hoist.cpp
             converter/converter_view_rebind.cpp
             converter/converter_symbols.cpp
@@ -62,6 +64,7 @@ add_library(pythonfrontend STATIC
             python_annotation/annotation_intrinsics.cpp
             python_annotation/annotation_parser.cpp
             python_annotation/annotation_utils.cpp
+            python_annotation/function_values.cpp
             symbol_id.cpp
             type/element_type_registry.cpp
             type/type_handler.cpp
@@ -72,6 +75,7 @@ add_library(pythonfrontend STATIC
             function_call/expr.cpp
             function_call/str_conv.cpp
             numpy/numpy_call_expr.cpp
+            numpy/numpy_random.cpp
             numpy/ndarray_shape.cpp
             function_call/builder.cpp
             string/string_builder.cpp

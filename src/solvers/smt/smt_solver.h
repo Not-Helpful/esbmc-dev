@@ -251,6 +251,12 @@ public:
     struct expr_op_convert ops);
 
   smt_astt convert_assign(const expr2tc &expr);
+  /** Bind the symbol on the left of an equality to its right-hand side
+   *  without asserting anything: later conversions of the symbol yield the
+   *  right-hand side, so only definitions something asserted depends on reach
+   *  the solver. Falls back to convert_assign for aggregates or a symbol that
+   *  was already converted. */
+  void define(const expr2tc &expr);
 
   /** Convert @p expr and dump the resulting SMT AST in SMT format. Used by
    *  --ssa-smt-trace so callers outside the solver layer can request the
@@ -285,6 +291,14 @@ public:
    *  an error occurred.
    *  @return Result code of the call to the solver. */
   virtual smt_resultt dec_solve() = 0;
+
+  /** Solve with each boolean ast in @p assumptions held true for this query
+   *  only. Backends without support abort; check supports_assumptions(). */
+  virtual smt_resultt dec_solve_assuming(const ast_vec &assumptions);
+  virtual bool supports_assumptions() const
+  {
+    return false;
+  }
 
   void pre_solve();
 
@@ -892,6 +906,10 @@ public:
   /** Encode a remainder: compositional via the matching division when
    *  one exists in the formula, the solver's rem primitive otherwise. */
   smt_astt convert_modulus(const modulus2t &m, smt_astt a, smt_astt b);
+  /** C's / and % of signed @p type on Int-sorted operands, from the
+   *  solver's Euclidean div/mod (#8662). */
+  smt_astt mk_truncated_div(const type2tc &type, smt_astt a, smt_astt b);
+  smt_astt mk_truncated_rem(const type2tc &type, smt_astt a, smt_astt b);
   /** Convert constant_array2tc's and constant_array_of2tc's */
   smt_astt array_create(const expr2tc &expr);
 

@@ -586,6 +586,29 @@ class GeneratorMixin:
             return None
         return result
 
+    @staticmethod
+    def _unguard_starred_call(call):
+        """The one argument of `call`, with a statement raising the arity
+        TypeError when it is the guard _lower_starred_call_argument spells
+        `f(a, *xs)` as: then `f(xs[0], ..., xs[k-1])` and the statement.
+        list(gen(*xs)) is inlined as statements, so the guard moves ahead of
+        them (#8670)."""
+        if len(call.args) != 1:
+            return None, []
+        node = call.args[0]
+        raising = node.orelse if isinstance(node, ast.IfExp) else None
+        if not (isinstance(raising, ast.Subscript) and isinstance(raising.value, ast.Tuple)
+                and len(raising.value.elts) == 2 and isinstance(raising.value.elts[0], ast.Call)
+                and isinstance(raising.value.elts[0].func, ast.Name)
+                and raising.value.elts[0].func.id == "_starred_arity_error"):
+            return node, []
+        check = ast.If(test=ast.UnaryOp(op=ast.Not(), operand=node.test),
+                       body=[ast.Expr(value=raising.value.elts[0])],
+                       orelse=[])
+        ast.copy_location(check, node)
+        ast.fix_missing_locations(check)
+        return node.body, [check]
+
     def _lower_list_gen_call(self, gen_call_node, parent_node):
         """Lower list(gen_func(args...)) to an inline list construction.
 
@@ -1128,7 +1151,7 @@ class GeneratorMixin:
             # clause naming a temporary the contract wrapper never declares.
             # Leave it as written; the frontend's clause check rejects by name.
             return [], expr, "Any"
-        lowerer = self._ListCompExpressionLowerer(self)
+        lowerer = self._ListCompExpressionLowerer(self, expr)
         new_expr = lowerer.visit(expr)
         result_type = self._infer_type_from_value(new_expr)
         return lowerer.statements, new_expr, result_type
@@ -1150,13 +1173,9 @@ class GeneratorMixin:
                 and call_node.func.id == "sorted" and len(call_node.args) == 1):
             return None
 
-        key_kw = None
-        for kw in call_node.keywords:
-            if kw.arg == "key" and key_kw is None:
-                key_kw = kw
-            else:
-                return None
-        if key_kw is None:
+        key_kw = self._single_key_keyword(call_node, ("reverse", ))
+        reverse = self._sorted_reverse(call_node)
+        if key_kw is None or not self._is_bool_constant(reverse):
             return None
 
         folded = self._fold_dict_getitem_key(call_node.args[0], key_kw.value)
@@ -1171,7 +1190,7 @@ class GeneratorMixin:
         elts, key_values = folded
 
         try:
-            order = sorted(range(len(elts)), key=lambda i: key_values[i])
+            order = sorted(range(len(elts)), key=lambda i: key_values[i], reverse=reverse.value)
         except TypeError:
             # Mutually incomparable key values (e.g. mixed str/int) — CPython
             # raises at runtime; bail to the existing key-drop fallback rather
@@ -1214,6 +1233,25 @@ class GeneratorMixin:
             members = [self._const_scalar_value(e) for e in node.elts]
             return None if None in members else tuple(members)
         return self._const_scalar_value(node)
+
+    @staticmethod
+    def _pack_min_max_key_args(call_node):
+        """``min``/``max(a, b, ..., key=f)`` as ``min``/``max([a, b, ...], key=f)``,
+        which CPython defines to be the same, so the key lowerings see their
+        one-iterable form. A call argument is left alone: the element type of
+        a list literal holding it cannot be inferred when the callee has no
+        return annotation."""
+        is_min_max = isinstance(call_node.func, ast.Name) and call_node.func.id in ("min", "max")
+        unpackable = any(isinstance(arg, (ast.Starred, ast.Call)) for arg in call_node.args)
+        only_key = [kw.arg for kw in call_node.keywords] == ["key"]
+        if not is_min_max or len(call_node.args) < 2 or unpackable or not only_key:
+            return call_node
+        packed = ast.List(elts=call_node.args, ctx=ast.Load())
+        ast.copy_location(packed, call_node.args[0])
+        call = ast.Call(func=call_node.func, args=[packed], keywords=call_node.keywords)
+        ast.copy_location(call, call_node)
+        ast.fix_missing_locations(call)
+        return call
 
     def _lower_min_max_with_key_call(self, call_node):  # pylint: disable=too-many-return-statements,too-many-locals,too-many-branches
         """Lower min/max(iterable, key=...) for literal-list iterables with a
@@ -1379,20 +1417,6 @@ class GeneratorMixin:
                            value=ast.copy_location(copy.deepcopy(lam), key_kw.value))
 
     @staticmethod
-    def _names_bound_by(node):
-        """The names @p node itself binds: a def or class, a Store/Del name, a
-        parameter, or a ``global`` declaration."""
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            return (node.name, )
-        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
-            return (node.id, )
-        if isinstance(node, ast.arg):
-            return (node.arg, )
-        if isinstance(node, ast.Global):
-            return tuple(node.names)
-        return ()
-
-    @staticmethod
     def _binds_key(key_value):
         """Whether a scan binds its key lambda to a name before applying it."""
         return isinstance(key_value,
@@ -1413,14 +1437,32 @@ class GeneratorMixin:
         return _Substitute().visit(copy.deepcopy(key_value.body))
 
     @staticmethod
-    def _single_key_keyword(call_node):
+    def _single_key_keyword(call_node, allowed=()):
+        """The call's one ``key=`` keyword, None when it has none or a keyword
+        outside ``key`` and ``allowed``."""
         key_kw = None
         for kw in call_node.keywords:
             if kw.arg == "key" and key_kw is None:
                 key_kw = kw
-            else:
+            elif kw.arg not in allowed:
                 return None
         return key_kw
+
+    @staticmethod
+    def _keyword_value(call_node, name):
+        return next((kw.value for kw in call_node.keywords if kw.arg == name), None)
+
+    @staticmethod
+    def _sorted_reverse(call_node):
+        """The ``reverse=`` value of a ``sorted`` call, ``False`` when absent."""
+        for kw in call_node.keywords:
+            if kw.arg == "reverse":
+                return kw.value
+        return ast.Constant(value=False)
+
+    @staticmethod
+    def _is_bool_constant(node):
+        return isinstance(node, ast.Constant) and isinstance(node.value, bool)
 
     @staticmethod
     def _literal_contains_tuple(literal):
@@ -1452,7 +1494,8 @@ class GeneratorMixin:
                 and call_node.func.id in func_names and len(call_node.args) == 1):
             return None
 
-        key_kw = self._single_key_keyword(call_node)
+        key_kw = self._single_key_keyword(call_node, ("reverse", ) if "sorted" in func_names else
+                                          ("default", ))
         if key_kw is None:
             return None
         key_kw = self._resolve_lambda_key_name(key_kw)
@@ -1464,7 +1507,10 @@ class GeneratorMixin:
         if call_node.func.id == "sorted" and not self._sorted_scan_key_supported(
                 key_kw.value, literal):
             return None
-        if literal is not None and self._const_scalar_list_literal(literal):
+        # The constant fold owns a non-empty constant literal unless reverse=
+        # is only known at run time.
+        if (literal is not None and literal.elts and self._const_scalar_list_literal(literal)
+                and self._is_bool_constant(self._sorted_reverse(call_node))):
             return None
         return key_kw
 
@@ -1539,6 +1585,7 @@ class GeneratorMixin:
         cur = f"ESBMC_srtc_{n}"
         cur_key = f"ESBMC_srtck_{n}"
         keys = f"ESBMC_srtk_{n}"
+        rev = f"ESBMC_srtr_{n}"
 
         def store(name, value):
             return ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())], value=value)
@@ -1590,13 +1637,24 @@ class GeneratorMixin:
             orelse=[],
         )
 
+        # reverse=True sorts as if each comparison were reversed, so equal
+        # keys keep their order there too.
+        reverse = self._sorted_reverse(call_node)
+
+        def out_of_order(op):
+            return ast.Compare(left=key_at(load(j)), ops=[op], comparators=[load(cur_key)])
+
+        if self._is_bool_constant(reverse):
+            shifts = out_of_order(ast.Lt() if reverse.value else ast.Gt())
+        else:
+            shifts = ast.IfExp(test=load(rev),
+                               body=out_of_order(ast.Lt()),
+                               orelse=out_of_order(ast.Gt()))
         shift = ast.While(
             test=ast.BoolOp(op=ast.And(),
                             values=[
                                 ast.Compare(left=load(j), ops=[ast.GtE()], comparators=[num(0)]),
-                                ast.Compare(left=key_at(load(j)),
-                                            ops=[ast.Gt()],
-                                            comparators=[load(cur_key)]),
+                                shifts,
                             ]),
             body=[
                 move(add(load(j), num(1)), at(load(j)), out),
@@ -1635,6 +1693,10 @@ class GeneratorMixin:
         if bind_key:
             prefix.append(store(key_fn, copy.deepcopy(key_kw.value)))
         prefix.append(store(out, whole_slice))
+        if not self._is_bool_constant(reverse):
+            # Evaluated once, before the key runs, as CPython evaluates the
+            # call's arguments.
+            prefix.append(store(rev, copy.deepcopy(reverse)))
         if once:
             prefix += [store(keys, ast.List(elts=[], ctx=ast.Load())), store(i, num(0)), fill_keys]
         prefix += [store(i, num(1)), outer]
@@ -1674,6 +1736,7 @@ class GeneratorMixin:
         idx = f"ESBMC_mmi_{n}"
         cur = f"ESBMC_mmcur_{n}"
         cur_key = f"ESBMC_mmcurk_{n}"
+        default_name = f"ESBMC_mmdef_{n}"
 
         def store(name, value):
             return ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())], value=value)
@@ -1708,7 +1771,11 @@ class GeneratorMixin:
         prefix = [store(seq, copy.deepcopy(call_node.args[0]))]
         if bind_key:
             prefix.append(store(key_fn, copy.deepcopy(key_kw.value)))
-        prefix += [
+        default = self._keyword_value(call_node, "default")
+        if default is not None:
+            # Evaluated with the other arguments, before the key runs.
+            prefix.append(store(default_name, copy.deepcopy(default)))
+        scan = [
             store(best, at(ast.Constant(value=0))),
             store(best_key, call_key(best)),
             store(idx, ast.Constant(value=1)),
@@ -1726,6 +1793,15 @@ class GeneratorMixin:
                 orelse=[],
             ),
         ]
+        if default is None:
+            prefix += scan
+        else:
+            empty = ast.Compare(left=ast.Call(func=ast.Name(id="len", ctx=ast.Load()),
+                                              args=[load(seq)],
+                                              keywords=[]),
+                                ops=[ast.Eq()],
+                                comparators=[ast.Constant(value=0)])
+            prefix.append(ast.If(test=empty, body=[store(best, load(default_name))], orelse=scan))
 
         result = load(best)
         for node in prefix + [result]:
@@ -1802,7 +1878,19 @@ class GeneratorMixin:
                 and node.func.id in ("abs", "len") and len(node.args) == 1 and not node.keywords):
             return self._apply_builtin(node.func.id,
                                        self._eval_key_body(node.args[0], param, element))
-        return None
+        return self._const_dict_entry(node, param, element)
+
+    def _const_dict_entry(self, node, param, element):
+        """Constant value of ``param["k"]`` over a dict literal of constants, else None."""
+        if not (isinstance(element, ast.Dict) and isinstance(node, ast.Subscript)
+                and isinstance(node.value, ast.Name) and node.value.id == param
+                and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str)):
+            return None
+        keys = [None if k is None else self._const_scalar_value(k) for k in element.keys]
+        values = [self._const_element_value(v) for v in element.values]
+        if None in keys or None in values or node.slice.value not in keys:
+            return None
+        return dict(zip(keys, values))[node.slice.value]
 
     @staticmethod
     def _param_subscript_index(node, param):

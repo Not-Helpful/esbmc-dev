@@ -1010,34 +1010,22 @@ bool clang_cpp_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
     break;
   }
 
-  // Represents an expression using a Concept template
-  // with a defined type.
   case clang::Stmt::ConceptSpecializationExprClass:
   {
     const clang::ConceptSpecializationExpr &concept_expr =
       static_cast<const clang::ConceptSpecializationExpr &>(stmt);
 
-    if (concept_expr.isSatisfied())
-      new_expr = true_exprt();
-    else
-      new_expr = false_exprt();
+    new_expr = gen_boolean(concept_expr.isSatisfied());
     break;
   }
 
-  // Clang gives back a RequiresExpr for both
-  // the template, and also specialized instances of the template
-  // If this node is the template (not an specialization), then
+  // If this node is the template (not a specialization), then
   // isSatisfied asserts an error.
-  // No check is needed because ESBMC filters out dependent nodes
   case clang::Stmt::RequiresExprClass:
   {
-    const auto &requires_expr =
-      static_cast<const clang::RequiresExpr &>(stmt);
+    const auto &requires_expr = static_cast<const clang::RequiresExpr &>(stmt);
 
-    if (requires_expr.isSatisfied())
-      new_expr = true_exprt();
-    else
-      new_expr = false_exprt();
+    new_expr = gen_boolean(requires_expr.isSatisfied());
     break;
   }
 

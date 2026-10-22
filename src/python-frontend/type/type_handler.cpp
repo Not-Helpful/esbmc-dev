@@ -875,6 +875,37 @@ typet type_handler::get_typet_from_call_func(const nlohmann::json &func) const
   throw std::runtime_error("Invalid type");
 }
 
+std::optional<typet>
+type_handler::scalar_array_element_type(const nlohmann::json &elem) const
+{
+  if (
+    elem.value("_type", "") != "Subscript" ||
+    elem["slice"].value("_type", "") == "Slice" ||
+    elem["value"].value("_type", "") != "Name")
+    return std::nullopt;
+  symbol_id sid(
+    converter_.python_file(),
+    converter_.current_classname(),
+    converter_.current_function_name());
+  sid.set_object(elem["value"]["id"].get<std::string>());
+  const symbolt *symbol = converter_.find_symbol(sid.to_string());
+  if (!symbol)
+    symbol = converter_.find_symbol(sid.global_to_string());
+  // A NumPy view is a pointer into its source's storage.
+  if (
+    !symbol ||
+    (!symbol->get_type().is_array() && !symbol->get_type().is_pointer()))
+    return std::nullopt;
+  const typet &subtype = symbol->get_type().subtype();
+  if (
+    !subtype.is_signedbv() && !subtype.is_unsignedbv() &&
+    !subtype.is_floatbv() && !subtype.is_bool())
+    return std::nullopt;
+  if (subtype == char_type())
+    return std::nullopt;
+  return subtype;
+}
+
 typet type_handler::get_typet(const nlohmann::json &elem) const
 {
   // Handle null/empty values
@@ -1637,4 +1668,17 @@ typet type_handler::get_dict_type(const nlohmann::json &dict_value) const
   // For now, return the generic dict type
   // In the future, this could infer specific key/value types
   return get_dict_type();
+}
+
+typet type_handler::class_value_type()
+{
+  struct_typet type;
+  type.tag("__ESBMC_PyClass");
+  type.components().push_back(struct_typet::componentt("id", "id", int_type()));
+  return type;
+}
+
+bool type_handler::is_class_value_type(const typet &type)
+{
+  return type.is_struct() && to_struct_type(type).tag() == "__ESBMC_PyClass";
 }

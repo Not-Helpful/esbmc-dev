@@ -519,9 +519,8 @@ exprt python_converter::get_lambda_expr(
   const nlohmann::json &element,
   const std::vector<std::optional<typet>> &argument_types)
 {
-  // The body is converted here with the lambda's parameters still unbound, so
-  // any division inside it must not emit a ZeroDivisionError guard (which would
-  // fire on the unconstrained divisor); it is checked at the bound call site.
+  // The body is converted while the enclosing block is current, so nothing it
+  // emits may be planted there; its ZeroDivisionError guards stay in the body.
   bool saved = converting_lambda_body_;
   converting_lambda_body_ = true;
   exprt result = lambda_handler_->get_lambda_expr(element, argument_types);
@@ -660,12 +659,12 @@ find_module_binding(const nlohmann::json &body, const std::string &name)
   return nullptr;
 }
 
-/// Whether \p aug adds to a global of annotated type \p type a constant that
-/// leaves it that type.
-static bool keeps_type(const nlohmann::json &aug, const std::string &type)
+/// Whether \p value is a constant that leaves a global of annotated type
+/// \p type that type when added to it.
+static bool
+constant_keeps_type(const nlohmann::json &value, const std::string &type)
 {
-  const nlohmann::json &value = aug["value"];
-  if (aug["op"].value("_type", "") == "Div" || value["_type"] != "Constant")
+  if (value["_type"] != "Constant")
     return false;
   const nlohmann::json &constant = value["value"];
   return (type == "int" && constant.is_number_integer()) ||
@@ -673,18 +672,38 @@ static bool keeps_type(const nlohmann::json &aug, const std::string &type)
          (type == "str" && constant.is_string());
 }
 
+/// Whether a name has a given annotated type where it is read.
+using name_type_test =
+  std::function<bool(const std::string &, const std::string &)>;
+
+/// Whether \p aug adds to a global of annotated type \p type a constant, or
+/// a name \p has_type gives that type, that leaves it that type.
+static bool keeps_type(
+  const nlohmann::json &aug,
+  const std::string &type,
+  const name_type_test &has_type)
+{
+  const nlohmann::json &value = aug["value"];
+  if (aug["op"].value("_type", "") == "Div")
+    return false;
+  return value["_type"] == "Name"
+           ? has_type(value["id"].get<std::string>(), type)
+           : constant_keeps_type(value, type);
+}
+
 /// The augmented assignments to \p name under \p node that keep it \p type.
 static std::size_t count_type_keeping_aug_assigns(
   const nlohmann::json &node,
   const std::string &name,
-  const std::string &type)
+  const std::string &type,
+  const name_type_test &has_type)
 {
   std::size_t n = node.is_object() && node.value("_type", "") == "AugAssign" &&
                   node["target"].value("id", "") == name &&
-                  keeps_type(node, type);
+                  keeps_type(node, type, has_type);
   for (const auto &child : node)
     if (child.is_structured())
-      n += count_type_keeping_aug_assigns(child, name, type);
+      n += count_type_keeping_aug_assigns(child, name, type, has_type);
   return n;
 }
 
@@ -693,8 +712,10 @@ static std::size_t count_type_keeping_aug_assigns(
 /// one, a local) leaves the name's value at a read depending on which binding
 /// ran. An augmented assignment that keeps the binding's type does not count:
 /// it reads the name first, so it raises unless the binding has already run.
-static const nlohmann::json *
-sole_module_binding(const nlohmann::json &module, const std::string &name)
+static const nlohmann::json *sole_module_binding(
+  const nlohmann::json &module,
+  const std::string &name,
+  const name_type_test &has_type)
 {
   const nlohmann::json *binding = find_module_binding(module["body"], name);
   if (!binding)
@@ -704,10 +725,22 @@ sole_module_binding(const nlohmann::json &module, const std::string &name)
                              : "";
   if (
     json_utils::count_name_bindings(module, name) -
-      count_type_keeping_aug_assigns(module, name, type) !=
+      count_type_keeping_aug_assigns(module, name, type, has_type) !=
     1)
     return nullptr;
   return binding;
+}
+
+/// Whether the module global \p name is already bound with annotated type
+/// \p type.
+bool python_converter::global_has_type(
+  const std::string &name,
+  const std::string &type) const
+{
+  symbol_id sid(current_python_file, "", "");
+  sid.set_object(name);
+  const symbolt *symbol = symbol_table_.find_symbol(sid.to_string());
+  return symbol && symbol->get_type() == type_handler_.get_typet(type);
 }
 
 /// The module global \p sid names for a read in an enclosing scope. Code
@@ -719,8 +752,12 @@ symbolt *python_converter::find_global_symbol(const symbol_id &sid)
 {
   if (symbolt *symbol = find_enclosing_scope_symbol(sid))
     return symbol;
-  const nlohmann::json *binding =
-    sole_module_binding(*ast_json, sid.get_object());
+  const nlohmann::json *binding = sole_module_binding(
+    *ast_json,
+    sid.get_object(),
+    [this](const std::string &name, const std::string &type) {
+      return global_has_type(name, type);
+    });
   if (!binding || binding->value("_type", "") != "AnnAssign")
     return nullptr;
   nlohmann::json annotated = *binding;
@@ -744,12 +781,40 @@ exprt python_converter::module_function_expr(
   const symbolt *symbol = symbol_table_.find_symbol(sid.to_string());
   if (symbol && symbol->get_type().is_code())
     return symbol_expr(*symbol);
-  const nlohmann::json *binding = sole_module_binding(*ast_json, name);
+  const nlohmann::json *binding = sole_module_binding(
+    *ast_json, name, [](const std::string &, const std::string &) {
+      return false;
+    });
   if (!binding || binding->value("_type", "") != "FunctionDef")
     return nil_exprt();
   track_unbound_global(sid.to_string(), element, typet());
   guard_unbound_global(sid.to_string(), name, element);
   return symbol_exprt(sid.to_string(), code_typet());
+}
+
+/// The return type of the module function \p name, read before its `def` as
+/// \p fn, from the annotation its `def` carries: one of int, float, bool or
+/// str, or nil. mark_global_bound refuses a `def` converted to another one.
+typet python_converter::forward_function_return_type(
+  const std::string &name,
+  const exprt &fn)
+{
+  const auto flag = unbound_global_flags_.find(fn.identifier().as_string());
+  const nlohmann::json *def = sole_module_binding(
+    *ast_json, name, [](const std::string &, const std::string &) {
+      return false;
+    });
+  if (flag == unbound_global_flags_.end() || !def)
+    return typet();
+  const nlohmann::json &returns = resolve_return_annotation_node(*def);
+  const std::string id = returns.is_object() && returns["_type"] == "Name"
+                           ? returns.value("id", "")
+                           : "";
+  if (id != "int" && id != "float" && id != "bool" && id != "str")
+    return typet();
+  flag->second.second = id == "str" ? gen_pointer_type(char_type())
+                                    : named_return_type(id, returns, *def);
+  return flag->second.second;
 }
 
 void python_converter::track_unbound_global(
@@ -805,9 +870,11 @@ void python_converter::mark_global_bound(
   const auto flag = unbound_global_flags_.find(sid.to_string());
   if (name.empty() || flag == unbound_global_flags_.end())
     return;
+  const typet &bound = symbol_table_.find_symbol(sid.to_string())->get_type();
   if (
-    !is_def && symbol_table_.find_symbol(sid.to_string())->get_type() !=
-                 flag->second.second)
+    is_def ? !flag->second.second.id().empty() &&
+               to_code_type(bound).return_type() != flag->second.second
+           : bound != flag->second.second)
     throw std::runtime_error(
       fmt::format(
         "Variable '{}' is read before its binding at line {} as a different "
@@ -1098,6 +1165,13 @@ python_converter::numpy_shape_from_indexed_decl(const std::string &name) const
   return numpy_subscript_shape(*source_shape, decl["value"]["slice"]);
 }
 
+// The attributes numpy_shape_attr_expr answers; any other one, such as a
+// complex element's .imag, is not a shape.
+static bool is_numpy_shape_attribute(const std::string &attr_name)
+{
+  return attr_name == "shape" || attr_name == "ndim" || attr_name == "size";
+}
+
 exprt python_converter::numpy_shape_attr_expr(
   const std::vector<std::size_t> &shape,
   const std::string &attr_name)
@@ -1136,7 +1210,7 @@ std::optional<exprt> python_converter::try_get_numpy_shape_attr(
     return param_attr;
 
   const std::string name = symbol.name.as_string();
-  if (name.empty())
+  if (name.empty() || !is_numpy_shape_attribute(attr_name))
     return std::nullopt;
   if (
     std::optional<std::vector<std::size_t>> shape =
@@ -1182,7 +1256,7 @@ std::optional<exprt> python_converter::try_get_numpy_tracked_value_shape_attr(
   const nlohmann::json &base_node,
   const std::string &attr_name)
 {
-  if (!base_expr.is_symbol())
+  if (!base_expr.is_symbol() || !is_numpy_shape_attribute(attr_name))
     return std::nullopt;
 
   const std::string base_id = base_expr.identifier().as_string();
@@ -1463,7 +1537,7 @@ std::optional<exprt> python_converter::try_dispatch_dict_subscript(
   exprt &array,
   const typet &array_type_for_dict,
   bool array_is_dict_pointer,
-  const nlohmann::json &slice)
+  const nlohmann::json &element)
 {
   // Handle dictionary subscript with type inference from annotations
   if (
@@ -1483,9 +1557,28 @@ std::optional<exprt> python_converter::try_dispatch_dict_subscript(
   typet expected_type =
     dict_handler_->resolve_expected_type_for_dict_subscript(array);
 
+  // A dict read out of a list, as in rows[0]["k"], has no symbol to type its
+  // value by, and the handler's default reads it as a str. Take the type the
+  // list's dicts were built with; a later store may change it, so check it.
+  const nlohmann::json &base = element["value"];
+  bool check_type = false;
+  if (
+    (expected_type.is_nil() || expected_type.is_empty()) &&
+    base.value("_type", "") == "Subscript" &&
+    base["value"].value("_type", "") == "Name")
+  {
+    symbol_id list_id = create_symbol_id();
+    list_id.set_object(base["value"]["id"].get<std::string>());
+    if (const symbolt *list = find_symbol(list_id.to_string()))
+      expected_type =
+        dict_handler_->uniform_list_dict_value_type(list->id.as_string());
+    check_type = !expected_type.is_empty();
+  }
+
   // Pass the expected type to the dict handler
   // If empty, the handler will use its default heuristics
-  return dict_handler_->handle_dict_subscript(array, slice, expected_type);
+  return dict_handler_->handle_dict_subscript(
+    array, element["slice"], expected_type, check_type);
 }
 
 std::optional<exprt> python_converter::try_dispatch_multidim_tuple_axes(
@@ -1795,10 +1888,34 @@ std::optional<exprt> python_converter::try_dispatch_dunder_getitem(
   return get_function_call(call_node);
 }
 
+// Whether `node` is a name declared `Any`, as a for loop's tuple target
+// variable is when the iterable's element type is unknown.
+static bool is_declared_any(
+  const nlohmann::json &node,
+  const std::string &function,
+  const nlohmann::json &ast)
+{
+  if (node.value("_type", "") != "Name")
+    return false;
+  const nlohmann::json decl =
+    json_utils::find_var_decl(node.value("id", ""), function, ast);
+  return decl.value("_type", "") == "AnnAssign" &&
+         decl["annotation"].value("id", "") == "Any";
+}
+
 void python_converter::reject_scalar_subscript(
   const typet &array_type,
   const nlohmann::json &element) const
 {
+  // A void* value declared Any has no element type, so indexing it reads void
+  // (#8358). A numpy value of unknown type is a void* too, but is not
+  // declared Any, and its own lowering reads it.
+  if (
+    array_type.is_pointer() && array_type.subtype().is_empty() &&
+    is_declared_any(element["value"], current_func_name_, *ast_json))
+    throw std::runtime_error(
+      "subscripting a value whose type is not known is not supported");
+
   // Reject subscripting scalar numeric / boolean values up front. CPython
   // raises "TypeError: 'int'/'float'/'bool' object is not subscriptable";
   // the list handler below silently produces an unresolved-type value that
@@ -1880,7 +1997,7 @@ exprt python_converter::handle_subscript_expr(const nlohmann::json &element)
 
   if (
     std::optional<exprt> dict_result = try_dispatch_dict_subscript(
-      array, array_type_for_dict, array_is_dict_pointer, slice))
+      array, array_type_for_dict, array_is_dict_pointer, element))
     return *dict_result;
 
   const typet list_type = type_handler_.get_list_type();
@@ -1979,7 +2096,8 @@ assigns_class_attribute(const nlohmann::json &body, const std::string &attr)
 }
 
 // Whether `class_name` or a class it derives from binds `attr` itself. A
-// class not defined in this module, such as an imported one, is assumed to.
+// builtin exception binds only `args` and dunder attributes. Any other class
+// not defined in this module, such as an imported one, is assumed to.
 static bool class_binds_attribute(
   const nlohmann::json &ast,
   const std::string &class_name,
@@ -1987,6 +2105,8 @@ static bool class_binds_attribute(
 {
   if (class_name == "object")
     return false;
+  if (type_utils::is_python_exceptions(class_name))
+    return attr == "args" || attr.rfind("__", 0) == 0;
   for (const auto &stmt : ast["body"])
   {
     if (
@@ -2142,6 +2262,9 @@ exprt python_converter::get_expr(const nlohmann::json &element)
                                       exprt base_expr,
                                       const nlohmann::json &base_node,
                                       const std::string &attr_name) -> exprt {
+        // `make().x` reads off a call statement, which a member expression
+        // cannot hold; as a side effect the call is hoisted (#8925).
+        base_expr = to_value_expr(base_expr, ns);
         typet base_type = base_expr.type();
         if (base_type.is_pointer())
           base_type = base_type.subtype();
@@ -2224,6 +2347,15 @@ exprt python_converter::get_expr(const nlohmann::json &element)
             return migrate_expr_back(
               member2tc(migrate_type(clean_type), src2, attr_name));
           }
+          // No instance member: read the class attribute, never write it.
+          // The receiver is dropped, so only a symbol qualifies (e.g. the
+          // temporary a constructor call is hoisted into); dropping a call
+          // left in the expression would lose its effects.
+          if (!is_converting_lhs && base_expr.is_symbol())
+            if (
+              symbolt *class_attr = find_class_attribute_symbol(
+                struct_type.tag().as_string(), attr_name))
+              return symbol_expr(*class_attr);
         }
 
         return nil_exprt();
@@ -2503,15 +2635,9 @@ exprt python_converter::get_expr(const nlohmann::json &element)
     // reassigned across the numeric<->string boundary, get_var_assign minted a
     // fresh symbol of the new type and recorded it here. Redirect the load to
     // that symbol so it observes the variable's current type and value.
+    symbol = follow_retype_alias(symbol);
     if (!is_class_attr)
     {
-      auto alias = retype_aliases_.find(symbol->id.as_string());
-      if (alias != retype_aliases_.end())
-      {
-        if (symbolt *retyped = symbol_table_.find_symbol(alias->second))
-          symbol = retyped;
-      }
-
       symbol = resolve_numpy_array_storage_alias(symbol);
 
       // Also resolve reads through a permanent tagged-object alias, if a
@@ -2520,6 +2646,7 @@ exprt python_converter::get_expr(const nlohmann::json &element)
     }
 
     expr = symbol_expr(*symbol);
+    reject_inexact_number_join(element, expr);
 
     // If the looked-up symbol is an enum class attribute with int type,
     // wrap it in the proper enum struct expression so callers that expect
@@ -2844,6 +2971,7 @@ exprt python_converter::get_expr(const nlohmann::json &element)
       typet class_symbol_type = class_symbol->get_type();
       struct_typet &class_type = static_cast<struct_typet &>(class_symbol_type);
       auto build_member_expr_from_class = [&](const typet &attr_type) -> exprt {
+        guard_attribute_on_none(*symbol, var_name, attr_name, element);
         typet clean_type = clean_attribute_type(attr_type);
         exprt base = symbol_expr(*symbol);
         typet base_type = base.type();
@@ -2932,41 +3060,16 @@ exprt python_converter::get_expr(const nlohmann::json &element)
         (instance_has_attr || symbol->is_parameter ||
          is_complex_type(class_type)))
       {
+        reject_maybe_unset_instance_attr(
+          instance_has_attr, *symbol, var_name, attr_name, obj_type_name);
         const typet &attr_type = class_type.get_component(attr_name).type();
         expr = build_member_expr_from_class(attr_type);
       }
       // Otherwise use class attribute
       else
       {
-        sid.set_function("");
-        sid.set_class(extract_class_name_from_tag(obj_type_name));
-        sid.set_object(attr_name);
-        symbolt *class_attr_symbol = symbol_table_.find_symbol(sid.to_string());
-
-        if (!class_attr_symbol)
-        {
-          // Not found in the direct class — walk base classes (Python MRO).
-          const std::string derived_name =
-            extract_class_name_from_tag(obj_type_name);
-          auto class_node =
-            json_utils::find_class((*ast_json)["body"], derived_name);
-          if (!class_node.empty() && class_node.contains("bases"))
-          {
-            for (const auto &base_node : class_node["bases"])
-            {
-              if (!base_node.contains("id"))
-                continue;
-              symbol_id base_sid = create_symbol_id();
-              base_sid.set_function("");
-              base_sid.set_class(base_node["id"].get<std::string>());
-              base_sid.set_object(attr_name);
-              class_attr_symbol =
-                symbol_table_.find_symbol(base_sid.to_string());
-              if (class_attr_symbol)
-                break;
-            }
-          }
-        }
+        symbolt *class_attr_symbol = find_class_attribute_symbol(
+          extract_class_name_from_tag(obj_type_name), attr_name);
 
         if (!class_attr_symbol)
         {
@@ -3207,4 +3310,70 @@ exprt python_converter::build_slice_from_args(
       std::to_string(args.size()));
   }
   return make_slice_struct_expr(*this, lower, upper, step, source_node);
+}
+
+std::vector<dynamic_type_detail::numeric_bindingt>
+python_converter::scope_numeric_bindings(
+  const std::string &name,
+  int before,
+  bool include_later) const
+{
+  const nlohmann::json function = json_utils::find_function_by_path(
+    *ast_json, json_utils::split_function_path(current_function_name()));
+  const nlohmann::json &body = function.is_object() && function.contains("body")
+                                 ? function["body"]
+                                 : (*ast_json)["body"];
+  std::vector<dynamic_type_detail::numeric_bindingt> bindings;
+  dynamic_type_detail::collect_numeric_bindings(
+    body, name, false, before, include_later, bindings);
+  return bindings;
+}
+
+/// Whether `value` survives the C type `type` unchanged: a float is exact
+/// only for an integral literal, and an int in a double only for a literal
+/// of at most 2**53.
+static bool stored_exactly(const nlohmann::json &value, const typet &type)
+{
+  if (value.value("_type", "") != "Constant")
+    return false;
+  const nlohmann::json &literal = value["value"];
+  if (type.is_floatbv())
+    return literal.is_boolean() ||
+           (literal.is_number_integer() &&
+            std::abs(literal.get<long long>()) <= (1LL << 53));
+  return literal.is_number_float() &&
+         literal.get<double>() == static_cast<long long>(literal.get<double>());
+}
+
+/// A name bound an int on one path and a float on another ends up one C
+/// double, but a read converted before the float binding still sees an int.
+/// On the path whose value the variable cannot hold, a read sees a rounded
+/// value (#8418).
+void python_converter::reject_inexact_number_join(
+  const nlohmann::json &element,
+  const exprt &expr) const
+{
+  const bool is_double = expr.type().is_floatbv();
+  if (
+    element.value("_type", "") != "Name" ||
+    !(is_double || expr.type().is_signedbv()) || is_loading_models ||
+    is_model_file(element))
+    return;
+  const std::string name = element["id"].get<std::string>();
+  const int line = element.value("lineno", 0);
+  if (!dynamic_type_detail::is_path_dependent_number(
+        scope_numeric_bindings(name, line, true)))
+    return;
+  for (const auto &binding : scope_numeric_bindings(name, line, false))
+  {
+    const bool is_int = binding.kind == "int";
+    if (
+      (is_int && !stored_exactly(binding.value, double_type())) ||
+      (!is_int && !is_double && !stored_exactly(binding.value, expr.type())))
+      throw std::runtime_error(
+        "reading '" + name +
+        "' is not supported: it holds an int or a float depending on the "
+        "path, and the " +
+        binding.kind + " is not stored exactly");
+  }
 }
