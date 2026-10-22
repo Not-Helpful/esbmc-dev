@@ -129,7 +129,7 @@ bool clang_cpp_convertert::get_decl(const clang::Decl &decl, exprt &new_expr)
     const clang::ExplicitInstantiationDecl &ei =
       static_cast<const clang::ExplicitInstantiationDecl &>(decl);
 
-
+    DBM_PRINT("EXPLICIT");
     if (get_decl(*ei.getSpecialization(), new_expr))
       return true;
     break;

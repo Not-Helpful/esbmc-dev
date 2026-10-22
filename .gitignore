@@ -2,6 +2,9 @@
 cmake-*
 .idea
 
+node_modules/
+*.json
+
 # Visual Studio (and Code)
 out
 .vs
