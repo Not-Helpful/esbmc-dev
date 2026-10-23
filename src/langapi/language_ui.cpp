@@ -93,8 +93,10 @@ bool language_uit::typecheck()
   log_progress("Converting");
 
   for (auto &it : langmap)
+    
     if (it.second->typecheck(context, ""))
     {
+      DBM_PRINT("1");
       log_error("CONVERSION ERROR");
       return true;
     }
@@ -107,6 +109,7 @@ bool language_uit::final()
   for (auto &it : langmap)
     if (it.second->final(context))
     {
+      DBM_PRINT("2");
       log_error("CONVERSION ERROR");
       return true;
     }

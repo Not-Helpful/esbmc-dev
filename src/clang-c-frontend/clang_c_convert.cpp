@@ -97,7 +97,9 @@ bool clang_c_convertert::convert_top_level_decl()
     // This is the whole translation unit. We don't represent it internally
     exprt dummy_decl;
     if (get_decl(*ASTContext->getTranslationUnitDecl(), dummy_decl))
+    {
       return true;
+    }
   }
 
   assert(current_functionDecl == nullptr);
@@ -6141,11 +6143,13 @@ bool clang_c_convertert::get_APValue_expr(
     // Not an Expr: report what it is and where we are
     std::string what = "unknown";
     if (const auto *vd = base.dyn_cast<const clang::ValueDecl *>())
-      DBM_PRINT("ValueDecl");      
+    {
+      DBM_PRINT("ValueDecl");
+    }
     else if (base.is<clang::TypeInfoLValue>())
-      DBM_PRINT("TypeInfoLValue");      
+      DBM_PRINT("TypeInfoLValue");
     else if (base.is<clang::DynamicAllocLValue>())
-      DBM_PRINT("DynamicAllocLValue");      
+      DBM_PRINT("DynamicAllocLValue");
 
     return true;
   }

@@ -152,6 +152,7 @@ bool clang_cpp_languaget::typecheck(
   contextt &context,
   const std::string &module)
 {
+  DBM_PRINT("HELLO");
   set_language_version();
 
   // Convert + adjust this translation unit in an isolated context, then
@@ -162,7 +163,9 @@ bool clang_cpp_languaget::typecheck(
 
   clang_cpp_convertert converter(new_context, AST, "C++");
   if (converter.convert())
+  {
     return true;
+  }
 
   // Phase 7 hop-off, mirroring clang_c_language's: the IREP2 pass *replaces*
   // the legacy one so the divergence count under the flag measures how much of
@@ -173,17 +176,23 @@ bool clang_cpp_languaget::typecheck(
   {
     clang_cpp_adjust_irep2 irep2_adjuster(new_context, true, false);
     if (irep2_adjuster.adjust())
+    {
       return true;
+    }
   }
   else
   {
     clang_cpp_adjust adjuster(new_context);
     if (adjuster.adjust())
+    {
       return true;
+    }
   }
 
   if (c_link(context, new_context, module))
+  {
     return true;
+  }
 
   if (config.options.get_bool_option("clang-cpp-irep2-migrate-census"))
     migrate_census(context);
