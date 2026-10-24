@@ -7,7 +7,7 @@ cd ./../../
 
 echo "HPX TEST"
 cd $HOME/.repos/writing/hpx_memory_usage_bug/
-./build.sh
+# ./build.sh
 
 ./test.sh
 

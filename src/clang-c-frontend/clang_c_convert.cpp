@@ -6121,6 +6121,9 @@ bool clang_c_convertert::is_member_decl_static(const clang::MemberExpr &member)
   return false;
 }
 
+// NEW
+// This entire function needs a pass before pr
+// TODO: Rerun and inspect assertion failure.
 bool clang_c_convertert::get_APValue_expr(
   const clang::APValue &value,
   exprt &new_expr,
@@ -6136,15 +6139,28 @@ bool clang_c_convertert::get_APValue_expr(
     if (const auto *e = base.dyn_cast<const clang::Expr *>())
     {
       if (get_expr(*e, new_expr))
+      {
         return true;
+      }
       break;
     }
 
-    // Not an Expr: report what it is and where we are
-    std::string what = "unknown";
-    if (const auto *vd = base.dyn_cast<const clang::ValueDecl *>())
+    // NEW
+    if (const auto *VD = base.dyn_cast<const clang::ValueDecl *>())
     {
       DBM_PRINT("ValueDecl");
+      const clang::UnnamedGlobalConstantDecl &lsd =
+        static_cast<const clang::UnnamedGlobalConstantDecl &>(*VD);
+      DBM_PRINT("UnnamedGlobalConstant");
+      clang::QualType bt = base.getType();
+      if (get_APValue_expr(lsd.getValue(), new_expr, &bt))
+      {
+        return true;
+      }
+      else
+      {
+        return false;        
+      }        
     }
     else if (base.is<clang::TypeInfoLValue>())
       DBM_PRINT("TypeInfoLValue");
@@ -6171,13 +6187,22 @@ bool clang_c_convertert::get_APValue_expr(
     // to a struct exprt. Bases come first, then fields, mirroring how
     // ESBMC flattens base sub-objects into the struct components.
     if (type.isNull())
+    {
+      DBM_PRINT("r1");
       return true;
+    }
     typet t;
     if (get_type(type, t))
+    {
+      DBM_PRINT("r2");
       return true;
+    }
     t = get_complete_type(t, ns);
     if (!t.is_struct())
+    {
+      DBM_PRINT("r3");
       return true;
+    }
     new_expr = gen_zero(t);
 
     const auto *cxxrd = type->getAsCXXRecordDecl();
@@ -6194,7 +6219,10 @@ bool clang_c_convertert::get_APValue_expr(
         exprt sub;
         clang::QualType bt = base.getType();
         if (get_APValue_expr(value.getStructBase(base_idx), sub, &bt))
+        {
+          DBM_PRINT("r4");
           return true;
+        }
         if (op_idx < new_expr.operands().size())
           new_expr.operands().at(op_idx) = sub;
         ++base_idx;
@@ -6212,7 +6240,10 @@ bool clang_c_convertert::get_APValue_expr(
         exprt sub;
         clang::QualType ft = fd->getType();
         if (get_APValue_expr(value.getStructField(field_idx), sub, &ft))
+        {
+          DBM_PRINT("r5");
           return true;
+        }
         if (op_idx < new_expr.operands().size())
           new_expr.operands().at(op_idx) = sub;
         ++field_idx;
