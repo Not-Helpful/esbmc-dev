@@ -6145,22 +6145,14 @@ bool clang_c_convertert::get_APValue_expr(
       break;
     }
 
+    clang::QualType bt = base.getType();
     // NEW
     if (const auto *VD = base.dyn_cast<const clang::ValueDecl *>())
     {
-      DBM_PRINT("ValueDecl");
-      const clang::UnnamedGlobalConstantDecl &lsd =
-        static_cast<const clang::UnnamedGlobalConstantDecl &>(*VD);
-      DBM_PRINT("UnnamedGlobalConstant");
-      clang::QualType bt = base.getType();
-      if (get_APValue_expr(lsd.getValue(), new_expr, &bt))
-      {
-        return true;
-      }
-      else
-      {
-        return false;        
-      }        
+      if (
+        const auto *ugcd = llvm::dyn_cast<clang::UnnamedGlobalConstantDecl>(VD))
+        return get_APValue_expr(ugcd->getValue(), new_expr, &bt);
+      return true; // other decls unsupported for now
     }
     else if (base.is<clang::TypeInfoLValue>())
       DBM_PRINT("TypeInfoLValue");
