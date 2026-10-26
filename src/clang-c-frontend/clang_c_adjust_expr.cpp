@@ -227,6 +227,13 @@ void clang_c_adjust::adjust_struct(exprt &expr)
 {
   const typet &t = ns.follow(expr.type());
   /* can't be an initializer of an incomplete type, it's not allowed by C */
+
+  //DEBUG
+  if (t.incomplete())
+  {
+    DBM_PRINT("INCOMPLETE");
+    t.dump();
+  }    
   assert(!t.incomplete());
   const struct_union_typet::componentst &new_comp =
     to_struct_union_type(t).components();
@@ -236,6 +243,8 @@ void clang_c_adjust::adjust_struct(exprt &expr)
    * gen_zero(get_complete_type()), which resolves padding before this
    * pass, whereas the C frontend relies on this pass to add them. */
   const bool already_padded = (ops.size() == new_comp.size());
+
+  //DEBUG
   for (size_t i = 0; i < new_comp.size(); i++)
   {
     const struct_union_typet::componentt &c = new_comp[i];
@@ -244,8 +253,19 @@ void clang_c_adjust::adjust_struct(exprt &expr)
       // TODO: should we initialize pads with nondet values?
       ops.insert(ops.begin() + i, gen_zero(c.type()));
     }
+  }
+
+  if (ops.size() != new_comp.size())
+  {
+    DBM_PRINT("PROBLEM:");
+    expr.dump();
+  }
+
+  for (size_t i = 0; i < new_comp.size(); i++)
+  {
     adjust_expr(ops[i]);
   }
+
   assert(new_comp.size() == ops.size());
 }
 

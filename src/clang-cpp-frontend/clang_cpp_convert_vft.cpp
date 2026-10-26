@@ -47,6 +47,15 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
   const clang::CXXRecordDecl &cxxrd,
   struct_typet &type)
 {
+  if (
+    cxxrd.getQualifiedNameAsString() ==
+    "hpx::lcos::detail::future_data_refcnt_base")
+  {
+    volatile int x = 1+1;
+    DBM_PRINT("STOP");
+    DBM_PRINT(x);
+  }
+
   // Register cxxrd against any inherited vptr-class up front so that an
   // inline body containing dynamic_cast<cxxrd&>(base_ref) — converted by
   // the loop below — can match its own runtime type.
@@ -339,6 +348,14 @@ void clang_cpp_convertert::add_vtable_type_entry(
     std::vector<irep_idt> names = vt.member_names;
     std::vector<irep_idt> pretty_names = vt.member_pretty_names;
     std::vector<irep_idt> base_names = vt.member_base_names;
+
+    const irep_idt new_name =
+      vt_name.as_string() + "::" + comp.name().as_string();
+
+    if (std::find(names.begin(), names.end(), new_name) != names.end())
+    {
+      //DBM_PRINT(new_name);
+    }
 
     members.push_back(pointer_type2tc(migrate_type(comp.type())));
     names.push_back(vt_name.as_string() + "::" + comp.name().as_string());
