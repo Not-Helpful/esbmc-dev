@@ -232,8 +232,8 @@ void clang_c_adjust::adjust_struct(exprt &expr)
   if (t.incomplete())
   {
     DBM_PRINT("INCOMPLETE");
-    t.dump();
-  }    
+  }
+
   assert(!t.incomplete());
   const struct_union_typet::componentst &new_comp =
     to_struct_union_type(t).components();
@@ -259,6 +259,8 @@ void clang_c_adjust::adjust_struct(exprt &expr)
   {
     DBM_PRINT("PROBLEM:");
     expr.dump();
+    DBM_PRINT("t.dump():");
+    t.dump();
   }
 
   for (size_t i = 0; i < new_comp.size(); i++)

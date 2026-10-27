@@ -43,6 +43,8 @@ CC_DIAGNOSTIC_POP()
 #include <functional>
 #include <optional>
 
+int debug = 0;
+
 bool clang_cpp_convertert::get_struct_class_virtual_methods(
   const clang::CXXRecordDecl &cxxrd,
   struct_typet &type)
@@ -51,10 +53,17 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
     cxxrd.getQualifiedNameAsString() ==
     "hpx::lcos::detail::future_data_refcnt_base")
   {
-    volatile int x = 1+1;
-    DBM_PRINT("STOP");
-    DBM_PRINT(x);
+    debug = 1;
   }
+  else
+  {
+    debug = 0;
+  }
+
+  // TODO: Symbol can become stale.
+  // 1. check ns
+  // 2. Resume from previous call in callstack
+  // 3. Lower calls must check for completion and bail.   
 
   // Register cxxrd against any inherited vptr-class up front so that an
   // inline body containing dynamic_cast<cxxrd&>(base_ref) — converted by
@@ -315,6 +324,10 @@ void clang_cpp_convertert::add_vtable_type_entry(
   struct_typet::componentt &comp,
   symbolt *vtable_type_symbol)
 {
+  if (debug)
+  {
+    
+  }    
   /*
    * When we encounter a virtual or overriding method in a class,
    * need to add an entry to the vtable type symbol.

@@ -7,9 +7,6 @@ cd ./../../
 gdb \
   -ex "break clang_cpp_convert_vft.cpp:54" \
   -ex "run" \
-  -ex "c" \
-  -ex "break clang_cpp_convert_vft.cpp:357" \
-  -ex "c" \
   --args $HOME/.repos/esbmc-dev/build/latest/src/esbmc/esbmc \
     ../writing/hpx_memory_usage_bug/bug.cpp \
     -I $INSTALLS/hpx/built-with-clang-24/include/ \

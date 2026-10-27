@@ -152,7 +152,6 @@ bool clang_cpp_languaget::typecheck(
   contextt &context,
   const std::string &module)
 {
-  DBM_PRINT("HELLO");
   set_language_version();
 
   // Convert + adjust this translation unit in an isolated context, then
