@@ -45,6 +45,17 @@ CC_DIAGNOSTIC_POP()
 
 int debug = 0;
 
+#include <unordered_map> // hash table, O(1) average
+
+std::unordered_map<std::string, int> vtable_worklist;
+
+// bool clang_cpp_convertert::method_done(struct_typet &type)
+// {
+//   auto freshsym = context.find_symbol(
+//     vtable_type_prefix + tag_prefix + type.tag().as_string());
+//   if (freshsym && freshsym.type().)
+// }
+
 bool clang_cpp_convertert::get_struct_class_virtual_methods(
   const clang::CXXRecordDecl &cxxrd,
   struct_typet &type)
@@ -54,6 +65,15 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
     "hpx::lcos::detail::future_data_refcnt_base")
   {
     debug = 1;
+    auto a = context.find_symbol(
+      vtable_type_prefix + tag_prefix + type.tag().as_string());
+    if (a)
+    {
+      for (const auto &c : a->type().components())
+      {
+        c->dump();
+      }
+    }      
   }
   else
   {
@@ -63,7 +83,7 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
   // TODO: Symbol can become stale.
   // 1. check ns
   // 2. Resume from previous call in callstack
-  // 3. Lower calls must check for completion and bail.   
+  // 3. Lower calls must check for completion and bail.
 
   // Register cxxrd against any inherited vptr-class up front so that an
   // inline body containing dynamic_cast<cxxrd&>(base_ref) — converted by
@@ -74,13 +94,19 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
   {
     if (!md->isVirtual())
       continue;
-
     /*
      * 1. convert this virtual method and add them to class symbol type
      */
     struct_typet::componentt comp;
     if (get_decl(*md, comp))
       return true;
+
+    // if (
+    //   method_done(
+    //     cxxrd.getQualifiedNameAsString(), md.getQualifiedNameAsString()))
+    // {
+    //   continue;
+    // }
 
     // additional annotations for virtual/overriding methods
     if (annotate_virtual_overriding_methods(*md, comp))
@@ -324,10 +350,6 @@ void clang_cpp_convertert::add_vtable_type_entry(
   struct_typet::componentt &comp,
   symbolt *vtable_type_symbol)
 {
-  if (debug)
-  {
-    
-  }    
   /*
    * When we encounter a virtual or overriding method in a class,
    * need to add an entry to the vtable type symbol.
@@ -367,7 +389,7 @@ void clang_cpp_convertert::add_vtable_type_entry(
 
     if (std::find(names.begin(), names.end(), new_name) != names.end())
     {
-      //DBM_PRINT(new_name);
+      // DBM_PRINT(new_name);
     }
 
     members.push_back(pointer_type2tc(migrate_type(comp.type())));
