@@ -258,9 +258,9 @@ void clang_c_adjust::adjust_struct(exprt &expr)
   if (ops.size() != new_comp.size())
   {
     DBM_PRINT("PROBLEM:");
-    expr.dump();
-    DBM_PRINT("t.dump():");
-    t.dump();
+    // expr.dump();
+    // DBM_PRINT("t.dump():");
+    // t.dump();
   }
 
   for (size_t i = 0; i < new_comp.size(); i++)

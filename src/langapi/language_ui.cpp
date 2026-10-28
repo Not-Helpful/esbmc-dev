@@ -96,7 +96,6 @@ bool language_uit::typecheck()
     
     if (it.second->typecheck(context, ""))
     {
-      DBM_PRINT("1");
       log_error("CONVERSION ERROR");
       return true;
     }

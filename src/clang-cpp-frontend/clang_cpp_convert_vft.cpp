@@ -45,17 +45,6 @@ CC_DIAGNOSTIC_POP()
 
 int debug = 0;
 
-#include <unordered_map> // hash table, O(1) average
-
-std::unordered_map<std::string, int> vtable_worklist;
-
-// bool clang_cpp_convertert::method_done(struct_typet &type)
-// {
-//   auto freshsym = context.find_symbol(
-//     vtable_type_prefix + tag_prefix + type.tag().as_string());
-//   if (freshsym && freshsym.type().)
-// }
-
 bool clang_cpp_convertert::get_struct_class_virtual_methods(
   const clang::CXXRecordDecl &cxxrd,
   struct_typet &type)
@@ -65,15 +54,16 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
     "hpx::lcos::detail::future_data_refcnt_base")
   {
     debug = 1;
-    auto a = context.find_symbol(
-      vtable_type_prefix + tag_prefix + type.tag().as_string());
-    if (a)
-    {
-      for (const auto &c : a->type().components())
-      {
-        c->dump();
-      }
-    }      
+    // auto a = context.find_symbol(
+    //   vtable_type_prefix + tag_prefix + type.tag().as_string());
+    // if (a)
+    // {
+    //   for (const auto &c : to_struct_type(a->get_type()).components())
+    //   {
+    //     DBM_PRINT("CDUMP");
+    //     c.dump();
+    //   }
+    // }
   }
   else
   {
@@ -132,6 +122,14 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
     /*
      * 3. add an entry in the existing virtual table type symbol
      */
+    auto comps = to_struct_type(vtable_type_symbol->get_type()).components();
+    auto it = std::find_if(comps.begin(), comps.end(), [&](const auto &elem) {
+      return elem.get_base_name() == comp.get_base_name();
+    });
+    if (it != comps.end())
+    {
+      DBM_PRINT("REPEAT_FOUND");
+    }      
     add_vtable_type_entry(type, comp, vtable_type_symbol);
 
     /*
@@ -158,6 +156,18 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
    * Each vft is modelled as a struct of function pointers.
    */
   setup_vtable_struct_variables(cxxrd, type);
+
+  if (debug)
+  {
+    auto a = context.find_symbol(
+      vtable_type_prefix + tag_prefix + type.tag().as_string());
+    if (a)
+    {
+      DBM_PRINT("FINALDUMP");
+      a->dump();
+      type.dump();
+    }
+  }
 
   return false;
 }
@@ -296,6 +306,7 @@ symbolt *clang_cpp_convertert::add_vtable_type_symbol(
   {
     struct_typet st;
     st.tag(vt_type_symb.id);
+
     // Every vtable leads with the most-derived type's name, the way a real
     // Itanium-ABI vtable leads with a type_info pointer. `typeid` on a
     // polymorphic glvalue reads it through the object's vptr, which is the only
@@ -330,6 +341,7 @@ void clang_cpp_convertert::add_vptr(struct_typet &type)
    */
 
   irep_idt vt_name = vtable_type_prefix + tag_prefix + type.tag().as_string();
+
   // add a virtual-table pointer
   struct_typet::componentt component;
   component.type() = pointer_typet(symbol_typet(vt_name));
@@ -380,17 +392,17 @@ void clang_cpp_convertert::add_vtable_type_entry(
     assert(vt.member_base_names.size() == vt.members.size());
 
     std::vector<type2tc> members = vt.members;
+    if (debug)
+    {
+      DBM_PRINT("DUMP:");
+      DBM_PRINT(vt_name);
+    }
     std::vector<irep_idt> names = vt.member_names;
     std::vector<irep_idt> pretty_names = vt.member_pretty_names;
     std::vector<irep_idt> base_names = vt.member_base_names;
 
     const irep_idt new_name =
       vt_name.as_string() + "::" + comp.name().as_string();
-
-    if (std::find(names.begin(), names.end(), new_name) != names.end())
-    {
-      // DBM_PRINT(new_name);
-    }
 
     members.push_back(pointer_type2tc(migrate_type(comp.type())));
     names.push_back(vt_name.as_string() + "::" + comp.name().as_string());

@@ -6180,19 +6180,16 @@ bool clang_c_convertert::get_APValue_expr(
     // ESBMC flattens base sub-objects into the struct components.
     if (type.isNull())
     {
-      DBM_PRINT("r1");
       return true;
     }
     typet t;
     if (get_type(type, t))
     {
-      DBM_PRINT("r2");
       return true;
     }
     t = get_complete_type(t, ns);
     if (!t.is_struct())
     {
-      DBM_PRINT("r3");
       return true;
     }
     new_expr = gen_zero(t);
@@ -6212,7 +6209,6 @@ bool clang_c_convertert::get_APValue_expr(
         clang::QualType bt = base.getType();
         if (get_APValue_expr(value.getStructBase(base_idx), sub, &bt))
         {
-          DBM_PRINT("r4");
           return true;
         }
         if (op_idx < new_expr.operands().size())
@@ -6233,7 +6229,6 @@ bool clang_c_convertert::get_APValue_expr(
         clang::QualType ft = fd->getType();
         if (get_APValue_expr(value.getStructField(field_idx), sub, &ft))
         {
-          DBM_PRINT("r5");
           return true;
         }
         if (op_idx < new_expr.operands().size())
