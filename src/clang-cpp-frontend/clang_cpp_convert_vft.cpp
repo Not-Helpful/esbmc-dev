@@ -128,8 +128,8 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
     });
     if (it != comps.end())
     {
-      DBM_PRINT("REPEAT_FOUND");
-      DBM_PRINT(it->get_base_name());
+      //DBM_PRINT("REPEAT_FOUND");
+      //DBM_PRINT(it->get_base_name());
     }
     add_vtable_type_entry(type, comp, vtable_type_symbol);
 

@@ -228,7 +228,7 @@ void clang_c_adjust::adjust_struct(exprt &expr)
   const typet &t = ns.follow(expr.type());
   /* can't be an initializer of an incomplete type, it's not allowed by C */
 
-  //DEBUG
+  // DEBUG
   if (t.incomplete())
   {
     DBM_PRINT("INCOMPLETE");
@@ -237,6 +237,7 @@ void clang_c_adjust::adjust_struct(exprt &expr)
   assert(!t.incomplete());
   const struct_union_typet::componentst &new_comp =
     to_struct_union_type(t).components();
+
   exprt::operandst &ops = expr.operands();
   /* Only insert padding operands if the expression doesn't already have
    * them.  The Solidity frontend creates struct expressions via
@@ -244,7 +245,7 @@ void clang_c_adjust::adjust_struct(exprt &expr)
    * pass, whereas the C frontend relies on this pass to add them. */
   const bool already_padded = (ops.size() == new_comp.size());
 
-  //DEBUG
+  // DEBUG
   for (size_t i = 0; i < new_comp.size(); i++)
   {
     const struct_union_typet::componentt &c = new_comp[i];
@@ -257,6 +258,12 @@ void clang_c_adjust::adjust_struct(exprt &expr)
 
   if (ops.size() != new_comp.size())
   {
+    DBM_PRINT("NEWCOMP:");
+    for (auto c : new_comp)
+    {
+      DBM_PRINT("C:");
+      c.dump();
+    }
     DBM_PRINT("PROBLEM:");
     // expr.dump();
     // DBM_PRINT("t.dump():");
