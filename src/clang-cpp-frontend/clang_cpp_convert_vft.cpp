@@ -129,7 +129,8 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
     if (it != comps.end())
     {
       DBM_PRINT("REPEAT_FOUND");
-    }      
+      DBM_PRINT(it->get_base_name());
+    }
     add_vtable_type_entry(type, comp, vtable_type_symbol);
 
     /*
@@ -157,7 +158,9 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
    */
   setup_vtable_struct_variables(cxxrd, type);
 
-  if (debug)
+  if (
+    cxxrd.getQualifiedNameAsString() ==
+    "hpx::lcos::detail::future_data_refcnt_base")
   {
     auto a = context.find_symbol(
       vtable_type_prefix + tag_prefix + type.tag().as_string());
