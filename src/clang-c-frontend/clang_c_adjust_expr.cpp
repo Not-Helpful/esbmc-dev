@@ -256,19 +256,19 @@ void clang_c_adjust::adjust_struct(exprt &expr)
     }
   }
 
-  if (ops.size() != new_comp.size())
-  {
-    DBM_PRINT("NEWCOMP:");
-    for (auto c : new_comp)
-    {
-      DBM_PRINT("C:");
-      c.dump();
-    }
-    DBM_PRINT("PROBLEM:");
-    // expr.dump();
-    // DBM_PRINT("t.dump():");
-    // t.dump();
-  }
+  // if (ops.size() != new_comp.size())
+  // {
+  //   DBM_PRINT("NEWCOMP:");
+  //   for (auto c : new_comp)
+  //   {
+  //     DBM_PRINT("C:");
+  //     c.dump();
+  //   }
+  //   DBM_PRINT("PROBLEM:");
+  //   // expr.dump();
+  //   // DBM_PRINT("t.dump():");
+  //   // t.dump();
+  // }
 
   for (size_t i = 0; i < new_comp.size(); i++)
   {

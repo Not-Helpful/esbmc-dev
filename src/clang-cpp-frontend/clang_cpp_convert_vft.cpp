@@ -49,32 +49,6 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
   const clang::CXXRecordDecl &cxxrd,
   struct_typet &type)
 {
-  if (
-    cxxrd.getQualifiedNameAsString() ==
-    "hpx::lcos::detail::future_data_refcnt_base")
-  {
-    debug = 1;
-    // auto a = context.find_symbol(
-    //   vtable_type_prefix + tag_prefix + type.tag().as_string());
-    // if (a)
-    // {
-    //   for (const auto &c : to_struct_type(a->get_type()).components())
-    //   {
-    //     DBM_PRINT("CDUMP");
-    //     c.dump();
-    //   }
-    // }
-  }
-  else
-  {
-    debug = 0;
-  }
-
-  // TODO: Symbol can become stale.
-  // 1. check ns
-  // 2. Resume from previous call in callstack
-  // 3. Lower calls must check for completion and bail.
-
   // Register cxxrd against any inherited vptr-class up front so that an
   // inline body containing dynamic_cast<cxxrd&>(base_ref) — converted by
   // the loop below — can match its own runtime type.
@@ -84,19 +58,26 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
   {
     if (!md->isVirtual())
       continue;
+
+    symbolt *vtable_type_symbol = check_vtable_type_symbol_existence(type);
+    if (vtable_type_symbol)
+    {
+      irep_idt vt_name = vtable_type_prefix + tag_prefix + type.tag().as_string();
+    const irep_idt new_name =
+      vt_name.as_string() + "::" + comp.name().as_string();
+
+
+      const struct_type2t &vt = to_struct_type(vtable_type_symbol->get_type2());
+      std::vector<irep_idt> names = vt.member_names;
+      if (std::find(names.begin(), names.end(), new_name) != names.end())
+        return false; 
+    }
     /*
      * 1. convert this virtual method and add them to class symbol type
      */
     struct_typet::componentt comp;
     if (get_decl(*md, comp))
       return true;
-
-    // if (
-    //   method_done(
-    //     cxxrd.getQualifiedNameAsString(), md.getQualifiedNameAsString()))
-    // {
-    //   continue;
-    // }
 
     // additional annotations for virtual/overriding methods
     if (annotate_virtual_overriding_methods(*md, comp))
@@ -108,7 +89,6 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
      *  add virtual table type symbol and virtual pointer. Then add a new
      *  entry in the vtable.
      */
-    symbolt *vtable_type_symbol = check_vtable_type_symbol_existence(type);
     if (!vtable_type_symbol)
     {
       // first time we create the vtable type for this class
@@ -122,20 +102,14 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
     /*
      * 3. add an entry in the existing virtual table type symbol
      */
-    auto comps = to_struct_type(vtable_type_symbol->get_type()).components();
-    auto it = std::find_if(comps.begin(), comps.end(), [&](const auto &elem) {
-      return elem.get_base_name() == comp.get_base_name();
-    });
-    if (it != comps.end())
-    {
-      //DBM_PRINT("REPEAT_FOUND");
-      //DBM_PRINT(it->get_base_name());
-    }
     add_vtable_type_entry(type, comp, vtable_type_symbol);
 
     /*
      * 4. deal with overriding method
      */
+
+    // NOTE: Make sure new line in add_vtable_type_entry doesnt cascade here.
+    // Probably better to just not process the fucntion at all
     if (md->begin_overridden_methods() != md->end_overridden_methods())
     {
       /*
@@ -157,21 +131,6 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
    * Each vft is modelled as a struct of function pointers.
    */
   setup_vtable_struct_variables(cxxrd, type);
-
-  if (
-    cxxrd.getQualifiedNameAsString() ==
-    "hpx::lcos::detail::future_data_refcnt_base")
-  {
-    auto a = context.find_symbol(
-      vtable_type_prefix + tag_prefix + type.tag().as_string());
-    if (a)
-    {
-      DBM_PRINT("FINALDUMP");
-      a->dump();
-      type.dump();
-    }
-  }
-
   return false;
 }
 
@@ -395,17 +354,17 @@ void clang_cpp_convertert::add_vtable_type_entry(
     assert(vt.member_base_names.size() == vt.members.size());
 
     std::vector<type2tc> members = vt.members;
-    if (debug)
-    {
-      DBM_PRINT("DUMP:");
-      DBM_PRINT(vt_name);
-    }
+
     std::vector<irep_idt> names = vt.member_names;
     std::vector<irep_idt> pretty_names = vt.member_pretty_names;
     std::vector<irep_idt> base_names = vt.member_base_names;
 
     const irep_idt new_name =
       vt_name.as_string() + "::" + comp.name().as_string();
+
+    // // NEW
+    // if (std::find(names.begin(), names.end(), new_name) != names.end())
+    //   return; // slot already in the vtable type; skip the duplicate
 
     members.push_back(pointer_type2tc(migrate_type(comp.type())));
     names.push_back(vt_name.as_string() + "::" + comp.name().as_string());

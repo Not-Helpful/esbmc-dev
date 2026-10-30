@@ -1,4 +1,4 @@
-use.hs llvm bootstrap
+use.hs llvm 24
 cd build/latest/
 ninja -v src/esbmc/esbmc
 cd ./../../
