@@ -382,8 +382,11 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     // method.
 
     sym = context.move_symbol_to_context(symbol);
+    if (name == "class std::locale::id")
+    {
+      DBM_PRINT("TEST-2");
+    }
   }
-
 
   assert(sym->is_type);
 
@@ -465,7 +468,6 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     DBM_PRINT("TEST1");
   }
 
-
   /* Recursive field conversion can re-enter this record and complete it.
    * The incomplete flag is removed only after all fields and methods have
    * been processed, so a complete type here means another invocation has
@@ -479,6 +481,11 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
   }
 
   sym->set_type(t);
+  if (name == "class std::locale::id")
+  {
+    DBM_PRINT("SYMDUMP:");
+    sym->dump();
+  }
   sym = context.reorder_symbol_to_back(id);
 
   {
@@ -493,8 +500,13 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     sym->set_type(std::move(t));
   }
 
+
   if (name == "class std::locale::id")
   {
+    DBM_PRINT("Searching context:");
+    context.report_incompletes();
+    symbolt *testsym = context.find_last_symbol(id);
+    testsym->dump();
     DBM_PRINT("TEST3");
   }
 
@@ -1486,9 +1498,8 @@ bool clang_c_convertert::get_type(const clang::Type &the_type, typet &new_type)
 #if CLANG_VERSION_MAJOR >= 22
   case clang::Type::PredefinedSugar:
   {
-    if (
-      get_type(
-        *the_type.getLocallyUnqualifiedSingleStepDesugaredType(), new_type))
+    if (get_type(
+          *the_type.getLocallyUnqualifiedSingleStepDesugaredType(), new_type))
       return true;
     break;
   }
@@ -2785,9 +2796,8 @@ bool clang_c_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
     clang::QualType qtype = function_call.getCallReturnType(*ASTContext);
     // Sema types a custom-typechecked builtin's call itself: on an unsigned
     // char, __sync_fetch_and_add calls the char-returning _1 variant.
-    if (
-      const unsigned id = function_call.getBuiltinCallee();
-      id && ASTContext->BuiltinInfo.hasCustomTypechecking(id))
+    if (const unsigned id = function_call.getBuiltinCallee();
+        id && ASTContext->BuiltinInfo.hasCustomTypechecking(id))
       qtype = function_call.getType();
     if (get_type(qtype, type))
       return true;
@@ -6011,9 +6021,8 @@ bool clang_c_convertert::process_record_layout_attributes(
     }
 
     case clang::attr::Aligned:
-      if (
-        process_aligned_attribute(
-          static_cast<const clang::AlignedAttr &>(*attr), t))
+      if (process_aligned_attribute(
+            static_cast<const clang::AlignedAttr &>(*attr), t))
         return true;
       break;
 

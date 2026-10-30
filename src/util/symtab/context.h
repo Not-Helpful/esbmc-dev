@@ -110,7 +110,9 @@ public:
   {
     symbols.swap(other.symbols);
   }
-
+  symbolt *find_last_symbol(irep_idt name);
+  void check_duplicates() const;
+  void report_incompletes() const;
   symbolt *find_symbol(const char *name)
   {
     return find_symbol(irep_idt(name));

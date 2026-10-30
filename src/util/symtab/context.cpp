@@ -53,6 +53,51 @@ symbolt *contextt::find_symbol(irep_idt name)
   return nullptr;
 }
 
+void contextt::check_duplicates() const
+{
+  auto const &by_order_idx = symbols.get<by_order>();
+
+  std::unordered_set<irep_idt> seen;
+
+  for (const auto &symbol : by_order_idx)
+  {
+    DBM_PRINT("Dupe checking " << symbol.id);
+    if (!seen.insert(symbol.id).second)
+    {
+      std::cerr << "Duplicate symbol ID: " << symbol.id << '\n';
+    }
+  }
+}
+
+void contextt::report_incompletes() const
+{
+  auto const &by_order_idx = symbols.get<by_order>();
+  typet t;
+  for (const auto &symbol : by_order_idx)
+  {
+    t = symbol.get_type();
+    if (t.incomplete())
+    {
+      std::cerr << "Incomplete: " << symbol.id << '\n';
+    }
+  }
+}
+
+symbolt *contextt::find_last_symbol(irep_idt name)
+{
+  auto &by_order_idx = symbols.get<by_order>();
+
+  auto it = std::find_if(
+    by_order_idx.rbegin(),
+    by_order_idx.rend(),
+    [&name](const symbolt &symbol) { return symbol.id == name; });
+
+  if (it != by_order_idx.rend())
+    return const_cast<symbolt *>(&*it);
+
+  return nullptr;
+}
+
 const symbolt *contextt::find_symbol(irep_idt name) const
 {
   const auto &by_id_idx = symbols.get<by_id>();
