@@ -384,6 +384,7 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     sym = context.move_symbol_to_context(symbol);
   }
 
+
   assert(sym->is_type);
 
   // TODO: Fix me when we have a test case using C++ union.
@@ -396,6 +397,10 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
    * b) the type is being referred to under a pointer inside another type
    *    definition and up to this definition has not been defined, yet.
    */
+  if (name == "class std::locale::id")
+  {
+    DBM_PRINT("TEST-1");
+  }
   if (!rd.isCompleteDefinition())
     return false;
 
@@ -408,6 +413,12 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
    * which is why the id is tested as well as the flag (de9158daeb); it
    * terminates because every non-re-entrant arrival inserts its symbol
    * first. */
+
+  if (name == "class std::locale::id")
+  {
+    DBM_PRINT("TEST0");
+    sym->dump();
+  }
   if (!holds_incomplete_record(sym->get_type()))
     return false;
 
@@ -449,12 +460,23 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
   sym = context.find_symbol(id);
   assert(sym && "symbol disappeared from context during field conversion");
 
+  if (name == "class std::locale::id")
+  {
+    DBM_PRINT("TEST1");
+  }
+
+
   /* Recursive field conversion can re-enter this record and complete it.
    * The incomplete flag is removed only after all fields and methods have
    * been processed, so a complete type here means another invocation has
    * already completed this type. */
   if (!holds_incomplete_record(sym->get_type()))
     return false;
+
+  if (name == "class std::locale::id")
+  {
+    DBM_PRINT("TEST2");
+  }
 
   sym->set_type(t);
   sym = context.reorder_symbol_to_back(id);
@@ -469,6 +491,11 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     // Struct is complete
     t.remove(irept::a_incomplete);
     sym->set_type(std::move(t));
+  }
+
+  if (name == "class std::locale::id")
+  {
+    DBM_PRINT("TEST3");
   }
 
   return false;

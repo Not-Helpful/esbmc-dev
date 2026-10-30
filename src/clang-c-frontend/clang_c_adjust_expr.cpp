@@ -232,6 +232,7 @@ void clang_c_adjust::adjust_struct(exprt &expr)
   if (t.incomplete())
   {
     DBM_PRINT("INCOMPLETE");
+    expr.dump();
   }
 
   assert(!t.incomplete());

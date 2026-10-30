@@ -59,19 +59,6 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
     if (!md->isVirtual())
       continue;
 
-    symbolt *vtable_type_symbol = check_vtable_type_symbol_existence(type);
-    if (vtable_type_symbol)
-    {
-      irep_idt vt_name = vtable_type_prefix + tag_prefix + type.tag().as_string();
-    const irep_idt new_name =
-      vt_name.as_string() + "::" + comp.name().as_string();
-
-
-      const struct_type2t &vt = to_struct_type(vtable_type_symbol->get_type2());
-      std::vector<irep_idt> names = vt.member_names;
-      if (std::find(names.begin(), names.end(), new_name) != names.end())
-        return false; 
-    }
     /*
      * 1. convert this virtual method and add them to class symbol type
      */
@@ -89,6 +76,7 @@ bool clang_cpp_convertert::get_struct_class_virtual_methods(
      *  add virtual table type symbol and virtual pointer. Then add a new
      *  entry in the vtable.
      */
+    symbolt *vtable_type_symbol = check_vtable_type_symbol_existence(type);
     if (!vtable_type_symbol)
     {
       // first time we create the vtable type for this class
@@ -362,9 +350,9 @@ void clang_cpp_convertert::add_vtable_type_entry(
     const irep_idt new_name =
       vt_name.as_string() + "::" + comp.name().as_string();
 
-    // // NEW
-    // if (std::find(names.begin(), names.end(), new_name) != names.end())
-    //   return; // slot already in the vtable type; skip the duplicate
+    // NEW
+    if (std::find(names.begin(), names.end(), new_name) != names.end())
+      return; // slot already in the vtable type; skip the duplicate
 
     members.push_back(pointer_type2tc(migrate_type(comp.type())));
     names.push_back(vt_name.as_string() + "::" + comp.name().as_string());
