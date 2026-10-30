@@ -159,7 +159,6 @@ bool clang_cpp_languaget::typecheck(
   // This keeps each TU's convert/adjust from re-walking and re-adjusting
   // symbols contributed by other frontends/TUs sharing `context` (#5309).
   contextt new_context;
-
   clang_cpp_convertert converter(new_context, AST, "C++");
   if (converter.convert())
   {
