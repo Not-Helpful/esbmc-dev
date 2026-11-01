@@ -232,7 +232,21 @@ void clang_c_adjust::adjust_struct(exprt &expr)
   if (t.incomplete())
   {
     DBM_PRINT("INCOMPLETE");
+    DBM_PRINT(t.tag());
+    symbolt *testsym = context.find_symbol(t.id());
+    symbolt *testsym_tag = context.find_symbol(t.tag());
+    if (testsym)
+    {
+      DBM_PRINT("TESTSYM");
+      testsym->dump();
+    }
+    if (testsym_tag)
+    {
+      DBM_PRINT("TESTTAGSYM");
+      testsym_tag->dump();
+    }
     expr.dump();
+    t.dump();    
   }
 
   assert(!t.incomplete());

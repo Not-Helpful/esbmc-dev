@@ -618,6 +618,7 @@ bool clang_cpp_convertert::get_struct_union_class_methods_decls(
     llvm::dyn_cast<clang::CXXRecordDecl>(&recordd);
   if (cxxrd == nullptr)
     return false;
+  
 
   /*
    * Order of converting methods:

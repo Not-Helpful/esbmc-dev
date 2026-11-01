@@ -78,7 +78,7 @@ void contextt::report_incompletes() const
     t = symbol.get_type();
     if (t.incomplete())
     {
-      std::cerr << "Incomplete: " << symbol.id << '\n';
+      std::cerr << "Incomplete: " << symbol.id << " && "<< t.tag() << '\n';
     }
   }
 }
