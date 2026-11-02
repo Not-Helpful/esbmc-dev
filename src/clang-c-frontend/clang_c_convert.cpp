@@ -505,6 +505,7 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
   {
     DBM_PRINT("Searching context:");
     context.report_incompletes();
+    DBM_PRINT("DUMPING SYM:" << id);
     symbolt *testsym = context.find_last_symbol(id);
     testsym->dump();
     DBM_PRINT("TEST3");

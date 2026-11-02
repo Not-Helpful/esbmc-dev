@@ -53,6 +53,13 @@ symbolt *contextt::find_symbol(irep_idt name)
   return nullptr;
 }
 
+symbolt *contextt::find_symbol_by_base(irep_idt base_name)
+{
+  for (const symbolt &s : symbols.get<by_id>())
+    if (s.name == base_name)
+      return const_cast<symbolt *>(&s);
+}
+
 void contextt::check_duplicates() const
 {
   auto const &by_order_idx = symbols.get<by_order>();
@@ -78,7 +85,7 @@ void contextt::report_incompletes() const
     t = symbol.get_type();
     if (t.incomplete())
     {
-      std::cerr << "Incomplete: " << symbol.id << " && "<< t.tag() << '\n';
+      std::cerr << "Incomplete: " << symbol.id << " && " << t.tag() << '\n';
     }
   }
 }
@@ -88,9 +95,9 @@ symbolt *contextt::find_last_symbol(irep_idt name)
   auto &by_order_idx = symbols.get<by_order>();
 
   auto it = std::find_if(
-    by_order_idx.rbegin(),
-    by_order_idx.rend(),
-    [&name](const symbolt &symbol) { return symbol.id == name; });
+    by_order_idx.rbegin(), by_order_idx.rend(), [&name](const symbolt &symbol) {
+      return symbol.id == name;
+    });
 
   if (it != by_order_idx.rend())
     return const_cast<symbolt *>(&*it);

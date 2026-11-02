@@ -232,21 +232,13 @@ void clang_c_adjust::adjust_struct(exprt &expr)
   if (t.incomplete())
   {
     DBM_PRINT("INCOMPLETE");
-    DBM_PRINT(t.tag());
-    symbolt *testsym = context.find_symbol(t.id());
-    symbolt *testsym_tag = context.find_symbol(t.tag());
-    if (testsym)
-    {
-      DBM_PRINT("TESTSYM");
-      testsym->dump();
-    }
-    if (testsym_tag)
-    {
-      DBM_PRINT("TESTTAGSYM");
-      testsym_tag->dump();
-    }
-    expr.dump();
-    t.dump();    
+    symbolt *testsym_tag = context.find_symbol_by_base(t.tag());
+    expr.type() = testsym_tag->get_type();
+  }
+
+  if (t.incomplete())
+  {
+    DBM_PRINT("STILL INCOMPLETE");
   }
 
   assert(!t.incomplete());
@@ -1221,10 +1213,9 @@ void clang_c_adjust::adjust_side_effect_function_call(
   if (f_op.is_symbol())
   {
     const irep_idt &identifier = f_op.identifier();
-    if (
-      exprt poly = declare_gcc_polymorphic_builtin(
-        to_symbol_expr(f_op), expr.arguments(), expr.location(), context);
-      poly.is_not_nil())
+    if (exprt poly = declare_gcc_polymorphic_builtin(
+          to_symbol_expr(f_op), expr.arguments(), expr.location(), context);
+        poly.is_not_nil())
     {
       f_op = std::move(poly);
     }

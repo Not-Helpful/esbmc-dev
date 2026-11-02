@@ -118,6 +118,7 @@ public:
     return find_symbol(irep_idt(name));
   }
   symbolt *find_symbol(irep_idt name);
+  symbolt *find_symbol_by_base(irep_idt name);
   const symbolt *find_symbol(irep_idt name) const;
 
   void erase_symbol(irep_idt name);
