@@ -55,6 +55,17 @@ bool clang_c_adjust::adjust()
     if (symbol.is_type)
     {
       typet t = symbol.get_type();
+      if (t.incomplete())
+      {
+        DBM_PRINT("INCOMPLETE TYPE");
+        symbolt *testsym_tag = context.find_symbol_by_base(t.tag());
+        t = testsym_tag->get_type();
+
+        if (t.incomplete())
+        {
+          DBM_PRINT("PROBLEM");
+        }
+      }
       adjust_type(t);
       symbol.set_type(std::move(t));
     }
@@ -1102,6 +1113,13 @@ void clang_c_adjust::adjust_type(typet &type)
     for (auto &f : to_struct_union_type(type).components())
       adjust_expr(f);
 
+    if (type.incomplete())
+    {
+      DBM_PRINT("INCOMPLETE");
+      symbolt *testsym_tag = context.find_symbol_by_base(type.tag());
+      type = testsym_tag->get_type();
+    }
+
     add_padding(type, ns);
 
 #ifndef NDEBUG
@@ -1113,6 +1131,12 @@ void clang_c_adjust::adjust_type(typet &type)
       assert(sz % a == 0);
     }
     typet copy = type;
+    if (copy.incomplete())
+    {
+      DBM_PRINT("INCOMPLETE");
+      symbolt *testsym_tag = context.find_symbol_by_base(copy.tag());
+      copy = testsym_tag->get_type();
+    }
     add_padding(copy, ns);
     assert(copy == type);
 #endif
@@ -1213,9 +1237,10 @@ void clang_c_adjust::adjust_side_effect_function_call(
   if (f_op.is_symbol())
   {
     const irep_idt &identifier = f_op.identifier();
-    if (exprt poly = declare_gcc_polymorphic_builtin(
-          to_symbol_expr(f_op), expr.arguments(), expr.location(), context);
-        poly.is_not_nil())
+    if (
+      exprt poly = declare_gcc_polymorphic_builtin(
+        to_symbol_expr(f_op), expr.arguments(), expr.location(), context);
+      poly.is_not_nil())
     {
       f_op = std::move(poly);
     }
