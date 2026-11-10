@@ -60,7 +60,9 @@ const typet &namespacet::follow(const typet &src) const
     assert(symbol);
     assert(symbol->is_type);
     if (!symbol->get_type().is_symbol())
-      return symbol->get_type();
+    {
+     return symbol->get_type();
+    }
     const symbolt *next = lookup(symbol->get_type());
     assert(next != symbol && "cycle of length 1 in ns.follow()");
     symbol = next;

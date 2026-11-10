@@ -52,20 +52,23 @@ bool clang_c_adjust::adjust()
   Forall_symbol_list(it, symbol_list)
   {
     symbolt &symbol = **it;
+    typet t;
     if (symbol.is_type)
     {
-      typet t = symbol.get_type();
-      if (t.incomplete())
+      const typet &followed_type = ns.follow(symbol.get_type());
+      if (followed_type.incomplete())
       {
-        DBM_PRINT("INCOMPLETE TYPE");
-        symbolt *testsym_tag = context.find_symbol_by_base(t.tag());
-        t = testsym_tag->get_type();
+        DBM_PRINT("FIXING");
+        symbolt *testsym_tag =
+          context.find_symbol_by_base(symbol.get_type().tag());
 
-        if (t.incomplete())
-        {
-          DBM_PRINT("PROBLEM");
-        }
+        t = testsym_tag->get_type();
       }
+      else
+      {
+        t = symbol.get_type();
+      }
+
       adjust_type(t);
       symbol.set_type(std::move(t));
     }
@@ -1113,13 +1116,6 @@ void clang_c_adjust::adjust_type(typet &type)
     for (auto &f : to_struct_union_type(type).components())
       adjust_expr(f);
 
-    if (type.incomplete())
-    {
-      DBM_PRINT("INCOMPLETE");
-      symbolt *testsym_tag = context.find_symbol_by_base(type.tag());
-      type = testsym_tag->get_type();
-    }
-
     add_padding(type, ns);
 
 #ifndef NDEBUG
@@ -1131,12 +1127,7 @@ void clang_c_adjust::adjust_type(typet &type)
       assert(sz % a == 0);
     }
     typet copy = type;
-    if (copy.incomplete())
-    {
-      DBM_PRINT("INCOMPLETE");
-      symbolt *testsym_tag = context.find_symbol_by_base(copy.tag());
-      copy = testsym_tag->get_type();
-    }
+
     add_padding(copy, ns);
     assert(copy == type);
 #endif
