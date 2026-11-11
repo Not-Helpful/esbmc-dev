@@ -71,6 +71,7 @@ protected:
    * methods for type (typet) adjustment
    */
   void adjust_type(typet &type);
+  void adjust_incompletes(typet &type);
 
   /**
    * methods for expression (exprt) adjustment

@@ -388,11 +388,17 @@ static void add_padding(union_typet &type, const namespacet &ns)
 void add_padding(typet &type, const namespacet &ns)
 {
   if (type.is_symbol())
+  {
     return add_padding(const_cast<typet &>(ns.lookup(type)->get_type()), ns);
+  }
 
   /* Only structs and unions get padded, all other types are fine */
   if (type.is_struct())
+  {
     add_padding(to_struct_type(type), ns);
+  }
   else if (type.is_union())
+  {
     add_padding(to_union_type(type), ns);
+  }
 }

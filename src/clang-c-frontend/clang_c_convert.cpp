@@ -382,10 +382,6 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     // method.
 
     sym = context.move_symbol_to_context(symbol);
-    if (name == "class std::locale::id")
-    {
-      DBM_PRINT("TEST-2");
-    }
   }
 
   assert(sym->is_type);
@@ -400,10 +396,6 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
    * b) the type is being referred to under a pointer inside another type
    *    definition and up to this definition has not been defined, yet.
    */
-  if (name == "class std::locale::id")
-  {
-    DBM_PRINT("TEST-1");
-  }
   if (!rd.isCompleteDefinition())
     return false;
 
@@ -417,11 +409,6 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
    * terminates because every non-re-entrant arrival inserts its symbol
    * first. */
 
-  if (name == "class std::locale::id")
-  {
-    DBM_PRINT("TEST0");
-    sym->dump();
-  }
   if (!holds_incomplete_record(sym->get_type()))
     return false;
 
@@ -463,10 +450,6 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
   sym = context.find_symbol(id);
   assert(sym && "symbol disappeared from context during field conversion");
 
-  if (name == "class std::locale::id")
-  {
-    DBM_PRINT("TEST1");
-  }
 
   /* Recursive field conversion can re-enter this record and complete it.
    * The incomplete flag is removed only after all fields and methods have
@@ -475,17 +458,8 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
   if (!holds_incomplete_record(sym->get_type()))
     return false;
 
-  if (name == "class std::locale::id")
-  {
-    DBM_PRINT("TEST2");
-  }
 
   sym->set_type(t);
-  if (name == "class std::locale::id")
-  {
-    DBM_PRINT("SYMDUMP:");
-    sym->dump();
-  }
   sym = context.reorder_symbol_to_back(id);
 
   {
@@ -500,16 +474,6 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     sym->set_type(std::move(t));
   }
 
-
-  if (name == "class std::locale::id")
-  {
-    DBM_PRINT("Searching context:");
-    context.report_incompletes();
-    DBM_PRINT("DUMPING SYM:" << id);
-    symbolt *testsym = context.find_last_symbol(id);
-    testsym->dump();
-    DBM_PRINT("TEST3");
-  }
 
   return false;
 }

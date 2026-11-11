@@ -52,23 +52,9 @@ bool clang_c_adjust::adjust()
   Forall_symbol_list(it, symbol_list)
   {
     symbolt &symbol = **it;
-    typet t;
     if (symbol.is_type)
     {
-      const typet &followed_type = ns.follow(symbol.get_type());
-      if (followed_type.incomplete())
-      {
-        DBM_PRINT("FIXING");
-        symbolt *testsym_tag =
-          context.find_symbol_by_base(symbol.get_type().tag());
-
-        t = testsym_tag->get_type();
-      }
-      else
-      {
-        t = symbol.get_type();
-      }
-
+      typet t = symbol.get_type();
       adjust_type(t);
       symbol.set_type(std::move(t));
     }
@@ -241,7 +227,6 @@ void clang_c_adjust::adjust_struct(exprt &expr)
 {
   const typet &t = ns.follow(expr.type());
   /* can't be an initializer of an incomplete type, it's not allowed by C */
-
   // DEBUG
   if (t.incomplete())
   {
@@ -250,23 +235,16 @@ void clang_c_adjust::adjust_struct(exprt &expr)
     expr.type() = testsym_tag->get_type();
   }
 
-  if (t.incomplete())
-  {
-    DBM_PRINT("STILL INCOMPLETE");
-  }
-
   assert(!t.incomplete());
+
   const struct_union_typet::componentst &new_comp =
     to_struct_union_type(t).components();
-
   exprt::operandst &ops = expr.operands();
   /* Only insert padding operands if the expression doesn't already have
    * them.  The Solidity frontend creates struct expressions via
    * gen_zero(get_complete_type()), which resolves padding before this
    * pass, whereas the C frontend relies on this pass to add them. */
   const bool already_padded = (ops.size() == new_comp.size());
-
-  // DEBUG
   for (size_t i = 0; i < new_comp.size(); i++)
   {
     const struct_union_typet::componentt &c = new_comp[i];
@@ -275,27 +253,8 @@ void clang_c_adjust::adjust_struct(exprt &expr)
       // TODO: should we initialize pads with nondet values?
       ops.insert(ops.begin() + i, gen_zero(c.type()));
     }
-  }
-
-  // if (ops.size() != new_comp.size())
-  // {
-  //   DBM_PRINT("NEWCOMP:");
-  //   for (auto c : new_comp)
-  //   {
-  //     DBM_PRINT("C:");
-  //     c.dump();
-  //   }
-  //   DBM_PRINT("PROBLEM:");
-  //   // expr.dump();
-  //   // DBM_PRINT("t.dump():");
-  //   // t.dump();
-  // }
-
-  for (size_t i = 0; i < new_comp.size(); i++)
-  {
     adjust_expr(ops[i]);
   }
-
   assert(new_comp.size() == ops.size());
 }
 
@@ -1041,6 +1000,26 @@ void clang_c_adjust::adjust_dereference(exprt &deref)
   }
 }
 
+void clang_c_adjust::adjust_incompletes(typet &type)
+{
+  if ((type.is_struct() || type.is_union()))
+  {
+    struct_typet stype = to_struct_type(type);
+    // Check for incompletes
+    struct_typet::componentst &components = stype.components();
+    for (struct_typet::componentt &c : components)
+    {
+      if (c.type().incomplete())
+      {
+        DBM_PRINT("INCOMPLETE2");
+        symbolt *testsym_tag = context.find_symbol_by_base(c.type().tag());
+        c.type() = testsym_tag->get_type();
+      }
+      adjust_incompletes(c.type());
+    }
+  }
+}
+
 void clang_c_adjust::adjust_sizeof(exprt &expr)
 {
   // op0 is a type_exprt carrying the measured type T; op1, when present, is
@@ -1112,6 +1091,8 @@ void clang_c_adjust::adjust_type(typet &type)
   }
   else if ((type.is_struct() || type.is_union()) && !type.incomplete())
   {
+    adjust_incompletes(type);
+
     /* components only exist for complete types */
     for (auto &f : to_struct_union_type(type).components())
       adjust_expr(f);
@@ -1127,7 +1108,6 @@ void clang_c_adjust::adjust_type(typet &type)
       assert(sz % a == 0);
     }
     typet copy = type;
-
     add_padding(copy, ns);
     assert(copy == type);
 #endif
