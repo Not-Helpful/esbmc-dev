@@ -106,6 +106,12 @@ raise_to_explicit_alignment(BigInt &max_alignment, const exprt &alignment)
 
 static void add_padding(struct_typet &type, const namespacet &ns)
 {
+  if (type.incomplete())
+  {
+    DBM_PRINT("ADD_PADDING");
+    type.dump();
+  }
+ 
   /* components only exist for complete types */
   assert(!type.incomplete());
 

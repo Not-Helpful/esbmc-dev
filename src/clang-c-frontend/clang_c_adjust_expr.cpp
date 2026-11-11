@@ -1,3 +1,4 @@
+#include "irep/std_types.h"
 #include <clang-c-frontend/clang_c_adjust.h>
 #include <clang-c-frontend/clang_c_base_layout.h>
 #include <clang-c-frontend/clang_c_adjust_irep2.h>
@@ -230,7 +231,7 @@ void clang_c_adjust::adjust_struct(exprt &expr)
   // DEBUG
   if (t.incomplete())
   {
-    DBM_PRINT("INCOMPLETE");
+    //DBM_PRINT("INCOMPLETE");
     symbolt *testsym_tag = context.find_symbol_by_base(t.tag());
     expr.type() = testsym_tag->get_type();
   }
@@ -1011,12 +1012,18 @@ void clang_c_adjust::adjust_incompletes(typet &type)
     {
       if (c.type().incomplete())
       {
-        DBM_PRINT("INCOMPLETE2");
+        //DBM_PRINT("INCOMPLETE2");
+        //c.type().dump();
         symbolt *testsym_tag = context.find_symbol_by_base(c.type().tag());
+        //DBM_PRINT("INCOMPLETE2");
+        //testsym_tag->dump();
         c.type() = testsym_tag->get_type();
+        //DBM_PRINT("INCOMPLETE2");
+        //c.type().dump();
       }
       adjust_incompletes(c.type());
     }
+    type = to_struct_union_type(stype);
   }
 }
 
