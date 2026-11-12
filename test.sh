@@ -11,3 +11,7 @@ cd $HOME/.repos/writing/hpx_memory_usage_bug/
 
 ./test.sh
 
+
+# cd build/latest/
+
+# ctest -R "$(sed 's/[][\/.^$*+?{}()|]/\\&/g' ../../suspects/ctest_fails.txt | paste -sd '|' | sed 's/^/^(/;s/$/)$/')"

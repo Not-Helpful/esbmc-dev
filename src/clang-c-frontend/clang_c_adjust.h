@@ -72,12 +72,13 @@ protected:
    */
   void adjust_type(typet &type);
   void adjust_incompletes(typet &type);
+  void print_incompletes(typet &type);
 
-  /**
-   * methods for expression (exprt) adjustment
-   * and other IRs derived from exprt
-   */
-  void adjust_expr(exprt &expr);
+    /**
+     * methods for expression (exprt) adjustment
+     * and other IRs derived from exprt
+     */
+    void adjust_expr(exprt &expr);
   void adjust_base_to_derived(exprt &expr);
   void adjust_derived_to_base(exprt &expr, const irep_idt &base_id);
   void adjust_call_argument(exprt &arg);

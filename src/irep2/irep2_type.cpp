@@ -478,22 +478,22 @@ bool struct_union_packed(const type2tc &t)
 std::optional<unsigned int>
 struct_union_get_component_number(const type2tc &t, const irep_idt &comp)
 {
-  //DBM_PRINT("DUMP" << comp);
+  DBM_PRINT("DUMP" << comp);
   //t->dump();
   const std::vector<irep_idt> names = struct_union_member_names(t);
   unsigned int i = 0, count = 0, pos = 0;
   for (const irep_idt &it : names)
   {
-    //DBM_PRINT(it << " == " << comp);
+    DBM_PRINT(it << " == " << comp);
     if (it == comp)
     {
       pos = i;
       ++count;
-      //DBM_PRINT("+1");
-      //DBM_PRINT("pos: " << pos);
     }
     i++;
   }
+  DBM_PRINT("COUNT: " << count);
+  DBM_PRINT("POS: " << pos);
 
   if (count == 1)
     return pos;

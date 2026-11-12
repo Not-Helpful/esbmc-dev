@@ -24,6 +24,19 @@ clang_c_adjust::clang_c_adjust(contextt &_context)
 {
 }
 
+// NEW
+void clang_c_adjust::adjust_incompletes(typet &type)
+{
+  if (type.incomplete())
+  {
+    symbolt *testsym_tag = context.find_symbol(type.identifier());
+    if (testsym_tag)
+    {
+      type = testsym_tag->get_type();
+    }
+  }
+}
+
 bool clang_c_adjust::adjust()
 {
   // migrate_expr and migrate_type resolve a symbol through this thread-local
@@ -228,14 +241,6 @@ void clang_c_adjust::adjust_struct(exprt &expr)
 {
   const typet &t = ns.follow(expr.type());
   /* can't be an initializer of an incomplete type, it's not allowed by C */
-  // DEBUG
-  if (t.incomplete())
-  {
-    //DBM_PRINT("INCOMPLETE");
-    symbolt *testsym_tag = context.find_symbol_by_base(t.tag());
-    expr.type() = testsym_tag->get_type();
-  }
-
   assert(!t.incomplete());
 
   const struct_union_typet::componentst &new_comp =
@@ -1001,32 +1006,6 @@ void clang_c_adjust::adjust_dereference(exprt &deref)
   }
 }
 
-void clang_c_adjust::adjust_incompletes(typet &type)
-{
-  if ((type.is_struct() || type.is_union()))
-  {
-    struct_typet stype = to_struct_type(type);
-    // Check for incompletes
-    struct_typet::componentst &components = stype.components();
-    for (struct_typet::componentt &c : components)
-    {
-      if (c.type().incomplete())
-      {
-        //DBM_PRINT("INCOMPLETE2");
-        //c.type().dump();
-        symbolt *testsym_tag = context.find_symbol_by_base(c.type().tag());
-        //DBM_PRINT("INCOMPLETE2");
-        //testsym_tag->dump();
-        c.type() = testsym_tag->get_type();
-        //DBM_PRINT("INCOMPLETE2");
-        //c.type().dump();
-      }
-      adjust_incompletes(c.type());
-    }
-    type = to_struct_union_type(stype);
-  }
-}
-
 void clang_c_adjust::adjust_sizeof(exprt &expr)
 {
   // op0 is a type_exprt carrying the measured type T; op1, when present, is
@@ -1059,6 +1038,8 @@ void clang_c_adjust::adjust_sizeof(exprt &expr)
 
 void clang_c_adjust::adjust_type(typet &type)
 {
+  // NEW
+  adjust_incompletes(type);
   if (type.is_symbol())
   {
     const irep_idt &identifier = type.identifier();
@@ -1098,8 +1079,6 @@ void clang_c_adjust::adjust_type(typet &type)
   }
   else if ((type.is_struct() || type.is_union()) && !type.incomplete())
   {
-    adjust_incompletes(type);
-
     /* components only exist for complete types */
     for (auto &f : to_struct_union_type(type).components())
       adjust_expr(f);
@@ -1215,10 +1194,9 @@ void clang_c_adjust::adjust_side_effect_function_call(
   if (f_op.is_symbol())
   {
     const irep_idt &identifier = f_op.identifier();
-    if (
-      exprt poly = declare_gcc_polymorphic_builtin(
-        to_symbol_expr(f_op), expr.arguments(), expr.location(), context);
-      poly.is_not_nil())
+    if (exprt poly = declare_gcc_polymorphic_builtin(
+          to_symbol_expr(f_op), expr.arguments(), expr.location(), context);
+        poly.is_not_nil())
     {
       f_op = std::move(poly);
     }
