@@ -97,6 +97,10 @@ const struct group_opt_templ all_cmd_options[] = {
     {"show-stacktrace",
      NULL,
      "Show the stack trace of function call in the counterexample"},
+    {"show-funccall-trace",
+     NULL,
+     "Show the chronological sequence of function calls leading to the "
+     "counterexample (reentrancy-aware)"},
     {"simplify-trace",
      NULL,
      "Simplify the trace and exclude the assignments whose variables are not "
@@ -174,13 +178,14 @@ const struct group_opt_templ all_cmd_options[] = {
     {"funsigned-char", NULL, "Make \"char\" unsigned by default"},
     {"fms-extensions", NULL, "Enable microsoft C extensions"},
     {"argv-max-args",
-     boost::program_options::value<int>()->default_value(2)->value_name("nr"),
-     "Maximum number of argv entries backed with nondet strings (default 2). "
+     boost::program_options::value<int>()->default_value(5)->value_name("nr"),
+     "Maximum number of argv (and envp) entries backed with nondet strings "
+     "(default 5). "
      "Higher values widen coverage at the cost of a larger SMT formula."},
     {"argv-max-strlen",
      boost::program_options::value<int>()->default_value(256)->value_name("nr"),
      "Maximum length (in bytes, including the null terminator) of each backed "
-     "argv string (default 256)."},
+     "argv or envp string (default 256)."},
     {"gcc-nested-functions",
      NULL,
      "Enable GCC nested functions extension (source-level lambda lifting)"},
@@ -189,7 +194,10 @@ const struct group_opt_templ all_cmd_options[] = {
      "Enable SV-COMP mode: suppress GCC-acceptable frontend diagnostics "
      "(int/pointer conversions), treat __builtin_unreachable as a no-op, emit "
      "physical line numbers for witnesses, and avoid malloc/free in the "
-     "fopen/fclose models. Set automatically by the SV-COMP wrapper."},
+     "fopen/fclose models. A program that can start a thread is verified with "
+     "incremental BMC over schedules of at most three context switches, "
+     "without interval analysis or --goto-unwind. Set automatically by the "
+     "SV-COMP wrapper."},
     /* Read by clang_c_language.cpp, which is built unconditionally, so these
      * must not sit in a frontend-gated group (#7345). */
     {"clang-c-irep2-adjust",
@@ -243,12 +251,24 @@ const struct group_opt_templ all_cmd_options[] = {
      {"python-no-fold",
       NULL,
       "Disable NumPy constant folding in the Python frontend"},
+     {"python-math-ulps",
+      boost::program_options::value<int>()->value_name("n"),
+      "How many ulps a math or NumPy transcendental function's result may "
+      "lie from the C library's value (default 8); 0 assumes a correctly "
+      "rounded library"},
      {"python-typecheck",
       NULL,
       "Type-check the input with mypy --strict and print the report."},
      {"nondet-str-length",
       boost::program_options::value<int>()->default_value(16)->value_name("nr"),
       "Set maximum length for non-deterministic strings (default is 16)"},
+     {"python-typed-lists",
+      NULL,
+      "Keep a list whose every element is an int in an int64 array instead of "
+      "one untyped cell per element (default on)"},
+     {"no-python-typed-lists",
+      NULL,
+      "Keep every list in one untyped cell per element"},
      {"python-list-compare-depth",
       boost::program_options::value<int>()->default_value(4)->value_name("nr"),
       "Set maximum nesting depth for Python list comparison (default is 4)"},
@@ -458,6 +478,10 @@ const struct group_opt_templ all_cmd_options[] = {
      boost::program_options::value<std::string>(),
      "Redirect all output to a file (no stdout/stderr)"},
     {"goto2c", NULL, "Translate the GOTO program to C"},
+    {"goto2lean",
+     NULL,
+     "Translate the GOTO program reachable from the entry function to Lean 4 "
+     "(prototype; scalar fragment)"},
     {"generate-testcase",
      NULL,
      "If a solution is found, generates a testcase in XML"},
@@ -562,7 +586,24 @@ const struct group_opt_templ all_cmd_options[] = {
      NULL,
      "Extract the main loop as a transition system, print one TS-CHECK line "
      "saying whether it is one, and stop"},
-    {"ts-dump", NULL, "With --ts-check, also print the transition system"}}},
+    {"ts-dump",
+     NULL,
+     "With another --ts option, also print the extracted transition system"},
+    {"ts-bmc", NULL, "Bounded model checking over the transition system"},
+    {"ts-no-fallback",
+     NULL,
+     "Report UNKNOWN instead of falling back when the program is not a "
+     "transition system"},
+    {"ts-no-live-filter",
+     NULL,
+     "Keep every havocked variable as state instead of slicing to the "
+     "properties' cone of influence"},
+    {"ts-fresh-solver",
+     NULL,
+     "With --ts-bmc, solve each bound as one formula in a new solver"},
+    {"ts-push-pop",
+     NULL,
+     "Use push/pop instead of assumptions in --ts-bmc (cross-check)"}}},
   {"k-induction",
    {{"base-case", NULL, "Check the base case"},
     {"forward-condition", NULL, "Check the forward condition"},
@@ -684,6 +725,10 @@ const struct group_opt_templ all_cmd_options[] = {
     {"cvc5", NULL, "Use CVC5"},
     {"yices", NULL, "Use Yices"},
     {"bitwuzla", NULL, "Use Bitwuzla (default)"},
+    {"bitwuzla-opt",
+     boost::program_options::value<std::vector<std::string>>()->value_name(
+       "name=value"),
+     "Set a Bitwuzla option, e.g. rewrite-level=1 (repeatable)"},
     {"bitwuzllob",
      NULL,
      "Use Bitwuzllob (Bitwuzla on the massively parallel Mallob platform) by "
@@ -781,6 +826,10 @@ const struct group_opt_templ all_cmd_options[] = {
    {{"multi-property",
      NULL,
      "Verify satisfiability of all claims of the current bound"},
+    {"report-unreached-claims",
+     NULL,
+     "List each claim no path reaches within the bound in the property "
+     "table, as passed vacuously"},
     {"multi-property-interleavings",
      boost::program_options::value<int>()->value_name("n"),
      "In multi-property mode, keep exploring thread interleavings after a "
@@ -803,6 +852,10 @@ const struct group_opt_templ all_cmd_options[] = {
      NULL,
      "Do not check that a floating-point to integer conversion is in range "
      "(C11 6.3.1.4p1); the rest of --overflow-check is unaffected"},
+    {"no-fp-overflow-check",
+     NULL,
+     "Do not check floating-point arithmetic for overflow; integer overflow "
+     "checks under --overflow-check are unaffected"},
     {"no-unlimited-scanf-check",
      NULL,
      "Do not do overflow check for scanf/fscanf with unlimited character "
@@ -1023,6 +1076,12 @@ const struct group_opt_templ all_cmd_options[] = {
      {"branch-coverage-claims",
       NULL,
       "Enable branch-coverage and shows all reached claims"},
+     {"coverage-covered-set",
+      boost::program_options::value<std::string>()->value_name("path"),
+      "Cross-run persisted covered-set for --branch-coverage. Read at "
+      "start (edges already witnessed are not re-instrumented, cutting "
+      "SMT cost) and merge-written at end. The denominator stays the "
+      "full static universe, so skipping never inflates coverage"},
      {"branch-function-coverage",
       NULL,
       "Show the coverage of branches and function entry"},
@@ -1097,6 +1156,10 @@ const struct group_opt_templ all_cmd_options[] = {
       "object (unsound)"},
      {"abort-on-recursion", NULL, "Abort if the program contains recursion"},
      {"ltl", NULL, "Enable Linear Temporal Logic property checking"},
+     {"ltl-sample-points",
+      NULL,
+      "Step the LTL monitor only at __ESBMC_ltl_sample() calls, not after "
+      "every update of a global its propositions read"},
      {"break-at",
       boost::program_options::value<std::string>(),
       "Trigger a breakpoint at the given GOTO instruction number"},

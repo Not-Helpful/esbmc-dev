@@ -128,6 +128,13 @@ public:
   {
   }
 
+  static std::set<irep_idt>
+  reachable_functions(const goto_functionst &gf, const contextt &context)
+  {
+    return compute_entry_reachable(
+      build_call_graph(gf), collect_address_taken(gf, context));
+  }
+
   void run(goto_functionst &goto_functions)
   {
     // Turn dynamic_cast<T&> bad_cast intrinsics into ordinary THROWs first, so
@@ -198,15 +205,8 @@ public:
           if (!is_nil_expr(t.operand))
           {
             registry.register_chain(t.exception_list);
-            // Record the dynamic type (front) for the typed uncaught-exception
-            // partition; dedup while preserving first-seen order.
             const irep_idt &dyn = t.exception_list.front();
-            if (
-              std::find(
-                thrown_dynamic_types_.begin(),
-                thrown_dynamic_types_.end(),
-                dyn) == thrown_dynamic_types_.end())
-              thrown_dynamic_types_.push_back(dyn);
+            record_thrown_type(fn.first, dyn);
             const locationt loc = raise_location(body, it);
             raise_location_[&*it] = loc;
             raise_site_id_[&*it] = record_throw_site(
@@ -478,6 +478,8 @@ private:
   // name_to_id, which the exception_typeidt constructor seeds from *every* type
   // symbol, not just exception types.
   std::vector<irep_idt> thrown_dynamic_types_;
+  // The subset raised in at least one function of entry_reachable_.
+  std::set<irep_idt> reachable_thrown_types_;
   /// One statement a type is raised from, and the id the lowering stamps on the
   /// exception state there.
   struct throw_sitet
@@ -528,6 +530,19 @@ private:
       if (is_located(it->location))
         return it->location;
     return body.begin()->location;
+  }
+
+  /// Records \p type, the dynamic type of a raise in \p fn, for the typed
+  /// uncaught-exception partition, keeping first-seen order without duplicates.
+  void record_thrown_type(const irep_idt &fn, const irep_idt &type)
+  {
+    if (
+      std::find(
+        thrown_dynamic_types_.begin(), thrown_dynamic_types_.end(), type) ==
+      thrown_dynamic_types_.end())
+      thrown_dynamic_types_.push_back(type);
+    if (entry_reachable_.count(fn))
+      reachable_thrown_types_.insert(type);
   }
 
   /// Records the raise of \p type at \p loc, in function \p fn, and returns the
@@ -1366,6 +1381,97 @@ private:
     return result;
   }
 
+  /// Point every vtable pointer of `obj`, a `catch (T v)` parameter or one of
+  /// its base subobjects, at T's own vtables: v is copy-initialised as a T, so
+  /// its dynamic type is T, not the thrown class ([except.handle]p15, #8696).
+  void reset_vptrs(
+    goto_programt &body,
+    goto_programt::targett &after,
+    const expr2tc &obj,
+    const irep_idt &object_tag)
+  {
+    const type2tc st = ns.follow(obj->type);
+    if (!is_struct_type(st))
+      return;
+    const struct_type2t &s = to_struct_type(st);
+    const std::string vptr_suffix = "::@vtable_pointer";
+    for (std::size_t i = 0; i < s.members.size(); ++i)
+    {
+      const std::string name = id2string(s.member_names[i]);
+      const expr2tc member = member2tc(s.members[i], obj, s.member_names[i]);
+      if (
+        name.compare(0, BASE_SUBOBJECT_PREFIX.size(), BASE_SUBOBJECT_PREFIX) ==
+        0)
+      {
+        reset_vptrs(body, after, member, object_tag);
+        continue;
+      }
+      if (
+        name.size() <= vptr_suffix.size() ||
+        name.compare(
+          name.size() - vptr_suffix.size(), vptr_suffix.size(), vptr_suffix) !=
+          0)
+        continue;
+      const std::string vptr_class =
+        name.substr(0, name.size() - vptr_suffix.size());
+      const symbolt *vtable = ns.lookup(
+        irep_idt("virtual_table::" + vptr_class + "@" + id2string(object_tag)));
+      if (!vtable)
+        continue;
+      const expr2tc table =
+        symbol2tc(migrate_type(vtable->get_type()), vtable->id);
+      auto assign = body.insert(std::next(after));
+      assign->make_assignment();
+      assign->code = code_assign2tc(
+        member, typecast2tc(s.members[i], address_of2tc(table->type, table)));
+      assign->location = after->location;
+      assign->function = after->function;
+      after = assign;
+    }
+  }
+
+  /// The value a `catch (T *)` binds: the thrown pointer, converted to `T *`
+  /// ([except.handle]p3). A thrown `D *` whose `T` base sits at a non-zero
+  /// offset moves to that subobject, and a null pointer stays null (#8695).
+  expr2tc
+  catch_pointer_value(const type2tc &var_type, const irep_idt &catch_type)
+  {
+    const type2tc char_ptr = pointer_type2tc(get_uint8_type());
+    const expr2tc thrown_ptr =
+      dereference2tc(char_ptr, typecast2tc(pointer_type2tc(char_ptr), value));
+    expr2tc result = typecast2tc(var_type, thrown_ptr);
+
+    const std::string suffix = "_ptr";
+    auto pointee = [&suffix](const irep_idt &name) {
+      const std::string s = id2string(name);
+      return s.substr(0, s.size() - suffix.size());
+    };
+    const irep_idt target_tag = "tag-" + pointee(catch_type);
+    for (const auto &[dname, id] : registry.concrete_subtypes(catch_type))
+    {
+      const symbolt *dsym = ns.lookup(irep_idt("tag-" + pointee(dname)));
+      if (!dsym)
+        continue;
+      std::optional<BigInt> off =
+        direct_base_offset(migrate_type(dsym->get_type()), target_tag);
+      if (!off || *off == 0)
+        continue;
+      expr2tc rebased = if2tc(
+        var_type,
+        equality2tc(thrown_ptr, gen_zero(char_ptr)),
+        gen_zero(var_type),
+        typecast2tc(
+          var_type,
+          add2tc(char_ptr, thrown_ptr, constant_int2tc(index_type2(), *off))));
+      result = if2tc(
+        var_type,
+        equality2tc(type_id, constant_int2tc(type_id->type, BigInt(id))),
+        rebased,
+        result);
+    }
+    return result;
+  }
+
   /// Insert `__ESBMC_exc_thrown = false` before a handler and rewrite its
   /// `var = NONDET` binding to read the thrown object via __ESBMC_exc_value:
   ///   catch (T &v): v is a T* — bind the address      v = (T*)value
@@ -1407,8 +1513,17 @@ private:
         ref_catch ? var->type : pointer_type2tc(var->type);
       expr2tc obj_ptr = catch_object_pointer(catch_ptr_type, h.type);
       expr2tc src = ref_catch ? obj_ptr : dereference2tc(var->type, obj_ptr);
+      if (is_pointer_catch(h.type) && is_pointer_type(var->type))
+        src = catch_pointer_value(var->type, h.type);
       bind->code = code_assign2tc(var, src);
       before_body = bind;
+      // `var` referred into the code just replaced; read the target back.
+      if (!ref_catch && !is_pointer_catch(h.type))
+        reset_vptrs(
+          body,
+          before_body,
+          to_code_assign2t(bind->code).target,
+          "tag-" + id2string(h.type));
     }
 
     auto insert_after = before_body;
@@ -1568,6 +1683,10 @@ private:
     case exception_globals::terminate_reason_no_active:
       first->location.comment("throw with no active exception");
       break;
+    case exception_globals::terminate_reason_unwinding:
+      first->location.comment(
+        "exception escaped a destructor during stack unwinding");
+      break;
     default:
       first->location.comment("terminate called after throwing an exception");
       break;
@@ -1628,6 +1747,9 @@ private:
 
     for (const irep_idt &name : thrown_dynamic_types_)
     {
+      // #10257: also kept out of known_disj, so a missed caller fails.
+      if (reports_escape(name) && !reachable_thrown_types_.count(name))
+        continue;
       expr2tc eq = typeid_eq(name);
       known_disj = is_nil_expr(known_disj) ? eq : or2tc(known_disj, eq);
       if (!reports_escape(name))
@@ -1940,6 +2062,20 @@ private:
     goto_programt::targett dest)
   {
     const auto after = std::next(call);
+    // A destructor run by a throw's unwinding that lets an exception escape
+    // calls std::terminate ([except.terminate]p1.4).
+    if (call->location.get_bool("#during_unwind"))
+    {
+      call->location.remove("#during_unwind");
+      emit_terminate(
+        body,
+        after,
+        not2tc(thrown),
+        call->location,
+        call->function,
+        exception_globals::terminate_reason_unwinding);
+      return;
+    }
     const irept unwind = call->location.find("#exception_unwind");
     call->location.remove("#exception_unwind");
     auto add = [&]() {
@@ -2053,4 +2189,10 @@ std::vector<irep_idt> python_checked_exceptions(const optionst &options)
   for (std::string name; std::getline(listed, name, ',');)
     checked.emplace_back(name);
   return checked;
+}
+
+std::set<irep_idt>
+entry_reachable_functions(const goto_functionst &gf, const contextt &context)
+{
+  return exception_loweringt::reachable_functions(gf, context);
 }

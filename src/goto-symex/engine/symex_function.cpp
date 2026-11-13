@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cassert>
+#include <string_view>
 #include <unordered_set>
 #include <goto-symex/scheduler/execution_state.h>
 #include <goto-symex/engine/goto_symex.h>
@@ -17,17 +18,19 @@
 
 bool goto_symex_utils::is_alloca_return_value_name(const std::string &name)
 {
-  static const std::string prefix = "return_value$_alloca$";
-  size_t pos = name.rfind(prefix);
-  if (pos == std::string::npos)
-    return false;
-  size_t rest = pos + prefix.size();
-  if (rest == name.size())
-    return false;
-  for (size_t i = rest; i < name.size(); ++i)
-    if (name[i] < '0' || name[i] > '9')
-      return false;
-  return true;
+  for (std::string_view prefix :
+       {"return_value$_alloca$", "return_value$___builtin_alloca$"})
+  {
+    size_t pos = name.rfind(prefix);
+    if (pos == std::string::npos)
+      continue;
+    size_t rest = pos + prefix.size();
+    if (
+      rest != name.size() &&
+      name.find_first_not_of("0123456789", rest) == std::string::npos)
+      return true;
+  }
+  return false;
 }
 
 namespace
@@ -631,15 +634,7 @@ void goto_symext::symex_function_call_code(const expr2tc &expr)
      *       calls to this function have the same number of parameters and that
      *       they - after type promotion - are compatible. */
 
-    if (!is_nil_expr(call.ret))
-    {
-      unsigned int &nondet_count = get_nondet_counter();
-      expr2tc rhs =
-        symbol2tc(call.ret->type, "nondet$symex::" + i2string(nondet_count++));
-
-      symex_assign(code_assign2tc(call.ret, rhs));
-    }
-
+    assign_nondet_call_result(call.ret);
     cur_state->source.pc++;
     return;
   }
@@ -795,6 +790,15 @@ get_function_list(const expr2tc &expr)
   return l;
 }
 
+void goto_symext::assign_nondet_call_result(const expr2tc &ret)
+{
+  if (is_nil_expr(ret))
+    return;
+  symex_assign(code_assign2tc(
+    ret,
+    symbol2tc(ret->type, "nondet$symex::" + i2string(get_nondet_counter()++))));
+}
+
 void goto_symext::symex_function_call_deref(const expr2tc &expr)
 {
   const code_function_call2t &call = to_code_function_call2t(expr);
@@ -804,20 +808,6 @@ void goto_symext::symex_function_call_deref(const expr2tc &expr)
   // address_of a symbol, or a set of if ireps. For symbols we'll invoke
   // symex_function_call_symbol, when dealing with if's we need to fork and
   // merge.
-  if (
-    (k_induction || inductive_step) &&
-    !options.get_bool_option("disable-inductive-step"))
-  {
-    log_warning(
-      "k-induction does not support function pointer calls yet. "
-      "Disabling inductive step");
-    options.set_option("disable-inductive-step", true);
-
-    // See the recursion site for the rationale.
-    if (inductive_step)
-      throw inductive_step_disabled_exceptiont("function pointer call");
-  }
-
   if (is_nil_expr(call.function))
   {
     log_error(
@@ -872,8 +862,26 @@ void goto_symext::symex_function_call_deref(const expr2tc &expr)
     // such call can happen and the path is dead (esbmc/esbmc#604).
     if (options.get_bool_option("closed-world-fnptr"))
       assume(gen_false_expr());
+    else
+      assign_nondet_call_result(call.ret);
     cur_state->source.pc++;
     return;
+  }
+
+  // A call with a target is not modelled by the inductive step; a call with
+  // none is skipped the same way in both steps and costs the proof nothing.
+  if (
+    (k_induction || inductive_step) &&
+    !options.get_bool_option("disable-inductive-step"))
+  {
+    log_warning(
+      "k-induction does not support function pointer calls yet. "
+      "Disabling inductive step");
+    options.set_option("disable-inductive-step", true);
+
+    // See the recursion site for the rationale.
+    if (inductive_step)
+      throw inductive_step_disabled_exceptiont("function pointer call");
   }
 
   std::list<std::pair<guard2tc, expr2tc>> l = get_function_list(func_ptr);
@@ -1034,7 +1042,15 @@ bool goto_symext::run_next_function_ptr_target(bool first)
   if (cur_state->top().cur_function_ptr_targets.size() == 0)
     cur_frame.orig_func_ptr_call = expr2tc();
 
+  const size_t depth = cur_state->call_stack.size();
   symex_function_call_code(state_call);
+
+  // A target whose body is not entered (e.g. at the recursion bound) never
+  // reaches the END_FUNCTION that runs the next target, so run it here.
+  // Otherwise the remaining targets are dropped and their merge snapshots
+  // stay in this frame.
+  if (cur_state->call_stack.size() == depth)
+    run_next_function_ptr_target(false);
 
   return true;
 }
@@ -1105,10 +1121,6 @@ void goto_symext::pop_frame()
     expr2tc l1_sym = symbol2tc(ptr, it.base_name);
     frame.level1.get_ident_name(l1_sym);
 
-    // Call free on alloca'd objects
-    if (goto_symex_utils::is_alloca_return_value_name(it.base_name.as_string()))
-      symex_free(code_free2tc(l1_sym));
-
     // Erase from level 1 propagation
     cur_state->value_set.erase(to_symbol2t(l1_sym).get_symbol_name());
 
@@ -1120,6 +1132,9 @@ void goto_symext::pop_frame()
       get_empty_type(), it.base_name, it.lev, it.l1_num, 0, it.t_num, 0);
     cur_state->value_set.erase(to_symbol2t(tmp_expr).get_symbol_name());
   }
+
+  for (const expr2tc &ptr : frame.alloca_objects)
+    invalidate_object(ptr);
 
   // decrease recursion unwinding counter
   if (!frame.function_identifier.empty())
@@ -1168,6 +1183,9 @@ bool goto_symext::make_return_assignment(expr2tc &assign, const expr2tc &code)
 
 void goto_symext::symex_return(const expr2tc &code)
 {
+  if (validate_witness && memory_leak_check && !no_reachable_memleak)
+    symex_witness_main_return();
+
   // we treat this like an unconditional
   // goto to the end of the function
 

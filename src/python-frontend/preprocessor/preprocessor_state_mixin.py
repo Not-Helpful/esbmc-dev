@@ -21,12 +21,16 @@ class PreprocessorStateMixin:
         self.functionKwonlyParams = {}
         self.static_methods = set()
         self.is_entry_module = False
-        self._hoisted_classes = {}
+        self.hoisted_classes = {}
         self._builtin_shadow_names = None
         self._unobservable_builtin_keys = frozenset()
         self._closed_lambda_bindings = {}
         self._fixed_length_starred = {}
+        self._vararg_alias_calls = {}
+        self._vararg_alias_stmts = []
+        self._redefined_names = set()
         self.functionVarargs = set()
+        self.functionAnyKeywords = set()
         self._vararg_func_defs = {}
         self._vararg_module_defs = set()
         self._vararg_callee_defs = {}
@@ -35,7 +39,25 @@ class PreprocessorStateMixin:
         self._vararg_scope_stack = []
         self._vararg_def_owners = {}
         self._vararg_owner_specs = {}
+        # (name, arity) -> copy of a variadic def an importer calls; see
+        # _specialize_external_varargs and _call_imported_vararg_spec.
+        self.external_vararg_arities = {}
+        self.exported_vararg_specs = {}
+        self._imported_vararg_specs = {}
+        self._used_imported_vararg_specs = {}
+        self._vararg_once_bound = set()
+        # Calls the entry module makes into a def of this module, by def name,
+        # and the names that module binds; see _specialise_requested_function.
+        self.external_type_calls = {}
+        self.blocked_type_functions = set()
+        self.external_bound_names = set()
+        self.exported_type_specs = {}
         self.listcomp_counter = 0
+        self.comprehension_targets = set()
+        self.outer_stored_names = set()
+        self.rebindable_names = None
+        self.functools_reduce_names = set()
+        self.functools_module_names = set()
         self.minmax_key_counter = 0
         self.variable_annotations = {}
         self.function_return_annotations = {}
@@ -50,6 +72,8 @@ class PreprocessorStateMixin:
         self.defaultdict_alias = None
         self.collections_module_imported = False
         self.collections_module_alias = None
+        self.numpy_module_names = set()
+        self.numpy_constructor_names = {}
         self._subscript_inferred_vars = set()
         self.generator_funcs = set()
         self.early_return_generator_funcs = set()
@@ -85,15 +109,21 @@ class PreprocessorStateMixin:
         # agrees (see _recover_param_dict_annotation).
         self._dict_param_call_shapes = {}
         self.bound_method_vars = {}
+        self.unscoped_binding_names = set()
+        self._bound_method_scopes = []
         # Filled by _scan_fixed_receivers; empty, an unpacked bound method
         # is never resolved at its calls.
         self.fixed_receivers = {}
         self.once_bound_names = set()
         self.module_statements = {}
+        self.unbound_checked_globals = set()
+        # Name -> values stored by `name[key] = value` anywhere in the module.
+        self.subscript_stored_values = {}
         self.variable_names = set()
         self.scope_binding_counts = {}
         self.in_order_bindings = set()
         self.called_names = set()
+        self.referenced_names = set()
         # nondet_list/nondet_dict the module defines itself, so the
         # rewrite to a typed builder must leave those calls alone.
         self.shadowed_nondet_collections = set()
@@ -107,6 +137,7 @@ class PreprocessorStateMixin:
         # Module-level ``def f(p): return <expr>``: name -> (param, expr).
         self._single_return_funcs = {}
         self._param_subscripting_funcs = set()
+        self._plain_function_names = set()
         # Map var -> RHS Call node; used by _apply_assert_eq_rewrites to
         # substitute the Name back to its defining call.
         self._assignment_call_origins = {}

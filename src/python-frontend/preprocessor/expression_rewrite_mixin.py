@@ -151,28 +151,167 @@ class ExpressionRewriteMixin:
                     if not self._inline_single_use_map(stmts, i, name_counts):
                         i += 1
 
+    def _is_sorted_of_map(self, node):
+        """Whether `node` is sorted(map(f, xs), ...) with a pure `f`."""
+        return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "sorted" and node.args and self._is_map_call(node.args[0])
+                and self._is_pure_operand(node.args[0].args[0]))
+
     def _rewrite_map_values(self, module):
         """Lower the map() uses whose result is consumed once, in full: as the
-        value of an unpacking, as a for-loop iterable, and through a name used
-        only by the next statement. list(map(...)) is lowered in visit_Call."""
+        value of an unpacking, as the argument of sorted(), as a for-loop
+        iterable, and through a name used only by the next statement.
+        list(map(...)) is lowered in visit_Call."""
         if self._binds_name(module, "map"):
             return
         self._inline_single_use_maps(module)
+        sorted_bound = self._binds_name(module, "sorted")
         for n in ast.walk(module):
             if (self._is_unpacking(n) and self._is_map_call(n.value)
                     and self._is_pure_operand(n.value.args[0])):
                 n.value = self._map_as_listcomp(n.value)
+            elif not sorted_bound and self._is_sorted_of_map(n):
+                n.args[0] = self._map_as_listcomp(n.args[0])
             elif (isinstance(n, ast.For) and self._is_map_call(n.iter)
                   and self._map_for_lowerable(n, n.iter)):
                 self._map_for_as_plain_for(n)
 
+    _REDUCE_FIRST = """\
+{seq} = list(__iterable)
+if len({seq}) == 0:
+    raise TypeError("reduce() of empty iterable with no initial value")
+{acc} = {seq}[0]
+for {i} in range(1, len({seq})):
+"""
+
+    _REDUCE_INITIAL = """\
+{seq} = list(__iterable)
+{acc} = __initial
+for {i} in range(0, len({seq})):
+"""
+
+    _REDUCE_CALL_STEP = "    {acc} = __function({acc}, {seq}[{i}])\n"
+
+    # The converter cannot call a lambda in place, so its body is inlined.
+    _REDUCE_LAMBDA_STEP = "    {x} = {acc}\n    {y} = {seq}[{i}]\n    {acc} = __function\n"
+
+    @staticmethod
+    def _functools_binding(node, alias):
+        """"reduce" when @p alias of import @p node binds functools.reduce,
+        "module" when it binds functools itself, else None."""
+        if (isinstance(node, ast.ImportFrom) and node.module == "functools" and not node.level
+                and alias.name == "reduce"):
+            return "reduce"
+        if isinstance(node, ast.Import) and alias.name == "functools":
+            return "module"
+        return None
+
+    def _scan_functools_reduce_names(self, module):
+        """Names that can only mean functools.reduce, and names that can only
+        mean the functools module: each bound once, by its import."""
+        sites = self._binding_sites(module)
+        found = {"reduce": set(), "module": set(), None: set()}
+        for n in ast.walk(module):
+            if isinstance(n, (ast.Import, ast.ImportFrom)):
+                for alias in n.names:
+                    name = alias.asname or alias.name
+                    if sites[name] == 1:
+                        found[self._functools_binding(n, alias)].add(name)
+        self.functools_reduce_names = found["reduce"]
+        self.functools_module_names = found["module"]
+
+    def _is_functools_reduce_call(self, node):
+        """Whether @p node calls functools.reduce in a form the fold lowers."""
+        func = node.func
+        named = isinstance(func, ast.Name) and func.id in self.functools_reduce_names
+        qualified = (isinstance(func, ast.Attribute) and func.attr == "reduce"
+                     and isinstance(func.value, ast.Name)
+                     and func.value.id in self.functools_module_names)
+        return ((named or qualified) and len(node.args) in (2, 3) and not node.keywords
+                and (isinstance(node.args[0], ast.Name) or self._is_inlinable_lambda(node.args[0]))
+                and not any(isinstance(a, ast.Starred) for a in node.args))
+
+    @staticmethod
+    def _is_inlinable_lambda(node):
+        """A two-parameter lambda whose body opens no scope of its own, so
+        renaming its parameters' loads renames every use of them."""
+        if not isinstance(node, ast.Lambda):
+            return False
+        args = node.args
+        scopes = (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp,
+                  ast.NamedExpr)
+        return (len(args.args) == 2 and not args.posonlyargs and not args.vararg
+                and not args.kwonlyargs and not args.kwarg and not args.defaults
+                and not any(isinstance(n, scopes) for n in ast.walk(node.body)))
+
+    def _lower_functools_reduce(self, call):
+        """reduce(f, xs[, initial]) -> the left fold functools.reduce performs,
+        raising its TypeError on an empty sequence without an initial value.
+        f is called directly at each step, so its argument and result types
+        are the caller's."""
+        n = self.listcomp_counter
+        self.listcomp_counter += 1
+        names = {
+            "seq": f"ESBMC_reduce_seq_{n}",
+            "acc": f"ESBMC_reduce_acc_{n}",
+            "i": f"ESBMC_reduce_i_{n}",
+            "x": f"ESBMC_reduce_x_{n}",
+            "y": f"ESBMC_reduce_y_{n}"
+        }
+        function = call.args[0]
+        step = self._REDUCE_CALL_STEP
+        if isinstance(function, ast.Lambda):
+            step = self._REDUCE_LAMBDA_STEP
+            function = copy.deepcopy(function.body)
+            for param, name in zip(call.args[0].args.args, (names["x"], names["y"])):
+                function = self._rename_loads(function, param.arg, name)
+        template = (self._REDUCE_FIRST if len(call.args) == 2 else self._REDUCE_INITIAL) + step
+        holes = dict(zip(("__function", "__iterable", "__initial"), [function, *call.args[1:]]))
+
+        class _Fill(ast.NodeTransformer):
+
+            def visit_Name(self, node):
+                """The argument a template placeholder stands for, else @p node."""
+                hole = holes.get(node.id)
+                return copy.deepcopy(hole) if hole is not None else node
+
+        tree = ast.parse(template.format(**names))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.stmt, ast.expr)):
+                ast.copy_location(node, call)
+        prefix = []
+        for stmt in _Fill().visit(tree).body:
+            visited = self.visit(stmt)
+            prefix.extend(visited if isinstance(visited, list) else [visited])
+        return prefix, self.create_name_node(names["acc"], ast.Load(), call)
+
     class _ListCompExpressionLowerer(ast.NodeTransformer):
         """Utility transformer that lowers list comprehensions, any(genexpr), and all(genexpr) inside an expression."""
 
-        def __init__(self, preprocessor):
+        def __init__(self, preprocessor, root):
             super().__init__()
             self.preprocessor = preprocessor
+            self.root = root
             self.statements = []
+            # Prefix statements run unconditionally, so an expression that
+            # might not be evaluated must not be lowered into them.
+            self.conditional_depth = 0
+
+        def _visit_conditionally(self, node):
+            """Visit @p node, whose operands may go unevaluated."""
+            self.conditional_depth += 1
+            try:
+                return self.generic_visit(node)
+            finally:
+                self.conditional_depth -= 1
+
+        visit_IfExp = visit_BoolOp = visit_Lambda = _visit_conditionally
+
+        def _lower_functools_reduce_call(self, node):
+            """The lowered fold for a functools.reduce call, else None."""
+            if self.conditional_depth or not self.preprocessor._is_functools_reduce_call(node):
+                return None
+            return self.preprocessor._lower_functools_reduce(self.generic_visit(node))
 
         def visit_ListComp(self, node):
             # pylint: disable=protected-access
@@ -206,6 +345,41 @@ class ExpressionRewriteMixin:
         def visit_GeneratorExp(self, node):
             """Lower a genexp not already handled above (any/all/join/...)."""
             return self._lower_as_listcomp(node)
+
+        def _other_code_may_run(self, comp):
+            """True when the expression may run code outside @p comp other than
+            the calls enclosing it, which hoisting @p comp would reorder."""
+            parents = {
+                id(child): parent
+                for parent in ast.walk(self.root)
+                for child in ast.iter_child_nodes(parent)
+            }
+            exempt = {id(n) for n in ast.walk(comp)}
+            node = comp
+            while id(node) in parents:
+                node = parents[id(node)]
+                exempt.add(id(node))
+            return any(
+                isinstance(n, (ast.Call, ast.NamedExpr, ast.Await, ast.Yield,
+                               ast.YieldFrom)) and id(n) not in exempt for n in ast.walk(self.root))
+
+        def visit_DictComp(self, node):
+            """Hoist a dict comprehension over a dict into a temp, so it takes
+            the for-loop lowering an assigned one gets (#5444)."""
+            if self.conditional_depth or self._other_code_may_run(node):
+                return self.generic_visit(node)
+            # pylint: disable=protected-access
+            tmp_id = f"ESBMC_dictcomp_{self.preprocessor.listcomp_counter}"
+            assign = ast.Assign(targets=[ast.Name(id=tmp_id, ctx=ast.Store())], value=node)
+            ast.copy_location(assign, node)
+            lowered = self.preprocessor._maybe_lower_dictcomp_over_items(assign)
+            if lowered is None:
+                return self.generic_visit(node)
+            self.preprocessor.listcomp_counter += 1
+            self.statements.extend(lowered)
+            result = ast.Name(id=tmp_id, ctx=ast.Load())
+            ast.copy_location(result, node)
+            return result
 
         def visit_Call(self, node):  # pylint: disable=protected-access,too-many-locals,too-many-boolean-expressions,too-many-statements
             if (isinstance(node.func, ast.Attribute) and node.func.attr == "join"
@@ -328,13 +502,14 @@ class ExpressionRewriteMixin:
                 ast.fix_missing_locations(listcomp)
                 return self.visit(listcomp)
 
+            gen_call, arity_check = self.preprocessor._unguard_starred_call(node)
             if (isinstance(node.func, ast.Name) and node.func.id == "list" and len(node.args) == 1
-                    and not node.keywords and isinstance(node.args[0], ast.Call)
-                    and isinstance(node.args[0].func, ast.Name)
-                    and node.args[0].func.id in self.preprocessor.generator_funcs):
-                prefix, result = self.preprocessor._lower_list_gen_call(node.args[0], node)
+                    and not node.keywords and isinstance(gen_call, ast.Call)
+                    and isinstance(gen_call.func, ast.Name)
+                    and gen_call.func.id in self.preprocessor.generator_funcs):
+                prefix, result = self.preprocessor._lower_list_gen_call(gen_call, node)
                 if prefix is not None:
-                    self.statements.extend(prefix)
+                    self.statements.extend(arity_check + prefix)
                     return result
 
             # sum(range(EXPR)) -> (EXPR * (EXPR - 1) // 2 if EXPR > 0 else 0).
@@ -378,6 +553,7 @@ class ExpressionRewriteMixin:
                 ast.fix_missing_locations(formula)
                 return self.visit(formula)
 
+            node = self.preprocessor._pack_min_max_key_args(node)
             # Ordered: each constant fold gets first refusal, then the scan
             # that handles what it could not fold.
             for lower in (
@@ -386,6 +562,7 @@ class ExpressionRewriteMixin:
                     self.preprocessor._lower_min_max_key_scan,
                     self.preprocessor._lower_sorted_key_scan,
                     self.preprocessor._lower_tuple_sorted_pair_call,
+                    self._lower_functools_reduce_call,
             ):
                 lowered = lower(node)
                 if lowered is not None:
@@ -402,9 +579,26 @@ class ExpressionRewriteMixin:
         if node.value is not None:
             dd_inits, node.value = self._lower_defaultdict_reads_in_expr(node.value, node)
             prefix = dd_inits + prefix
+        prefix = prefix + self._name_returned_sorted(node)
         if prefix:
             return prefix + [node]
         return node
+
+    def _name_returned_sorted(self, node):
+        """Bind `return sorted(x)` to a name first: the elements of a returned name's
+        value keep their types where those of a returned call do not (#9736)."""
+        value = node.value
+        if not (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+                and value.func.id == "sorted"):
+            return []
+        name = f"ESBMC_sorted_ret_{self._next_unpack_tmp_id()}"
+        assign = ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())], value=value)
+        ast.copy_location(assign, node)
+        ast.copy_location(assign.targets[0], node)
+        node.value = ast.Name(id=name, ctx=ast.Load())
+        ast.copy_location(node.value, node)
+        ast.fix_missing_locations(assign)
+        return [assign]
 
     def visit_Attribute(self, node):
         node = self.generic_visit(node)
@@ -461,6 +655,9 @@ class ExpressionRewriteMixin:
                             elt.op, (ast.UAdd, ast.USub)) and isinstance(elt.operand, ast.Constant))
                     if is_pure_literal:
                         folded = copy.deepcopy(elt)
+                        # Each fold is a fresh copy, so record which element it
+                        # reads for `is` to compare by identity (#8412).
+                        folded.esbmc_list_element = f"{node.value.id}[{idx}]"
                         self.ensure_all_locations(folded, node)
                         ast.fix_missing_locations(folded)
                         return folded
@@ -695,4 +892,75 @@ class ExpressionRewriteMixin:
 
     def visit_Compare(self, node):
         node = self.generic_visit(node)
+        return self._distribute_over_conditional(node)
+
+    @staticmethod
+    def _distribute_over_conditional(node):
+        """`x == (a if c else b)` as `(x == a) if c else (x == b)`, and likewise for `!=` and a
+        conditional on the left, when one of the constants `a` and `b` is a str and the other a
+        number. A conditional takes one type, so the other arm would be compared as that type.
+        `x` and `c` are names or constants, so evaluating `c` before `x` changes nothing."""
+        if len(node.ops) != 1 or not isinstance(node.ops[0], (ast.Eq, ast.NotEq)):
+            return node
+        sides = (node.left, node.comparators[0])
+        for i, cond in enumerate(sides):
+            other = sides[1 - i]
+            if ExpressionRewriteMixin._mixes_str_and_number(cond) and isinstance(
+                    other, (ast.Name, ast.Constant)):
+                arms = [[arm, other] if i == 0 else [other, arm]
+                        for arm in (cond.body, cond.orelse)]
+                compares = [
+                    ast.Compare(copy.deepcopy(a), node.ops, [copy.deepcopy(b)]) for a, b in arms
+                ]
+                return ast.fix_missing_locations(
+                    ast.copy_location(ast.IfExp(cond.test, *compares), node))
+        return node
+
+    @staticmethod
+    def _mixes_str_and_number(node):
+        """`a if c else b` with a name or constant `c`, and constants `a` and `b` of which one is
+        a str and the other an int, a float or a bool."""
+        if not (isinstance(node, ast.IfExp) and isinstance(node.test, (ast.Name, ast.Constant))):
+            return False
+        arms = (node.body, node.orelse)
+        if not all(
+                isinstance(a, ast.Constant) and type(a.value) in (str, int, float, bool)
+                for a in arms):
+            return False
+        return isinstance(arms[0].value, str) != isinstance(arms[1].value, str)
+
+    @staticmethod
+    def _literal_list_truth(node):
+        """Whether a list literal of constants is truthy, or None for any other operand."""
+        if isinstance(node, ast.List) and all(isinstance(e, ast.Constant) for e in node.elts):
+            return bool(node.elts)
+        return None
+
+    def visit_BoolOp(self, node):
+        """Fold the operands decided by a list literal on the left: `[1] and x` is `x`,
+        `[] and x` is `[]`, `[1] or x` is `[1]` and `[] or x` is `x`, so the result has the
+        type of the operand that is kept. `(a and b) and c` has the value of `a and b and c`,
+        so a nested operand with the same operator is spliced in."""
+        node = self.generic_visit(node)
+        is_and = isinstance(node.op, ast.And)
+        values = []
+        for value in node.values:
+            if isinstance(value, ast.BoolOp) and type(value.op) is type(node.op):
+                values.extend(value.values)
+            else:
+                values.append(value)
+        node.values = list(values)
+        while len(values) > 1:
+            truth = self._literal_list_truth(values[0])
+            if truth is None:
+                break
+            if truth == is_and:
+                values = values[1:]
+            else:
+                values = values[:1]
+        if len(values) == len(node.values):
+            return node
+        if len(values) == 1:
+            return values[0]
+        node.values = values
         return node

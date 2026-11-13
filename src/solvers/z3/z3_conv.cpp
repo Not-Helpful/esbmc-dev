@@ -62,6 +62,8 @@ z3_convt::z3_convt(const namespacet &_ns, const optionst &_options)
             (z3::tactic(z3_ctx, "smt") | z3::tactic(z3_ctx, "qfnra-nlsat")))
              .mk_solver())
 {
+  if (_options.get_bool_option("smt-assumptions"))
+    solver = z3::solver(z3_ctx);
   z3::params p(z3_ctx);
   p.set("relevancy", 0U);
   p.set("model", true);
@@ -101,10 +103,27 @@ smt_resultt z3_convt::dec_solve()
   if (result == z3::unsat)
     return P_UNSATISFIABLE;
 
+  log_warning("Z3 solver returned unknown: {}", solver.reason_unknown());
   return P_ERROR;
 }
 
-void z3_convt::assert_ast(smt_astt a)
+smt_resultt z3_convt::dec_solve_assuming(const ast_vec &assumptions)
+{
+  pre_solve();
+
+  z3::expr_vector terms(z3_ctx);
+  for (smt_astt a : assumptions)
+    terms.push_back(to_solver_smt_ast<z3_smt_ast>(a)->a);
+
+  z3::check_result result = solver.check(terms);
+  if (result == z3::sat)
+    return P_SATISFIABLE;
+  if (result == z3::unsat)
+    return P_UNSATISFIABLE;
+  return P_ERROR;
+}
+
+void z3_convt::assert_ast_in_solver(smt_astt a)
 {
   z3::expr theval = to_solver_smt_ast<z3_smt_ast>(a)->a;
   solver.add(theval);
@@ -227,6 +246,31 @@ smt_astt z3_convt::mk_bvmul(smt_astt a, smt_astt b)
   return new_ast(
     (to_solver_smt_ast<z3_smt_ast>(a)->a * to_solver_smt_ast<z3_smt_ast>(b)->a),
     a->sort);
+}
+
+smt_astt z3_convt::overflow_arith(const expr2tc &expr)
+{
+  const overflow2t &overflow = to_overflow2t(expr);
+  const expr2tc &op1 = *overflow.operand->get_sub_expr(0);
+  const expr2tc &op2 = *overflow.operand->get_sub_expr(1);
+
+  // Z3's predicates avoid the generic check's double-width multiplier (#9222).
+  if (
+    int_encoding || !is_mul2t(overflow.operand) || !is_bv_type(op1) ||
+    op1->type != op2->type)
+    return smt_solver_baset::overflow_arith(expr);
+
+  const z3::expr &a = to_solver_smt_ast<z3_smt_ast>(convert_ast(op1))->a;
+  const z3::expr &b = to_solver_smt_ast<z3_smt_ast>(convert_ast(op2))->a;
+  const bool is_signed = is_signedbv_type(op1);
+
+  z3::expr no_overflow =
+    z3::to_expr(z3_ctx, Z3_mk_bvmul_no_overflow(z3_ctx, a, b, is_signed));
+  if (is_signed)
+    no_overflow = no_overflow &&
+                  z3::to_expr(z3_ctx, Z3_mk_bvmul_no_underflow(z3_ctx, a, b));
+
+  return new_ast(!no_overflow, boolean_sort);
 }
 
 smt_astt z3_convt::mk_mod(smt_astt a, smt_astt b)
@@ -949,6 +993,9 @@ smt_astt z3_convt::mk_smt_fpbv_rm(ieee_floatt::rounding_modet rm)
   {
   case ieee_floatt::ROUND_TO_EVEN:
     return new_ast(z3::to_expr(z3_ctx, Z3_mk_fpa_rne(z3_ctx)), s);
+
+  case ieee_floatt::ROUND_TO_AWAY:
+    return new_ast(z3::to_expr(z3_ctx, Z3_mk_fpa_rna(z3_ctx)), s);
 
   case ieee_floatt::ROUND_TO_MINUS_INF:
     return new_ast(z3::to_expr(z3_ctx, Z3_mk_fpa_rtn(z3_ctx)), s);

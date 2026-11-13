@@ -215,6 +215,11 @@ void goto_symext::symex_realloc(
   if (handle_realloc_zero_size(lhs, code, guard, realloc_size))
     return;
 
+  // C17 7.22.3.5p3: a pointer realloc did not get from an allocator, or one
+  // already freed, is undefined behaviour, as for free.
+  expr2tc free_check = src_ptr;
+  dereference(free_check, dereferencet::FREE);
+
   // Nil unless the request can exceed max_object_size(); see R38. Under
   // --force-realloc-success the cap is not applied at all, for the reason the
   // symbolic malloc arm gives: assuming it away would prune
@@ -882,8 +887,21 @@ expr2tc goto_symext::symex_mem(
   alloc_guard.append(guard);
   dynamic_memory.emplace_back(
     rhs_copy, alloc_guard, !is_malloc, symbol.name.as_string());
+  record_frame_alloca(lhs, rhs_copy, is_malloc);
 
   return to_address_of2t(rhs_addrof).ptr_obj;
+}
+
+void goto_symext::record_frame_alloca(
+  const expr2tc &lhs,
+  const expr2tc &object,
+  bool is_malloc)
+{
+  if (
+    !is_malloc && is_symbol2t(lhs) &&
+    goto_symex_utils::is_alloca_return_value_name(
+      to_symbol2t(lhs).thename.as_string()))
+    cur_state->top().alloca_objects.push_back(object);
 }
 
 void goto_symext::track_new_pointer(
@@ -958,9 +976,10 @@ void goto_symext::symex_free(const expr2tc &expr)
   internal_deref_items.clear();
   tmp = operand;
 
-  // Create temporary, dummy, dereference
+  // Create temporary, dummy, dereference. The FREE dereference above already
+  // made the validity claims; this one only collects the targets.
   tmp = dereference2tc(get_uint8_type(), tmp);
-  dereference(tmp, dereferencet::INTERNAL);
+  dereference(tmp, dereferencet::INTERNAL, true);
 
   // Only add assertions to check pointer offset if pointer check is enabled
   if (!options.get_bool_option("no-pointer-check"))
@@ -1038,9 +1057,13 @@ void goto_symext::symex_free(const expr2tc &expr)
     }
   }
 
-  // Clear the alloc bit.
+  invalidate_object(operand);
+}
+
+void goto_symext::invalidate_object(const expr2tc &ptr)
+{
   type2tc sym_type = array_type2tc(get_bool_type(), expr2tc(), true);
-  expr2tc ptr_obj = pointer_object2tc(pointer_type2(), operand);
+  expr2tc ptr_obj = pointer_object2tc(pointer_type2(), ptr);
   dereference(ptr_obj, dereferencet::READ);
 
   expr2tc valid_sym = symbol2tc(sym_type, valid_ptr_arr_name);

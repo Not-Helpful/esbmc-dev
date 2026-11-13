@@ -22,6 +22,11 @@ public:
   ~cvc5_convt() override = default;
 
   smt_resultt dec_solve() override;
+  smt_resultt dec_solve_assuming(const ast_vec &assumptions) override;
+  bool supports_assumptions() const override
+  {
+    return true;
+  }
   const std::string solver_text() override;
 
   tvt get_bool(smt_astt a) override;
@@ -156,7 +161,7 @@ public:
   smt_astt
   convert_array_of(smt_astt init_val, unsigned long domain_width) override;
 
-  void assert_ast(smt_astt a) override;
+  void assert_ast_in_solver(smt_astt a) override;
 
   std::string dump_smt() override;
 

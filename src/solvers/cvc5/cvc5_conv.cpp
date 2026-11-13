@@ -28,6 +28,8 @@ cvc5_convt::cvc5_convt(const namespacet &ns, const optionst &options)
   // Already initialized stuff in the constructor list,
   slv.setOption("produce-models", "true");
   slv.setOption("produce-assertions", "true");
+  if (options.get_bool_option("smt-assumptions"))
+    slv.setOption("incremental", "true");
 }
 
 smt_resultt cvc5_convt::dec_solve()
@@ -41,6 +43,22 @@ smt_resultt cvc5_convt::dec_solve()
   if (r.isUnknown())
     return P_ERROR;
 
+  return P_UNSATISFIABLE;
+}
+
+smt_resultt cvc5_convt::dec_solve_assuming(const ast_vec &assumptions)
+{
+  pre_solve();
+
+  std::vector<cvc5::Term> terms;
+  for (smt_astt a : assumptions)
+    terms.push_back(to_solver_smt_ast<cvc5_smt_ast>(a)->a);
+
+  cvc5::Result r = slv.checkSatAssuming(terms);
+  if (r.isSat())
+    return P_SATISFIABLE;
+  if (r.isUnknown())
+    return P_ERROR;
   return P_UNSATISFIABLE;
 }
 
@@ -600,7 +618,7 @@ smt_astt cvc5_convt::mk_smt_fpbv_neg(smt_astt op)
     op->sort);
 }
 
-void cvc5_convt::assert_ast(smt_astt a)
+void cvc5_convt::assert_ast_in_solver(smt_astt a)
 {
   auto const *ca = to_solver_smt_ast<cvc5_smt_ast>(a);
   slv.assertFormula(ca->a);

@@ -11,6 +11,7 @@
 #include <util/lang/c_types.h>
 #include <util/irep/migrate.h>
 #include <util/lang/python_types.h>
+#include <algorithm>
 #include <set>
 
 namespace
@@ -37,6 +38,16 @@ exprt compare_class_objects(
                           lhs.get("value") == rhs.get("value");
   return gen_bool(same_class == (op == "Eq"));
 }
+
+// A char array copied from a variable (`{ x[0], x[1], ... }`) can still carry
+// the constant id; only one whose every character is a literal folds.
+bool is_folded_constant(const exprt &e)
+{
+  return e.is_constant() && std::all_of(
+                              e.operands().begin(),
+                              e.operands().end(),
+                              [](const exprt &op) { return op.is_constant(); });
+}
 } // namespace
 
 std::pair<exprt, exprt> python_converter::resolve_comparison_operands_internal(
@@ -50,14 +61,14 @@ std::pair<exprt, exprt> python_converter::resolve_comparison_operands_internal(
   if (lhs.is_symbol() && lhs.type().is_array())
   {
     const symbolt *sym = symbol_table_.find_symbol(lhs.identifier());
-    if (sym && sym->get_value().is_constant())
+    if (sym && is_folded_constant(sym->get_value()))
       resolved_lhs = sym->get_value();
   }
 
   if (rhs.is_symbol() && rhs.type().is_array())
   {
     const symbolt *sym = symbol_table_.find_symbol(rhs.identifier());
-    if (sym && sym->get_value().is_constant())
+    if (sym && is_folded_constant(sym->get_value()))
       resolved_rhs = sym->get_value();
   }
 
@@ -81,7 +92,7 @@ exprt python_converter::compare_constants_internal(
   const exprt &lhs,
   const exprt &rhs)
 {
-  if (!lhs.is_constant() || !rhs.is_constant())
+  if (!is_folded_constant(lhs) || !is_folded_constant(rhs))
     return nil_exprt();
 
   // Resolve an op plus a three-way comparison sign (cmp < 0 / == 0 / > 0) to a
@@ -128,8 +139,8 @@ exprt python_converter::compare_constants_internal(
   {
     // Check if both are char arrays (strings)
     if (
-      lhs.type().subtype() == char_type() &&
-      rhs.type().subtype() == char_type())
+      type_utils::is_char_storage(lhs.type().subtype()) &&
+      type_utils::is_char_storage(rhs.type().subtype()))
     {
       if (is_class_object(lhs) || is_class_object(rhs))
         return compare_class_objects(op, lhs, rhs);
@@ -180,12 +191,25 @@ exprt python_converter::compare_constants_internal(
   return nil_exprt();
 }
 
+// A constant index whose base's initializer is its value: a numpy array is
+// written in place, so its initializer is not.
+bool python_converter::is_foldable_constant_index(const exprt &expr) const
+{
+  if (expr.id() != "index" || !expr.op1().is_constant())
+    return false;
+  const exprt &base = expr.op0();
+  return !base.is_symbol() ||
+         numpy_array_symbols_.count(base.identifier().as_string()) == 0;
+}
+
 exprt python_converter::handle_indexed_comparison_internal(
   const std::string &op,
   const exprt &lhs,
   const exprt &rhs)
 {
-  if (lhs.id() != "index" || !rhs.is_constant() || !rhs.type().is_array())
+  if (
+    !is_foldable_constant_index(lhs) || !rhs.is_constant() ||
+    !rhs.type().is_array())
     return nil_exprt();
 
   const exprt &index = lhs.operands()[1];
@@ -238,12 +262,14 @@ exprt python_converter::handle_type_mismatches(
     return nil_exprt();
 
   // Check if both are string types (either array or pointer to char)
-  bool lhs_is_string =
-    (lhs.type().is_array() && lhs.type().subtype() == char_type()) ||
-    (lhs.type().is_pointer() && lhs.type().subtype() == char_type());
-  bool rhs_is_string =
-    (rhs.type().is_array() && rhs.type().subtype() == char_type()) ||
-    (rhs.type().is_pointer() && rhs.type().subtype() == char_type());
+  bool lhs_is_string = (lhs.type().is_array() &&
+                        type_utils::is_char_storage(lhs.type().subtype())) ||
+                       (lhs.type().is_pointer() &&
+                        type_utils::is_char_storage(lhs.type().subtype()));
+  bool rhs_is_string = (rhs.type().is_array() &&
+                        type_utils::is_char_storage(rhs.type().subtype())) ||
+                       (rhs.type().is_pointer() &&
+                        type_utils::is_char_storage(rhs.type().subtype()));
 
   // If both are strings (regardless of array vs pointer), let strcmp handle it
   if (lhs_is_string && rhs_is_string)
@@ -257,8 +283,10 @@ exprt python_converter::handle_type_mismatches(
   if (lhs.type().is_array() && rhs.type().is_array())
   {
     // Check if these are different semantic types (list vs string)
-    bool lhs_is_string_array = (lhs.type().subtype() == char_type());
-    bool rhs_is_string_array = (rhs.type().subtype() == char_type());
+    bool lhs_is_string_array =
+      (type_utils::is_char_storage(lhs.type().subtype()));
+    bool rhs_is_string_array =
+      (type_utils::is_char_storage(rhs.type().subtype()));
 
     // If one is a string array and the other is not, they're different types
     if (lhs_is_string_array != rhs_is_string_array)
@@ -288,6 +316,25 @@ static bool either_is_string(const exprt &lhs, const exprt &rhs)
 {
   return type_utils::is_string_type(lhs.type()) ||
          type_utils::is_string_type(rhs.type());
+}
+
+// An index or member read of a char array has operands that are not its
+// characters; only a constant array spells them out.
+static bool is_constant_char_array(const exprt &expr)
+{
+  return expr.is_constant() && expr.type().is_array() &&
+         type_utils::is_char_storage(expr.type().subtype());
+}
+
+// A pointer to the characters of `expr`, reading an Any (void *) operand as
+// the str strcmp() would see.
+static exprt char_pointer_of(const exprt &expr)
+{
+  exprt ptr = expr.type().is_pointer() ? expr : address_of_exprt(expr);
+  // An Optional[str] points to a char array; index its chars, not arrays.
+  if (ptr.type().subtype().is_empty() || ptr.type().subtype().is_array())
+    ptr = typecast_exprt(ptr, gen_pointer_type(char_type()));
+  return ptr;
 }
 
 exprt python_converter::handle_string_comparison(
@@ -324,10 +371,7 @@ exprt python_converter::handle_string_comparison(
         candidate = &expr.op0();
       }
 
-      if (!candidate->type().is_array())
-        return false;
-
-      if (candidate->type().subtype() != char_type())
+      if (!is_constant_char_array(*candidate))
         return false;
 
       const std::string value =
@@ -359,9 +403,7 @@ exprt python_converter::handle_string_comparison(
       // (nil, since char_type() is not a pointer type) rather than tp
       // itself; migrate_type(char_type().subtype()) reproduces that exact
       // quirk byte-for-byte.
-      exprt ptr = expr;
-      if (!ptr.type().is_pointer())
-        ptr = address_of_exprt(expr);
+      const exprt ptr = char_pointer_of(expr);
       expr2tc ptr2, index2;
       migrate_expr(ptr, ptr2);
       migrate_expr(index, index2);
@@ -546,6 +588,88 @@ static std::string python_operator_symbol(const std::string &op)
   return it == symbols.end() ? op : it->second;
 }
 
+/// The None flag of the attribute `operand` reads, or nil when it has none.
+exprt python_converter::none_flag_of_attribute(const exprt &operand) const
+{
+  const exprt *read = &operand;
+  while (read->id() == "typecast")
+    read = &read->op0();
+  if (!read->is_member())
+    return nil_exprt();
+  const member_exprt &member = to_member_expr(*read);
+  const std::string attr = member.get_component_name().as_string();
+  if (!none_flagged_attributes_.count(attr))
+    return nil_exprt();
+  return member_exprt(member.struct_op(), attr + "$none", bool_type());
+}
+
+/// An attribute stored None and a value of unknown type is typed `void *`.
+/// Arithmetic on it raises TypeError where its None flag is set. With no
+/// flag, it is refused: reading the pointer as a number on the path where it
+/// holds None would not raise.
+void python_converter::guard_none_attribute_operands(
+  const std::string &op,
+  const nlohmann::json &left,
+  const nlohmann::json &right,
+  const exprt &lhs,
+  const exprt &rhs,
+  const nlohmann::json &element)
+{
+  // The type probe of an assignment's value is converted again for real.
+  if (!raises_on_none_operand(op) || in_rhs_type_probe_)
+    return;
+  for (const nlohmann::json *operand : {&left, &right})
+  {
+    const std::string attr =
+      operand->is_object() && operand->value("_type", "") == "Attribute"
+        ? operand->value("attr", "")
+        : "";
+    if (
+      untyped_none_attributes_.count(attr) ||
+      (none_flagged_attributes_.count(attr) && !can_emit_runtime_guard()))
+      throw std::runtime_error(
+        "arithmetic on '" + attr +
+        "', which may hold None or a value whose type is not known, is not "
+        "supported");
+  }
+  const exprt lhs_none = none_flag_of_attribute(lhs);
+  const exprt rhs_none = none_flag_of_attribute(rhs);
+  const locationt location = get_location_from_decl(element);
+  const std::string symbol = python_operator_symbol(op);
+  if (lhs_none.is_not_nil())
+    emit_guarded_raise(
+      lhs_none,
+      "TypeError",
+      "unsupported operand type(s) for " + symbol + ": 'NoneType' and '" +
+        type_handler_.get_python_type_name(rhs.type()) + "'",
+      location);
+  if (rhs_none.is_not_nil())
+    emit_guarded_raise(
+      rhs_none,
+      "TypeError",
+      "unsupported operand type(s) for " + symbol + ": '" +
+        type_handler_.get_python_type_name(lhs.type()) + "' and 'NoneType'",
+      location);
+}
+
+/// Sets the None flag of an attribute store: whether it stores None.
+void python_converter::set_none_flag(
+  const exprt &lhs,
+  const nlohmann::json &ast_node,
+  codet &target_block) const
+{
+  const exprt flag = none_flag_of_attribute(lhs);
+  if (flag.is_nil())
+    return;
+  const nlohmann::json &value = ast_node.value("value", nlohmann::json());
+  const bool stores_none = value.is_object() &&
+                           value.value("_type", "") == "Constant" &&
+                           value["value"].is_null();
+  code_assignt assign(flag, gen_boolean(stores_none));
+  assign.location() = get_location_from_decl(ast_node);
+  target_block.copy_to_operands(assign);
+}
+
 /// Entry point for a binary operation with a None operand. Rejects the
 /// operators CPython rejects, and otherwise defers to the identity/equality
 /// handling. Kept separate from both callers so neither grows a decision
@@ -575,9 +699,18 @@ void python_converter::raise_on_optional_none(
   const exprt &rhs,
   const nlohmann::json &element)
 {
+  const locationt location = get_location_from_decl(element);
+  if ((op == "In" || op == "NotIn") && !rhs_none.is_false())
+  {
+    emit_guarded_raise(
+      rhs_none,
+      "TypeError",
+      "argument of type 'NoneType' is not iterable",
+      location);
+    return;
+  }
   if (!raises_on_none_operand(op))
     return;
-  const locationt location = get_location_from_decl(element);
   auto raise = [&](
                  const exprt &flag,
                  const std::string &lhs_name,
@@ -672,15 +805,67 @@ exprt python_converter::handle_none_comparison(
   return isnone_expr;
 }
 
+static bool is_constant_index(const nlohmann::json &slice)
+{
+  const nlohmann::json &index =
+    slice.value("_type", "") == "UnaryOp" ? slice["operand"] : slice;
+  return index.value("_type", "") == "Constant" &&
+         index["value"].is_number_integer();
+}
+
+/// True when every read of `name` in `node` indexes it by a constant, so no
+/// statement can replace one of its elements.
+static bool
+only_read_by_constant_index(const nlohmann::json &node, const std::string &name)
+{
+  if (node.is_object())
+  {
+    const std::string kind = node.value("_type", "");
+    if (
+      kind == "Subscript" && node["value"].value("_type", "") == "Name" &&
+      node["value"]["id"] == name)
+      return node["ctx"].value("_type", "") == "Load" &&
+             is_constant_index(node["slice"]);
+    if (kind == "Name" && node["id"] == name)
+      return node["ctx"].value("_type", "") == "Store";
+  }
+  for (const auto &child : node)
+    if (child.is_structured() && !only_read_by_constant_index(child, name))
+      return false;
+  return true;
+}
+
+/// The element `node` reads when the preprocessor folded `list[i]` to a copy
+/// of that element, or "" unless the list is one module-level literal whose
+/// elements are never replaced.
+static std::string
+folded_list_element(const nlohmann::json &module, const nlohmann::json &node)
+{
+  const std::string element = node.value("esbmc_list_element", "");
+  if (element.empty())
+    return "";
+  const std::string list = element.substr(0, element.find('['));
+  const nlohmann::json *value = json_utils::top_level_value(module, list);
+  if (
+    !value || value->value("_type", "") != "List" ||
+    json_utils::count_name_bindings(module, list) != 1 ||
+    !only_read_by_constant_index(module, list))
+    return "";
+  return element;
+}
+
 /// The module-level name that owns the object `node` denotes, or "" when that
 /// is not provable from the AST. Each name on the way must be bound exactly
 /// once in the whole module, by a top-level statement, and every name but the
 /// owner by `name = other_name`. Such a name holds one object for the whole
 /// run, so two names with one owner are the same object, whatever the value
-/// is modelled as: a str is copied on assignment (#8412).
+/// is modelled as: a str is copied on assignment (#8412). A folded list
+/// element, or a name bound to one, is owned by that element.
 static std::string
 sole_object_owner(const nlohmann::json &module, const nlohmann::json &node)
 {
+  if (std::string element = folded_list_element(module, node); !element.empty())
+    return element;
   std::set<std::string> seen;
   for (const nlohmann::json *name = &node; name->value("_type", "") == "Name";)
   {
@@ -691,7 +876,10 @@ sole_object_owner(const nlohmann::json &module, const nlohmann::json &node)
       !seen.insert(id).second)
       return "";
     if (value->value("_type", "") != "Name")
-      return id;
+    {
+      const std::string element = folded_list_element(module, *value);
+      return element.empty() ? id : element;
+    }
     name = value;
   }
   return "";
@@ -754,19 +942,20 @@ expr2tc python_converter::build_is_equality(
   if (!owner.empty() && owner == sole_object_owner(ast(), right))
     return gen_true_expr();
 
-  expr2tc lhs2, rhs2;
-  if (lhs.type().is_array() && rhs.type().is_array())
-  {
-    // Compare base addresses of the arrays
-    migrate_expr(string_handler_.get_array_base_address(lhs), lhs2);
-    migrate_expr(string_handler_.get_array_base_address(rhs), rhs2);
-  }
-  else
-  {
-    // Default identity comparison
-    migrate_expr(lhs, lhs2);
-    migrate_expr(rhs, rhs2);
-  }
+  // An array is identified by its base address, which a pointer on the other
+  // side may hold: `b = get(v)` returns v's characters by pointer (#8412).
+  auto identity = [this](const exprt &e, const exprt &other) {
+    expr2tc out;
+    const bool as_address =
+      e.type().is_array() && (other.type().is_array() ||
+                              (other.type().is_pointer() &&
+                               other.type().subtype() == e.type().subtype()));
+    migrate_expr(
+      as_address ? string_handler_.get_array_base_address(e) : e, out);
+    return out;
+  };
+  expr2tc lhs2 = identity(lhs, rhs);
+  expr2tc rhs2 = identity(rhs, lhs);
 
   if (
     expr2tc fn = function_identity(
@@ -790,7 +979,85 @@ expr2tc python_converter::build_is_equality(
       "'is' with an operand that lost its object type, which ESBMC cannot "
       "compare by identity");
 
+  // IEEE == calls a NaN not identical to itself (#8769). Comparing bit
+  // patterns would be exact, but SMT-LIB leaves a NaN's bits unspecified.
+  if (is_floatbv_type(lhs2->type) && lhs2->type == rhs2->type)
+    return or2tc(
+      equality2tc(lhs2, rhs2), and2tc(isnan2tc(lhs2), isnan2tc(rhs2)));
+
   return equality2tc(lhs2, rhs2);
+}
+
+std::optional<std::pair<exprt, std::string>>
+python_converter::bound_method_operand(const nlohmann::json &operand)
+{
+  if (
+    operand.value("_type", "") != "Attribute" ||
+    operand["value"].value("_type", "") != "Name")
+    return std::nullopt;
+  const std::string &attr = operand["attr"].get_ref<const std::string &>();
+  const nlohmann::json &body = (*ast_json)["body"];
+  if (std::none_of(body.begin(), body.end(), [&](const nlohmann::json &stmt) {
+        return stmt.value("_type", "") == "ClassDef" &&
+               sole_method_def(stmt["name"].get<std::string>(), attr);
+      }))
+    return std::nullopt;
+  const exprt receiver = get_expr(operand["value"]);
+  if (!receiver.type().is_pointer())
+    return std::nullopt;
+  const typet &pointed = ns.follow(receiver.type().subtype());
+  if (!pointed.is_struct())
+    return std::nullopt;
+  const struct_typet &instance = to_struct_type(pointed);
+  const std::string class_name =
+    extract_class_name_from_tag(instance.tag().as_string());
+  const auto mro = class_mro(class_name);
+  if (
+    !mro || instance.has_component(attr) || overridden_below(class_name, attr))
+    return std::nullopt;
+  for (const std::string &cls : *mro)
+    if (class_binds_name(cls, attr))
+    {
+      // A decorator (staticmethod, classmethod, property) may not bind the
+      // receiver at all.
+      const nlohmann::json *def = sole_method_def(cls, attr);
+      if (!def || !def->value("decorator_list", nlohmann::json()).empty())
+        return std::nullopt;
+      return std::make_pair(receiver, cls + "." + attr);
+    }
+  return std::nullopt;
+}
+
+/// Two bound methods are equal when they bind the same function to the same
+/// object (#8457). No subclass overrides either method, so the class that
+/// defines it on the static type is the one the object runs.
+std::optional<exprt>
+python_converter::try_bound_method_compare(const nlohmann::json &element)
+{
+  if (
+    element.value("_type", "") != "Compare" || element["ops"].size() != 1 ||
+    element["comparators"].size() != 1)
+    return std::nullopt;
+  const std::string op = element["ops"][0]["_type"].get<std::string>();
+  if (op != "Eq" && op != "NotEq")
+    return std::nullopt;
+  const nlohmann::json &left = element["left"];
+  const nlohmann::json &right = element["comparators"][0];
+  if (
+    left.value("_type", "") != "Attribute" ||
+    right.value("_type", "") != "Attribute")
+    return std::nullopt;
+  const auto lhs = bound_method_operand(left);
+  const auto rhs = lhs ? bound_method_operand(right) : std::nullopt;
+  if (!lhs || !rhs)
+    return std::nullopt;
+  const typet object = pointer_typet(empty_typet());
+  exprt same = lhs->second != rhs->second
+                 ? gen_bool(false)
+                 : exprt(equality_exprt(
+                     typecast_exprt(lhs->first, object),
+                     typecast_exprt(rhs->first, object)));
+  return op == "Eq" ? same : exprt(not_exprt(same));
 }
 
 /// Construct the expression for Python 'is' operator
@@ -857,7 +1124,7 @@ exprt python_converter::handle_string_type_mismatch(
 }
 
 /// The argument of @p node when it is `type(x)` on a name whose static type
-/// was erased to `void *`; nil otherwise.
+/// was erased to `void *` or whose runtime type is tagged; nil otherwise.
 exprt python_converter::erased_type_argument(const nlohmann::json &node)
 {
   if (
@@ -867,7 +1134,9 @@ exprt python_converter::erased_type_argument(const nlohmann::json &node)
     return nil_exprt();
 
   exprt value = get_expr(node["args"][0]);
-  if (!value.type().is_pointer() || value.type().subtype().id() != "empty")
+  const bool erased =
+    value.type().is_pointer() && value.type().subtype().id() == "empty";
+  if (!erased && !type_handler_.is_tagged_scalar_type(value.type()))
     return nil_exprt();
   return value;
 }
@@ -898,6 +1167,9 @@ exprt python_converter::handle_erased_type_comparison(
   // for isinstance(), refusing when it cannot. bool is int's only builtin
   // subclass.
   auto isinstance_of = [&](const std::string &type_name) {
+    if (type_handler_.is_tagged_scalar_type(value.type()))
+      return dynamic_type_handler_.build_isinstance_check(
+        value, type_name, false);
     expr2tc value2, type2;
     migrate_expr(value, value2);
     migrate_expr(gen_zero(type_handler_.get_typet(type_name, 0)), type2);
@@ -909,6 +1181,65 @@ exprt python_converter::handle_erased_type_comparison(
   return op == "Is" || op == "Eq" ? result : not_exprt(result);
 }
 
+// The classes `elts` names, or none unless each element names a class.
+static std::vector<std::string>
+named_classes(const nlohmann::json &elts, const nlohmann::json &ast)
+{
+  std::vector<std::string> classes;
+  for (const auto &elt : elts)
+  {
+    if (elt.value("_type", "") != "Name")
+      return {};
+    const std::string id = elt["id"];
+    if (!type_utils::is_type_identifier(id) && !json_utils::is_class(id, ast))
+      return {};
+    classes.push_back(id);
+  }
+  return classes;
+}
+
+exprt python_converter::listed_class_value(const nlohmann::json &node)
+{
+  if (
+    node.value("_type", "") != "Subscript" ||
+    node["value"].value("_type", "") != "List")
+    return nil_exprt();
+  const nlohmann::json &slice = node["slice"];
+  const std::string kind = slice.value("_type", "");
+  // The index is converted again, so it must have no side effects.
+  if (kind != "Name" && kind != "Constant" && kind != "UnaryOp")
+    return nil_exprt();
+  if (kind == "UnaryOp" && slice["operand"].value("_type", "") != "Constant")
+    return nil_exprt();
+
+  const std::vector<std::string> classes =
+    named_classes(node["value"]["elts"], *ast_json);
+  if (classes.empty())
+    return nil_exprt();
+  const exprt index = get_expr(slice);
+  if (!type_utils::is_integer_type(index.type()))
+    return nil_exprt();
+
+  // An index out of range already raised IndexError where the subscript
+  // itself was converted, so the last class needs no test of its own.
+  const std::size_t n = classes.size();
+  const auto at = [&](long long i) {
+    exprt eq("=", bool_type());
+    eq.copy_to_operands(index, from_integer(i, index.type()));
+    return eq;
+  };
+  exprt cls = class_value(classes.back());
+  for (std::size_t k = n - 1; k-- > 0;)
+  {
+    const long long pos = static_cast<long long>(k);
+    cls = if_exprt(
+      or_exprt(at(pos), at(pos - static_cast<long long>(n))),
+      class_value(classes[k]),
+      cls);
+  }
+  return cls;
+}
+
 exprt python_converter::handle_type_comparison(
   const std::string &op,
   const exprt &lhs,
@@ -916,9 +1247,90 @@ exprt python_converter::handle_type_comparison(
   const nlohmann::json &left,
   const nlohmann::json &right)
 {
+  const exprt runtime = compare_class_values(op, lhs, rhs);
+  if (!runtime.is_nil())
+    return runtime;
   const exprt erased = handle_erased_type_comparison(op, left, right);
-  return erased.is_nil() ? handle_type_identity_check(op, lhs, rhs, left, right)
-                         : erased;
+  if (!erased.is_nil())
+    return erased;
+  auto unknown = [](const exprt &e) {
+    return e.get_string("value") == unknown_class_name;
+  };
+  if (unknown(lhs) || unknown(rhs))
+  {
+    log_warning(
+      "type() of a value whose class is not known statically is compared "
+      "as nondet");
+    return side_effect_expr_nondett(bool_type());
+  }
+  const exprt left_listed = listed_class_value(left);
+  const exprt right_listed = listed_class_value(right);
+  if (left_listed.is_not_nil() || right_listed.is_not_nil())
+  {
+    const exprt listed = compare_class_values(
+      op,
+      left_listed.is_nil() ? lhs : left_listed,
+      right_listed.is_nil() ? rhs : right_listed);
+    if (listed.is_not_nil())
+      return listed;
+  }
+  return handle_type_identity_check(op, lhs, rhs, left, right);
+}
+
+static bool may_hold_class(const exprt &expr);
+
+exprt python_converter::class_value(const std::string &name)
+{
+  const int id =
+    class_ids_.emplace(name, static_cast<int>(class_ids_.size()) + 1)
+      .first->second;
+  exprt value("struct", type_handler::class_value_type());
+  value.copy_to_operands(from_integer(id, int_type()));
+  return value;
+}
+
+exprt python_converter::as_class_value(const exprt &e)
+{
+  if (type_handler::is_class_value_type(e.type()))
+    return e;
+  if (is_class_object(e))
+    return class_value(e.get_string("value"));
+  if (e.id() != "if")
+    return nil_exprt();
+  const exprt then_value = as_class_value(e.op1());
+  const exprt else_value = as_class_value(e.op2());
+  if (then_value.is_nil() || else_value.is_nil())
+    return nil_exprt();
+  return if_exprt(e.op0(), then_value, else_value);
+}
+
+exprt python_converter::compare_class_values(
+  const std::string &op,
+  const exprt &lhs,
+  const exprt &rhs)
+{
+  if (
+    (op != "Is" && op != "IsNot" && op != "Eq" && op != "NotEq") ||
+    (!type_handler::is_class_value_type(lhs.type()) &&
+     !type_handler::is_class_value_type(rhs.type())))
+    return nil_exprt();
+  const exprt l = as_class_value(lhs);
+  const exprt r = as_class_value(rhs);
+  if (l.is_nil() || r.is_nil())
+  {
+    // A value that cannot hold a class, an int or None say, is never one.
+    // A string shares a class object's char-array model, and an erased
+    // value may be either, so for those the answer is not known.
+    const exprt &other = l.is_nil() ? lhs : rhs;
+    if (!may_hold_class(other))
+      return gen_bool(op == "IsNot" || op == "NotEq");
+    throw std::runtime_error(
+      "Unsupported: comparing a class value with a value that may be one");
+  }
+  const typet id = int_type();
+  exprt same("=", bool_type());
+  same.copy_to_operands(member_exprt(l, "id", id), member_exprt(r, "id", id));
+  return op == "Is" || op == "Eq" ? same : not_exprt(same);
 }
 
 static bool is_type_call(const nlohmann::json &node)
@@ -958,6 +1370,47 @@ std::optional<std::string> python_converter::class_identity_operand(
   return *held;
 }
 
+static bool may_hold_class(const exprt &expr)
+{
+  const typet &t = expr.type();
+  return (t.is_array() || t.is_pointer()) &&
+         (type_utils::is_char_storage(t.subtype()) ||
+          t.subtype().id() == "empty");
+}
+
+/// Whether an operand the fold could not resolve to a class may still be
+/// one: an unresolved type(x) denotes a class, and since a class object is
+/// lowered to a string, so may a name typed as a string or erased to void *
+/// (say a parameter). Such a side is left to the comparison paths that follow.
+static bool undecided_side(
+  const std::optional<std::string> &cls,
+  const nlohmann::json &node,
+  const exprt &expr)
+{
+  return !cls && (is_type_call(node) ||
+                  (node["_type"] == "Name" && may_hold_class(expr)));
+}
+
+// An operand of `is` against a class that did not resolve to one, but has
+// the char-array model a class object shares, may hold a class the frontend
+// lost track of (a loop variable over classes, say), and the paths that
+// follow would fold it to "not identical", so it is refused. A string
+// literal never holds one, and an unresolved type(x) is left to those paths.
+static void refuse_possible_class(
+  const std::optional<std::string> &resolved,
+  const nlohmann::json &node,
+  const exprt &expr)
+{
+  const typet &type = expr.type();
+  const std::string kind = node.value("_type", "");
+  if (
+    !resolved && (type.is_array() || type.is_pointer()) &&
+    type_utils::is_char_storage(type.subtype()) && kind != "Constant" &&
+    kind != "JoinedStr" && !is_type_call(node))
+    throw std::runtime_error(
+      "Unsupported: 'is' between a class and a value that may hold one");
+}
+
 exprt python_converter::handle_type_identity_check(
   const std::string &op,
   const exprt &lhs,
@@ -972,14 +1425,16 @@ exprt python_converter::handle_type_identity_check(
     class_identity_operand(left, lhs);
   const std::optional<std::string> rhs_class =
     class_identity_operand(right, rhs);
-  // An unresolved type(x) still denotes a class, so it is left to the
-  // comparison paths that follow.
+  if (!lhs_class && !rhs_class)
+    return nil_exprt();
+  refuse_possible_class(lhs_class, left, lhs);
+  refuse_possible_class(rhs_class, right, rhs);
   if (
-    (!lhs_class && !rhs_class) || (!lhs_class && is_type_call(left)) ||
-    (!rhs_class && is_type_call(right)))
+    undecided_side(lhs_class, left, lhs) ||
+    undecided_side(rhs_class, right, rhs))
     return nil_exprt();
 
-  // A value is never identical to a class object.
+  // A value that cannot hold a class is never identical to one.
   const bool same = lhs_class && rhs_class && *lhs_class == *rhs_class;
   return gen_bool(same == (op == "Is"));
 }

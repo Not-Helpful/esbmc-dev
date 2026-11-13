@@ -98,6 +98,18 @@ public:
     unsigned pointer_diff_width;
     unsigned word_size;
     unsigned wchar_t_width;
+    /* ABI alignment in bytes of 8-byte and wider scalars, as the C frontend's
+     * clang target lays out records (i386: 4, #8694); 0 means the type's size.
+     */
+    unsigned long_long_align = 0;
+    unsigned double_align = 0;
+    unsigned long_double_align = 0;
+    /* Cap on _BitInt alignment in bytes (x86-64: 8, AArch64: 16; #8692). */
+    unsigned bitint_max_align = 0;
+    /* Whether an unnamed bit-field's declared type raises its record's
+     * alignment: true on ARM and Microsoft layouts, false for the SysV psABI
+     * (#9383). */
+    bool unnamed_bitfield_aligns = true;
 
     unsigned pointer_width() const noexcept
     {

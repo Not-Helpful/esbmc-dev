@@ -2441,7 +2441,8 @@ class code_switch_case2t : public expr2t
 {
 public:
   bool is_default;
-  expr2tc case_op; // nil when is_default
+  expr2tc case_op;    // nil when is_default
+  expr2tc case_op_hi; // GNU `case lo ... hi:` upper bound; nil otherwise
   expr2tc code;
   locationt location; // not reflected (see note above)
   static constexpr std::size_t excluded_field_bytes = sizeof(locationt);
@@ -2450,10 +2451,12 @@ public:
     bool _is_default,
     const expr2tc &_case_op,
     const expr2tc &_code,
-    const locationt &loc = locationt())
+    const locationt &loc = locationt(),
+    const expr2tc &_case_op_hi = expr2tc())
     : expr2t(get_empty_type(), code_switch_case_id),
       is_default(_is_default),
       case_op(_case_op),
+      case_op_hi(_case_op_hi),
       code(_code),
       location(loc)
   {
@@ -2464,6 +2467,7 @@ public:
     &expr2t::type,
     &code_switch_case2t::is_default,
     &code_switch_case2t::case_op,
+    &code_switch_case2t::case_op_hi,
     &code_switch_case2t::code);
   static std::string field_names[esbmct::num_type_fields];
 };

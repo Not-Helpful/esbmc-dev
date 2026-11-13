@@ -104,6 +104,27 @@ public:
 
   exprt build_nondet_string_fallback(const locationt &location);
 
+  /// A bounded, NUL-terminated str of nondet content, as nondet_str() gives.
+  exprt build_nondet_string(const locationt &location);
+
+  /// CPython's default object repr, @p prefix followed by the address as 1 to
+  /// 16 nondet lowercase hex digits and ">".
+  exprt build_default_object_repr(
+    const std::string &prefix,
+    const locationt &location);
+
+  /// The nondet str buffer size: --nondet-str-length plus the NUL.
+  static int nondet_str_buffer_size();
+  void assume_length_in_buffer(
+    const exprt &length,
+    int buffer_size,
+    const locationt &location);
+  void assume_no_nul_before(
+    const exprt &array,
+    const exprt &length,
+    int buffer_size,
+    const locationt &location);
+
   /**
    * @brief Extract string content from array operands
    * @param array_expr Array expression containing characters
@@ -141,6 +162,10 @@ public:
    */
   exprt
   apply_format_specification(const exprt &expr, const std::string &format);
+
+  /// A spec on a value not folded at conversion time: a fixed-point float
+  /// through its model, anything else as a nondet string.
+  exprt format_runtime_value(const exprt &expr, const std::string &format);
 
   /**
    * @brief Convert f-string JSON to expression
@@ -260,6 +285,9 @@ public:
    * - "-".join(list_var) -> joined string
    */
   exprt handle_str_join(const nlohmann::json &call_json);
+  exprt join_unfoldable_iterable(
+    const exprt &separator,
+    const nlohmann::json &call_json);
 
   /// Convert a join() literal's elements into `elem_exprs`. Returns a TypeError
   /// raise for an element that is known not to be a str, nil otherwise.
@@ -277,6 +305,36 @@ public:
   exprt handle_string_attribute_call(const nlohmann::json &call_json);
 
   /**
+   * @brief The str a tagged receiver of str-only method `method` holds,
+   * after raising AttributeError on the paths where it holds another type.
+   * Any other receiver is returned unchanged.
+   */
+  exprt read_tagged_str_receiver(
+    const exprt &receiver,
+    const std::string &method,
+    const nlohmann::json &call_json);
+
+  /**
+   * @brief The str a tagged argument of str method `method` holds, after
+   * raising TypeError on the paths where it holds another type. Any other
+   * argument is returned unchanged.
+   */
+  exprt read_tagged_str_argument(
+    const exprt &argument,
+    const std::string &method,
+    const locationt &location);
+
+  /// The char pointer of the str @p tagged holds, behind a guard raising
+  /// @p exception with @p message where it holds another type. @p refusal
+  /// stops the conversion where no guard can be planted.
+  exprt read_tagged_str(
+    const exprt &tagged,
+    const std::string &exception,
+    const std::string &message,
+    const std::string &refusal,
+    const locationt &location);
+
+  /**
    * @brief Try fast-path folding for len() when argument is string-like.
    *
    * Returns non-nil when a compile-time or cheap symbolic shortcut is
@@ -286,6 +344,7 @@ public:
   exprt try_handle_len_string_fast_path(
     const nlohmann::json &call_json,
     const exprt &arg_expr);
+  exprt char_array_type_length(const exprt &arg_expr) const;
 
   // String method operations
 
@@ -345,6 +404,9 @@ public:
    */
   exprt
   handle_string_isdigit(const exprt &string_obj, const locationt &location);
+
+  exprt
+  handle_string_isascii(const exprt &string_obj, const locationt &location);
 
   /**
    * @brief Handle str.isalpha() method
@@ -700,6 +762,20 @@ public:
     const exprt &string_obj,
     [[maybe_unused]] const locationt &location);
 
+  exprt
+  handle_string_isdecimal(const exprt &string_obj, const locationt &location);
+
+  exprt
+  handle_string_istitle(const exprt &string_obj, const locationt &location);
+
+  exprt
+  handle_string_isprintable(const exprt &string_obj, const locationt &location);
+
+  exprt call_str_predicate_model(
+    const std::string &name,
+    const exprt &string_obj,
+    const locationt &location);
+
   /**
    * @brief Handle str.isidentifier() method
    */
@@ -901,6 +977,13 @@ private:
     const std::vector<unsigned char> &chars,
     const typet &type);
 
+  /// A one-character str holding the char `expr`.
+  exprt char_to_string(const exprt &expr);
+
+  exprt constant_to_string(const exprt &expr);
+
+  exprt pointer_to_string(const exprt &expr);
+
   exprt build_string_index_result(
     const nlohmann::json &call,
     const exprt &find_expr,
@@ -921,11 +1004,15 @@ private:
   std::string ensure_string_function_symbol(const std::string &function_name);
 
   symbolt *find_cached_symbol(const std::string &symbol_id);
+  const symbolt *find_foldable_symbol(const std::string &symbol_id);
+  exprt symbol_to_string(const exprt &expr);
   symbolt *find_cached_c_function_symbol(const std::string &symbol_id);
   exprt try_len_fast_path_from_constant_arg(
     const nlohmann::json &arg_json,
     const exprt &arg_expr);
   exprt try_len_fast_path_from_name_arg(const nlohmann::json &arg_json);
+  bool is_single_binding(const std::string &var_name);
+  exprt recorded_length(const nlohmann::json &arg_json, const exprt &arg_expr);
 
   /**
    * @brief Convert float bits to string representation

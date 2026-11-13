@@ -3,6 +3,7 @@
 #include <goto-programs/goto_convert_class.h>
 #include <irep2/irep2_utils.h>
 #include <util/arith/arith_tools.h>
+#include <util/config/config.h>
 #include <util/lang/c_types.h>
 #include <util/symtab/cprover_prefix.h>
 #include <util/expr/expr_util.h>
@@ -2082,6 +2083,48 @@ void goto_convertt::guard_arm_destructors(
   cond = flag_expr;
 }
 
+/// clang_c_adjust promotes E1 of a compound assignment narrower than int, so
+/// it arrives as (int)x.
+static const exprt &skip_promotion(const exprt &lhs)
+{
+  return lhs.is_typecast() ? lhs.op0() : lhs;
+}
+
+// A _Bool bit-field has the semantics of a _Bool (C11 6.7.2.1p10), but
+// get_bitfield_type gives it an unsignedbv[N] type, and only its #cpp_type
+// survives the IREP2 round trip. A store must convert the value to _Bool
+// first (6.3.1.2p1) rather than keep its low bits.
+static bool is_bool_bitfield(const typet &type)
+{
+  return type.is_unsignedbv() && type.cpp_type() == "bool";
+}
+
+// `rhs = (_Bool)((int)op + 1)`, or `- 1` by rhs's id, stored back into op's
+// type.
+static void make_bool_step(exprt &rhs, const exprt &op, const typet &op_type)
+{
+  rhs.copy_to_operands(op, gen_one(int_type()));
+  rhs.op0().make_typecast(int_type());
+  rhs.type() = int_type();
+  rhs.make_typecast(bool_type());
+  if (is_bool_bitfield(op_type))
+    rhs.make_typecast(op_type);
+}
+
+// The C adjuster promotes E1 of `E1 op= E2` in place, so the lvalue may be a
+// typecast of the bit-field.
+static void convert_bool_bitfield_store(const exprt &lhs, exprt &rhs)
+{
+  const exprt *object = &lhs;
+  while (object->is_typecast())
+    object = &object->op0();
+  if (!is_bool_bitfield(object->type()))
+    return;
+  const typet rhs_type = rhs.type();
+  rhs.make_typecast(bool_type());
+  rhs.make_typecast(rhs_type);
+}
+
 void goto_convertt::remove_assignment(
   exprt &expr,
   goto_programt &dest,
@@ -2138,12 +2181,14 @@ void goto_convertt::remove_assignment(
       rhs.make_typecast(expr.op0().type());
     }
 
+    convert_bool_bitfield_store(expr.op0(), rhs);
+
     exprt lhs(expr.op0());
 
     // C11 compound assignments on _Atomic are RMW: the read and write must
     // happen in a single indivisible atomic section (no context-switch window
     // between the load and the store, unlike plain "x = x op y").
-    if (is_atomic_symbol(lhs, ns))
+    if (is_atomic_symbol(skip_promotion(lhs), ns))
       convert_assign_rmw_atomic(lhs, rhs, expr.location(), dest);
     else
     {
@@ -2162,6 +2207,24 @@ void goto_convertt::remove_assignment(
   }
   else
     expr.make_nil();
+}
+
+// C11 6.5.2.4p2/6.5.3.1p2 define ++ and -- through += 1, so a signed operand
+// of rank below int is promoted (6.3.1.1p2) and cannot overflow. Unsigned
+// operands keep their own type so --unsigned-overflow-check still reports the
+// wrap. _BitInt is not promoted (C23 6.3.1.1p2); it is told apart by having
+// no #cpp_type, the only marker irep2 keeps.
+static bool is_promoted_to_int(const typet &type)
+{
+  if (
+    config.language.lid != language_idt::C &&
+    config.language.lid != language_idt::CPP)
+    return false;
+  if (!type.is_signedbv())
+    return false;
+  if (type.cpp_type().empty())
+    return false;
+  return bv_width(type) < bv_width(int_type());
 }
 
 void goto_convertt::remove_pre(
@@ -2202,14 +2265,11 @@ void goto_convertt::remove_pre(
 
   const typet &op_type = ns.follow(expr.op0().type());
 
-  if (op_type.is_bool())
-  {
-    rhs.copy_to_operands(expr.op0(), gen_one(int_type()));
-    rhs.op0().make_typecast(int_type());
-    rhs.type() = int_type();
-    rhs.make_typecast(bool_type());
-  }
-  else if (op_type.id() == "c_enum" || op_type.id() == "incomplete_c_enum")
+  if (op_type.is_bool() || is_bool_bitfield(op_type))
+    make_bool_step(rhs, expr.op0(), op_type);
+  else if (
+    op_type.id() == "c_enum" || op_type.id() == "incomplete_c_enum" ||
+    is_promoted_to_int(op_type))
   {
     rhs.copy_to_operands(expr.op0(), gen_one(int_type()));
     rhs.op0().make_typecast(int_type());
@@ -2279,34 +2339,18 @@ void goto_convertt::remove_post(
     abort();
   }
 
-  exprt rhs;
+  exprt rhs(compound_assign_operator(
+    statement == "postincrement" ? "assign+" : "assign-",
+    expr.type().is_floatbv()));
   rhs.location() = expr.location();
-
-  if (statement == "postincrement")
-  {
-    if (expr.type().is_floatbv())
-      rhs.id("ieee_add");
-    else
-      rhs.id("+");
-  }
-  else
-  {
-    if (expr.type().is_floatbv())
-      rhs.id("ieee_sub");
-    else
-      rhs.id("-");
-  }
 
   const typet &op_type = ns.follow(expr.op0().type());
 
-  if (op_type.is_bool())
-  {
-    rhs.copy_to_operands(expr.op0(), gen_one(int_type()));
-    rhs.op0().make_typecast(int_type());
-    rhs.type() = int_type();
-    rhs.make_typecast(bool_type());
-  }
-  else if (op_type.id() == "c_enum" || op_type.id() == "incomplete_c_enum")
+  if (op_type.is_bool() || is_bool_bitfield(op_type))
+    make_bool_step(rhs, expr.op0(), op_type);
+  else if (
+    op_type.id() == "c_enum" || op_type.id() == "incomplete_c_enum" ||
+    is_promoted_to_int(op_type))
   {
     rhs.copy_to_operands(expr.op0(), gen_one(int_type()));
     rhs.op0().make_typecast(int_type());
@@ -2382,6 +2426,9 @@ void goto_convertt::remove_post(
   {
     exprt tmp = expr.op0();
     make_temp_symbol(tmp, dest);
+    // A bit-field operand is narrower than the expression's type (#9443).
+    if (tmp.type() != expr.type())
+      tmp.make_typecast(expr.type());
     expr.swap(tmp);
   }
   else

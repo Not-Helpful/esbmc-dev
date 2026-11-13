@@ -1,59 +1,42 @@
 #include <python-frontend/consteval/python_consteval.h>
+#include <python-frontend/math/python_round.h>
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <functional>
 #include <unordered_set>
 
-static double round_ties_to_even_consteval(const double value)
+// round(x) or round(x, ndigits) as CPython computes it. Answers nullopt where
+// the converter decides: a result outside long long or an OverflowError.
+static std::optional<PyConstValue>
+eval_round(const PyConstValue &x, const std::optional<long long> ndigits)
 {
-  const double lower = std::floor(value);
-  const double diff = value - lower;
-  constexpr double tie_eps = 1e-12;
-
-  if (diff < 0.5 - tie_eps)
-    return lower;
-  if (diff > 0.5 + tie_eps)
-    return lower + 1.0;
-
-  const double parity = std::fmod(std::fabs(lower), 2.0);
-  const bool lower_is_even =
-    parity < tie_eps || std::fabs(parity - 2.0) < tie_eps;
-  return lower_is_even ? lower : lower + 1.0;
-}
-
-static double
-round_to_ndigits_ties_even_consteval(const double value, const int ndigits)
-{
-  auto round_ld_ties_even = [](const long double v) -> long double {
-    const long double lower = std::floor(v);
-    const long double diff = v - lower;
-    constexpr long double tie_eps = 1e-15L;
-
-    if (diff < 0.5L - tie_eps)
-      return lower;
-    if (diff > 0.5L + tie_eps)
-      return lower + 1.0L;
-
-    const long double parity = std::fmod(std::fabs(lower), 2.0L);
-    const bool lower_is_even =
-      parity < tie_eps || std::fabs(parity - 2.0L) < tie_eps;
-    return lower_is_even ? lower : lower + 1.0L;
-  };
-
-  long double scale = 1.0L;
-  if (ndigits >= 0)
+  const int n =
+    ndigits ? static_cast<int>(std::clamp<long long>(*ndigits, -1000, 1000))
+            : 0;
+  // bool is an int subclass, and round() of either gives an int
+  if (x.kind == PyConstValue::INT || x.kind == PyConstValue::BOOL)
   {
-    for (int i = 0; i < ndigits; ++i)
-      scale *= 10.0L;
-    return static_cast<double>(
-      round_ld_ties_even(static_cast<long double>(value) * scale) / scale);
+    const std::optional<long long> rounded = round_int_to_ndigits(
+      x.kind == PyConstValue::BOOL ? x.bool_val : x.int_val, n);
+    if (!rounded)
+      return std::nullopt;
+    return PyConstValue::make_int(*rounded);
   }
-
-  for (int i = 0; i < -ndigits; ++i)
-    scale *= 10.0L;
-  return static_cast<double>(
-    round_ld_ties_even(static_cast<long double>(value) / scale) * scale);
+  if (x.kind != PyConstValue::FLOAT)
+    return std::nullopt;
+  if (ndigits)
+  {
+    const std::optional<double> rounded =
+      round_to_ndigits_ties_even(x.float_val, n);
+    if (!rounded)
+      return std::nullopt;
+    return PyConstValue::make_float(*rounded);
+  }
+  const double rounded = round_ties_to_even(x.float_val);
+  if (!(rounded >= -9223372036854775808.0 && rounded < 9223372036854775808.0))
+    return std::nullopt;
+  return PyConstValue::make_int(static_cast<long long>(rounded));
 }
 
 bool PyConstValue::is_truthy() const
@@ -187,12 +170,29 @@ static bool body_has_stmt_kind(
   return false;
 }
 
+// PyConstValue has no bytes kind: a bytes literal evaluates to the str of its
+// text, so b"ab"[0] would fold to "a" instead of 97. Expression-level folds
+// of bytes methods rely on that, but a user function returning or receiving
+// bytes must not be folded to a str.
+static bool contains_bytes_literal(const nlohmann::json &node)
+{
+  if (node.is_object() && node.contains("encoded_bytes"))
+    return true;
+  if (node.is_object() || node.is_array())
+    for (const auto &child : node)
+      if (contains_bytes_literal(child))
+        return true;
+  return false;
+}
+
 /// Bodies carrying properties that must be verified independently: an Assert
-/// (must reach the solver) or a nested FunctionDef (closures are unmodeled).
-/// Always blocks folding, regardless of control-flow permission.
+/// (must reach the solver) or a nested FunctionDef (closures are unmodeled),
+/// and bodies handling bytes literals. Always blocks folding, regardless of
+/// control-flow permission.
 static bool body_has_unfoldable_stmts(const nlohmann::json &body)
 {
-  return body_has_stmt_kind(body, {"Assert", "FunctionDef"});
+  return body_has_stmt_kind(body, {"Assert", "FunctionDef"}) ||
+         contains_bytes_literal(body);
 }
 
 /// Control flow whose branches matter for coverage/branch analysis. Blocks
@@ -201,6 +201,22 @@ static bool body_has_unfoldable_stmts(const nlohmann::json &body)
 static bool body_has_control_flow(const nlohmann::json &body)
 {
   return body_has_stmt_kind(body, {"If", "For", "While"});
+}
+
+std::optional<std::vector<PyConstValue>>
+python_consteval::eval_call_args(const nlohmann::json &args, const Env &env)
+{
+  if (contains_bytes_literal(args))
+    return std::nullopt;
+  std::vector<PyConstValue> values;
+  for (const auto &arg_node : args)
+  {
+    auto arg = eval_expr(arg_node, env);
+    if (!arg)
+      return std::nullopt;
+    values.push_back(*arg);
+  }
+  return values;
 }
 
 std::optional<PyConstValue> python_consteval::try_eval_call(
@@ -985,6 +1001,17 @@ python_consteval::exec_stmt(const nlohmann::json &stmt, Env &env)
   return std::nullopt; // Unsupported statement type
 }
 
+// string_val holds UTF-8 bytes, and len, indexing, slicing, iteration and find
+// here are byte-wise, while CPython counts code points (#7552).
+static std::optional<PyConstValue> ascii_string_constant(const std::string &s)
+{
+  if (std::any_of(s.begin(), s.end(), [](char c) {
+        return static_cast<unsigned char>(c) >= 0x80;
+      }))
+    return std::nullopt;
+  return PyConstValue::make_string(s);
+}
+
 std::optional<PyConstValue>
 python_consteval::eval_expr(const nlohmann::json &node, const Env &env)
 {
@@ -1014,7 +1041,7 @@ python_consteval::eval_expr(const nlohmann::json &node, const Env &env)
       return PyConstValue{
         PyConstValue::FLOAT, false, 0, val.get<double>(), "", {}};
     if (val.is_string())
-      return PyConstValue::make_string(val.get<std::string>());
+      return ascii_string_constant(val.get_ref<const std::string &>());
     return std::nullopt;
   }
 
@@ -1773,6 +1800,10 @@ python_consteval::eval_expr(const nlohmann::json &node, const Env &env)
 
     const std::string &func_name = node["func"]["id"].get<std::string>();
 
+    // A name bound to a value is not the builtin or the function of that name.
+    if (env.count(func_name))
+      return std::nullopt;
+
     // Built-in: len()
     if (func_name == "len")
     {
@@ -1850,29 +1881,12 @@ python_consteval::eval_expr(const nlohmann::json &node, const Env &env)
       auto arg = eval_expr(node["args"][0], env);
       if (!arg)
         return std::nullopt;
-
       if (node["args"].size() == 1)
-      {
-        // round(x) -> int
-        if (arg->kind == PyConstValue::INT)
-          return PyConstValue::make_int(arg->int_val);
-        if (arg->kind == PyConstValue::FLOAT)
-          return PyConstValue::make_int(
-            static_cast<long long>(
-              round_ties_to_even_consteval(arg->float_val)));
-        return std::nullopt;
-      }
-
-      // round(x, n) -> float (or int if n <= 0, but keep float for simplicity)
+        return eval_round(*arg, std::nullopt);
       auto ndigits = eval_expr(node["args"][1], env);
       if (!ndigits || ndigits->kind != PyConstValue::INT)
         return std::nullopt;
-      int n = static_cast<int>(ndigits->int_val);
-      double val = (arg->kind == PyConstValue::INT)
-                     ? static_cast<double>(arg->int_val)
-                     : arg->float_val;
-      double rounded = round_to_ndigits_ties_even_consteval(val, n);
-      return PyConstValue::make_float(rounded);
+      return eval_round(*arg, ndigits->int_val);
     }
 
     // Built-in: min(), max()
@@ -1926,16 +1940,10 @@ python_consteval::eval_expr(const nlohmann::json &node, const Env &env)
     }
 
     // User-defined function call — recurse
-    std::vector<PyConstValue> args;
-    for (const auto &arg_node : node["args"])
-    {
-      auto arg = eval_expr(arg_node, env);
-      if (!arg)
-        return std::nullopt;
-      args.push_back(*arg);
-    }
-
-    return try_eval_call(func_name, args);
+    auto args = eval_call_args(node["args"], env);
+    if (!args)
+      return std::nullopt;
+    return try_eval_call(func_name, *args);
   }
 
   // IfExp (ternary): x if cond else y

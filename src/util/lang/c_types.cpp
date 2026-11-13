@@ -84,7 +84,8 @@ type2tc uint_type2()
 
 typet bool_type()
 {
-  typet result = bool_typet();
+  // Callers get a shared node; copy-on-write detaches it before any change.
+  static const typet result = bool_typet();
   return result;
 }
 
@@ -250,6 +251,14 @@ type2tc double_type2()
 typet long_double_type()
 {
   return build_float_type(config.ansi_c.long_double_width);
+}
+
+const char *c_float_literal_suffix(const typet &type)
+{
+  // Where long double is double, a double takes no suffix.
+  if (type == double_type())
+    return "";
+  return type == float_type() ? "f" : type == long_double_type() ? "l" : "";
 }
 
 type2tc long_double_type2()

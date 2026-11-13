@@ -1,7 +1,9 @@
 #include <cassert>
+#include <functional>
 #include <goto-symex/engine/goto_symex.h>
 #include <goto-symex/scheduler/reachability_tree.h>
 #include <util/arith/arith_tools.h>
+#include <util/lang/c_builtins.h>
 #include <util/lang/c_types.h>
 #include <util/expr/expr_util.h>
 #include <util/expr/type_byte_size.h>
@@ -74,6 +76,24 @@ expr2tc select_by_object(
       fallback = if2tc(size_type2(), item.guard, size, fallback);
   return fallback;
 }
+
+/// The size `size_of` gives the object `ptr` addresses. A pointer that may
+/// address several objects takes the size of the one it addresses, not of
+/// whichever the value set lists first; an `&x` operand or a single candidate
+/// keeps that object's size unguarded.
+template <class SizeOf>
+expr2tc size_by_object(
+  const std::list<dereference_callbackt::internal_item> &items,
+  const expr2tc &ptr,
+  const expr2tc &fallback,
+  SizeOf size_of)
+{
+  if (items.empty())
+    return fallback;
+  if (items.size() == 1 || !is_nil_type(address_of_object_type(ptr)))
+    return size_of(items.front());
+  return select_by_object(items, fallback, size_of);
+}
 } // namespace
 
 void goto_symext::intrinsic_builtin_object_size(
@@ -85,22 +105,51 @@ void goto_symext::intrinsic_builtin_object_size(
   expr2tc ptr = func_call.operands[0];
   expr2tc type_param = func_call.operands[1];
 
-  // Extract type parameter
-  size_t type_value = 0;
   cur_state->rename(type_param);
-  if (is_constant_int2t(type_param))
-  {
-    int64_t param_val = to_constant_int2t(type_param).value.to_int64();
-    // Invalid type parameter (outside 0..3): keep default 0 (GCC behavior).
-    if (param_val >= 0 && param_val <= 3)
-      type_value = static_cast<size_t>(param_val);
-  }
 
   // Work out what the ptr points at.
   internal_deref_items.clear();
   expr2tc deref = dereference2tc(get_empty_type(), ptr);
   dereference(deref, dereferencet::INTERNAL);
 
+  expr2tc obj_size;
+  if (is_constant_int2t(type_param))
+  {
+    int64_t param_val = to_constant_int2t(type_param).value.to_int64();
+    // Outside 0..3 (and ESBMC's internal whole-object mode): 0, as GCC does.
+    bool in_range = param_val >= 0 && param_val <= esbmc_object_size_whole;
+    obj_size = object_size_of_type(ptr, deref, in_range ? param_val : 0);
+  }
+  else
+  {
+    // GCC and clang reject a non-constant type, but the macro this call comes
+    // from bypasses clang's check, so a nondet type selects among GCC's modes.
+    obj_size = object_size_of_type(ptr, deref, 0);
+    for (int t = 1; t <= 3; t++)
+      obj_size = if2tc(
+        size_type2(),
+        equality2tc(type_param, constant_int2tc(type_param->type, BigInt(t))),
+        object_size_of_type(ptr, deref, t),
+        obj_size);
+  }
+  do_simplify(obj_size);
+
+  expr2tc ret_ref = func_call.ret;
+  if (!is_nil_expr(ret_ref))
+  {
+    dereference(ret_ref, dereferencet::READ);
+    symex_assign(
+      code_assign2tc(ret_ref, typecast2tc(ret_ref->type, obj_size)),
+      false,
+      cur_state->guard);
+  }
+}
+
+expr2tc goto_symext::object_size_of_type(
+  const expr2tc &ptr,
+  const expr2tc &deref,
+  int type_value)
+{
   bool use_zero_for_unknown = (type_value == 2 || type_value == 3);
   bool consider_offset = (type_value == 1 || type_value == 3);
 
@@ -129,44 +178,46 @@ void goto_symext::intrinsic_builtin_object_size(
     return size;
   };
 
-  expr2tc obj_size = create_fallback_size(use_zero_for_unknown);
-  if (!internal_deref_items.empty())
-  {
-    // A pointer that may address several objects takes the size of the one it
-    // addresses, not of whichever the value set lists first. An `&x` operand
-    // or a single candidate keeps that object's size unguarded, as before.
-    if (
-      internal_deref_items.size() == 1 ||
-      !is_nil_type(address_of_object_type(ptr)))
-      obj_size = total_size_of(internal_deref_items.front());
-    else
-      obj_size =
-        select_by_object(internal_deref_items, obj_size, total_size_of);
-
-    // Type 1 or 3: the bytes remaining after the pointer's offset.
-    if (consider_offset)
-    {
-      expr2tc offset = pointer_offset2tc(get_int64_type(), ptr);
+  // Type 0 or 2: the bytes from the pointer to the end of the whole object it
+  // points into, taken per object so its size and the offset agree (#8660).
+  auto remaining_in_object =
+    [&](const dereference_callbackt::internal_item &item) {
+      expr2tc total = typecast2tc(
+        get_int64_type(), type_byte_size_expr(item.object->type, &ns));
+      expr2tc offset = typecast2tc(get_int64_type(), item.offset);
+      cur_state->rename(total);
       cur_state->rename(offset);
-      const expr2tc total = typecast2tc(get_int64_type(), obj_size);
-      obj_size = if2tc(
+      return if2tc(
         size_type2(),
         greaterthan2tc(total, offset),
         typecast2tc(size_type2(), sub2tc(get_int64_type(), total, offset)),
         gen_zero(size_type2()));
-    }
-    do_simplify(obj_size);
-  }
+    };
 
-  expr2tc ret_ref = func_call.ret;
-  if (!is_nil_expr(ret_ref))
+  const std::function<expr2tc(const dereference_callbackt::internal_item &)>
+    size_of = consider_offset || type_value == esbmc_object_size_whole
+                ? std::function(total_size_of)
+                : std::function(remaining_in_object);
+
+  expr2tc obj_size = size_by_object(
+    internal_deref_items,
+    ptr,
+    create_fallback_size(use_zero_for_unknown),
+    size_of);
+
+  // Type 1 or 3: the bytes remaining after the pointer's offset.
+  if (!internal_deref_items.empty() && consider_offset)
   {
-    dereference(ret_ref, dereferencet::READ);
-    symex_assign(
-      code_assign2tc(ret_ref, typecast2tc(ret_ref->type, obj_size)),
-      false,
-      cur_state->guard);
+    expr2tc offset = pointer_offset2tc(get_int64_type(), ptr);
+    cur_state->rename(offset);
+    const expr2tc total = typecast2tc(get_int64_type(), obj_size);
+    obj_size = if2tc(
+      size_type2(),
+      greaterthan2tc(total, offset),
+      typecast2tc(size_type2(), sub2tc(get_int64_type(), total, offset)),
+      gen_zero(size_type2()));
   }
+  return obj_size;
 }
 
 void goto_symext::intrinsic_get_object_size(

@@ -220,6 +220,8 @@ const static std::vector<std::string> solidity_c_models = {
   "gasleft",
   // builtins (solidity_builtins.c)
   "sol_pow_uint",
+  "sol_pow_int",
+  "sol_pow_wrap",
   "addmod",
   "mulmod",
   "llc_nondet_bytes",
@@ -934,6 +936,8 @@ void add_cprover_library(contextt &context, const languaget *language)
         "sideeffect", get_complete_type(s.get_type(), namespacet{context}));
       value.statement("nondet");
       s.set_value(value);
+      // No harness feeds this value, so it is not a test input (#10132).
+      s.location.set("#decl_nondet", true);
     }
   });
 }

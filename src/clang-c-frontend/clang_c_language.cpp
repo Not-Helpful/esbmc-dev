@@ -2,7 +2,11 @@
 #include <clang-c-frontend/clang_c_adjust_irep2.h>
 CC_DIAGNOSTIC_PUSH()
 CC_DIAGNOSTIC_IGNORE_LLVM_CHECKS()
+#include <clang/Basic/TargetInfo.h>
+#include <clang/Basic/Version.inc>
+#include <clang/AST/StmtCXX.h>
 #include <clang/Frontend/ASTUnit.h>
+#include <clang/Lex/Lexer.h>
 CC_DIAGNOSTIC_POP()
 
 #include <AST/build_ast.h>
@@ -14,6 +18,7 @@ CC_DIAGNOSTIC_POP()
 #include <clang-c-frontend/clang_c_language.h>
 #include <clang-c-frontend/clang_c_main.h>
 #include <util/lang/c_expr2string.h>
+#include <set>
 #include <sstream>
 #include <util/lang/c_link.h>
 
@@ -110,6 +115,9 @@ void clang_c_languaget::build_compiler_args(
       "-Dpthread_rwlock_rdlock=pthread_rwlock_rdlock_check");
     compiler_args.emplace_back(
       "-Dpthread_rwlock_wrlock=pthread_rwlock_wrlock_check");
+    compiler_args.emplace_back(
+      "-Dpthread_barrier_wait=pthread_barrier_wait_check");
+    compiler_args.emplace_back("-Dpthread_spin_lock=pthread_spin_lock_check");
   }
   else if (config.options.get_bool_option("lock-order-check"))
   {
@@ -238,8 +246,6 @@ void clang_c_languaget::build_compiler_args(
   for (auto const &inc : config.ansi_c.warnings)
     compiler_args.push_back("-W" + inc);
 
-  compiler_args.emplace_back("-D__ESBMC_alloca=__builtin_alloca");
-
   // Lets a source tree tell an ESBMC run from an ordinary compile, and gates
   // include/esbmc.h so including it anywhere else is an error rather than a
   // pile of undefined intrinsics (#4610).
@@ -336,8 +342,11 @@ write_witness_tmp(const std::string &content)
   auto tmp = file_operations::create_tmp_file("esbmc-witness.%%%%-%%%%.c");
   if (!tmp.file())
     return std::nullopt;
-  std::fwrite(content.c_str(), 1, content.size(), tmp.file());
-  std::fflush(tmp.file());
+  if (
+    std::fwrite(content.c_str(), 1, content.size(), tmp.file()) !=
+      content.size() ||
+    std::fflush(tmp.file()) != 0)
+    return std::nullopt;
   return tmp;
 }
 
@@ -346,6 +355,277 @@ write_witness_tmp(const std::string &content)
 static bool ast_failed(const std::unique_ptr<clang::ASTUnit> &unit)
 {
   return !unit || unit->getDiagnostics().hasErrorOccurred();
+}
+
+static unsigned bitint_max_align(const clang::TargetInfo &target)
+{
+#if CLANG_VERSION_MAJOR >= 19
+  return target.getBitIntMaxAlign();
+#else
+  // Before clang 19, _BitInt alignment was capped at that of long long.
+  return target.getLongLongAlign();
+#endif
+}
+
+/// Takes the alignments the data model cannot express from clang's target.
+static void adopt_target_layout(const clang::TargetInfo &target)
+{
+  config.ansi_c.long_long_align = target.getLongLongAlign() / 8;
+  config.ansi_c.double_align = target.getDoubleAlign() / 8;
+  config.ansi_c.long_double_align = target.getLongDoubleAlign() / 8;
+  // Where long double is double (AArch64 Darwin, Windows), the data model's
+  // 128 bits would lay it out wider than clang does; other formats keep it.
+  if (&target.getLongDoubleFormat() == &llvm::APFloat::IEEEdouble())
+    config.ansi_c.long_double_width = target.getLongDoubleWidth();
+  config.ansi_c.bitint_max_align = bitint_max_align(target) / 8;
+  // Mirrors clang's Itanium record layout; Windows targets may lay records
+  // out as ms_struct, where the bit-field's type does count.
+  config.ansi_c.unnamed_bitfield_aligns =
+    target.useZeroLengthBitfieldAlignment() || target.getTriple().isOSWindows();
+}
+
+static bool is_parsed_constraint(const waypoint &wp)
+{
+  return wp.type == waypoint::function_return ||
+         wp.format == "ext_c_expression" || wp.format == "acsl_expression";
+}
+
+static void parse_witness_constraints(std::vector<waypoint> &waypoints)
+{
+  clang_c_lexert lexer;
+  for (auto &wp : waypoints)
+  {
+    if (!is_parsed_constraint(wp))
+      continue;
+    expr2tc e = lexer.parse_expr(wp.value);
+    if (!e)
+    {
+      log_error(
+        "witness: could not parse constraint '{}'; witness is invalid",
+        wp.value);
+      abort();
+    }
+    wp.parsed_cond.expr = e;
+    wp.parsed_cond.valid = true;
+  }
+}
+
+static const clang::Stmt *
+witness_terminal_statement(const clang::Stmt *statement)
+{
+  while (true)
+  {
+    if (const auto *branch = llvm::dyn_cast<clang::IfStmt>(statement))
+      statement = branch->getElse() ? branch->getElse() : branch->getThen();
+    else if (const auto *loop = llvm::dyn_cast<clang::WhileStmt>(statement))
+      statement = loop->getBody();
+    else if (const auto *loop = llvm::dyn_cast<clang::ForStmt>(statement))
+      statement = loop->getBody();
+    else if (
+      const auto *loop = llvm::dyn_cast<clang::CXXForRangeStmt>(statement))
+      statement = loop->getBody();
+    else if (
+      const auto *selection = llvm::dyn_cast<clang::SwitchStmt>(statement))
+      statement = selection->getBody();
+    else if (const auto *label = llvm::dyn_cast<clang::LabelStmt>(statement))
+      statement = label->getSubStmt();
+    else if (const auto *label = llvm::dyn_cast<clang::SwitchCase>(statement))
+      statement = label->getSubStmt();
+    else if (
+      const auto *attribute = llvm::dyn_cast<clang::AttributedStmt>(statement))
+      statement = attribute->getSubStmt();
+    else
+      break;
+  }
+  return statement;
+}
+
+static clang::SourceLocation witness_statement_end(
+  const clang::Stmt *statement,
+  const clang::SourceManager &source_manager,
+  const clang::LangOptions &language)
+{
+  statement = witness_terminal_statement(statement);
+  const auto end = statement->getEndLoc();
+  if (
+    end.isInvalid() || end.isMacroID() ||
+    !source_manager.isWrittenInMainFile(end))
+    return {};
+  if (llvm::isa<clang::CompoundStmt, clang::CXXTryStmt>(statement))
+    return clang::Lexer::getLocForEndOfToken(end, 0, source_manager, language);
+  if (!llvm::isa<
+        clang::Expr,
+        clang::DeclStmt,
+        clang::NullStmt,
+        clang::ReturnStmt,
+        clang::BreakStmt,
+        clang::ContinueStmt,
+        clang::GotoStmt,
+        clang::IndirectGotoStmt,
+        clang::DoStmt,
+        clang::GCCAsmStmt>(statement))
+    return {};
+  clang::Token token;
+  if (clang::Lexer::getRawToken(end, token, source_manager, language))
+    return {};
+  if (token.is(clang::tok::semi))
+    return clang::Lexer::getLocForEndOfToken(end, 0, source_manager, language);
+  return clang::Lexer::findLocationAfterToken(
+    end, clang::tok::semi, source_manager, language, false);
+}
+
+static bool
+is_witness_control_body(const clang::Stmt *statement, const clang::Stmt *parent)
+{
+  if (const auto *branch = llvm::dyn_cast_or_null<clang::IfStmt>(parent))
+    return statement == branch->getThen() || statement == branch->getElse();
+  if (const auto *loop = llvm::dyn_cast_or_null<clang::WhileStmt>(parent))
+    return statement == loop->getBody();
+  if (const auto *loop = llvm::dyn_cast_or_null<clang::DoStmt>(parent))
+    return statement == loop->getBody();
+  if (const auto *loop = llvm::dyn_cast_or_null<clang::ForStmt>(parent))
+    return statement == loop->getBody();
+  if (const auto *loop = llvm::dyn_cast_or_null<clang::CXXForRangeStmt>(parent))
+    return statement == loop->getBody();
+  return false;
+}
+
+class witness_body_locatort
+{
+public:
+  witness_body_locatort(
+    const clang::ASTContext &context,
+    const std::vector<invariant> &invariants)
+    : context(context), source_manager(context.getSourceManager())
+  {
+    for (const auto &inv : invariants)
+      pending.insert(static_cast<size_t>(inv.line.to_int64()));
+  }
+
+  std::optional<std::map<size_t, size_t>> locate()
+  {
+    visit_declarations(context.getTranslationUnitDecl());
+    if (!pending.empty())
+      return std::nullopt;
+    return body_ends;
+  }
+
+private:
+  const clang::ASTContext &context;
+  const clang::SourceManager &source_manager;
+  std::set<size_t> pending;
+  std::map<size_t, size_t> body_ends;
+
+  void record_site(
+    const clang::Stmt *statement,
+    const clang::Stmt *parent,
+    size_t line)
+  {
+    const auto begin = statement->getBeginLoc();
+    const bool wrap = is_witness_control_body(statement, parent);
+    const bool block =
+      parent && llvm::isa<clang::CompoundStmt>(parent) &&
+      parent->getBeginLoc().isFileID() &&
+      source_manager.isWrittenInMainFile(parent->getBeginLoc());
+    if (!block && !wrap)
+      return;
+    const auto prefix =
+      source_manager.getBufferData(source_manager.getMainFileID())
+        .take_front(source_manager.getFileOffset(begin));
+    if (!prefix.substr(prefix.rfind('\n') + 1).trim().empty())
+      return;
+    const auto end = wrap ? witness_statement_end(
+                              statement, source_manager, context.getLangOpts())
+                          : begin;
+    if (end.isInvalid())
+      return;
+    if (wrap)
+      body_ends.emplace(line, source_manager.getFileOffset(end));
+    pending.erase(line);
+  }
+
+  void visit_statement(const clang::Stmt *statement, const clang::Stmt *parent)
+  {
+    if (!statement || pending.empty())
+      return;
+    const auto begin = statement->getBeginLoc();
+    if (begin.isFileID() && source_manager.isWrittenInMainFile(begin))
+    {
+      const size_t line = source_manager.getSpellingLineNumber(begin);
+      if (
+        pending.count(line) &&
+        !llvm::isa<clang::LabelStmt, clang::SwitchCase, clang::AttributedStmt>(
+          statement))
+        record_site(statement, parent, line);
+    }
+    for (const auto *child : statement->children())
+      visit_statement(child, statement);
+  }
+
+  void visit_declarations(const clang::DeclContext *declarations)
+  {
+    for (const auto *declaration : declarations->decls())
+    {
+      if (pending.empty())
+        return;
+      const auto location =
+        source_manager.getExpansionLoc(declaration->getLocation());
+      if (location.isValid() && !source_manager.isWrittenInMainFile(location))
+        continue;
+      if (
+        const auto *function = llvm::dyn_cast<clang::FunctionDecl>(declaration))
+        visit_statement(function->getBody(), nullptr);
+      if (const auto *nested = llvm::dyn_cast<clang::DeclContext>(declaration))
+        visit_declarations(nested);
+    }
+  }
+};
+
+static std::optional<std::map<size_t, size_t>> witness_body_ends(
+  const std::string &intrinsics,
+  const std::vector<std::string> &compiler_args,
+  const std::vector<invariant> &invariants)
+{
+  auto ast = buildASTs(intrinsics, compiler_args);
+  if (ast_failed(ast))
+    return std::nullopt;
+  return witness_body_locatort(ast->getASTContext(), invariants).locate();
+}
+
+static std::optional<file_operations::tmp_file> inject_correctness_witness(
+  const std::string &intrinsics,
+  const std::string &actual_path,
+  const std::string &path,
+  std::vector<std::string> &compiler_args,
+  const std::vector<invariant> &invariants)
+{
+  auto body_ends = witness_body_ends(intrinsics, compiler_args, invariants);
+  if (!body_ends)
+  {
+    log_error(
+      "Cannot safely locate witness injection sites in the original AST");
+    return std::nullopt;
+  }
+  std::string content = yaml_parser::build_injected_source(
+    actual_path, path, invariants, *body_ends);
+  if (content.empty())
+  {
+    log_error("Failed to build injected source for '{}'", path);
+    return std::nullopt;
+  }
+  auto injected = write_witness_tmp(content);
+  if (!injected)
+  {
+    log_error("Failed to write injected source for '{}'", path);
+    return std::nullopt;
+  }
+  compiler_args.insert(
+    compiler_args.end() - 1,
+    {"-Xclang",
+     "-remap-file",
+     "-Xclang",
+     actual_path + ";" + injected->path()});
+  return injected;
 }
 
 bool clang_c_languaget::parse(const std::string &path)
@@ -363,21 +643,24 @@ bool clang_c_languaget::parse(const std::string &path)
   const std::string &actual_path =
     nested_transformed ? nested_transformed->path() : path;
 
+  std::vector<std::string> new_compiler_args = compiler_args("clang-tool");
+  new_compiler_args.push_back(actual_path);
+  std::string intrinsics = internal_additions();
+
   // Inject witness intrinsic calls so that Clang parses them naturally.
   // #line directives after each injection preserve original line numbers.
   std::optional<file_operations::tmp_file> witness_injected;
+  std::optional<file_operations::tmp_file> correctness_injected;
   if (config.options.get_bool_option("validate-correctness-witness"))
   {
     const std::string witness_path = config.options.get_option("witness");
     auto invariants = yaml_parser::read_invariants(witness_path);
     if (!invariants.empty())
     {
-      std::string content =
-        yaml_parser::build_injected_source(actual_path, path, invariants);
-      if (content.empty())
-        log_warning("Failed to build injected source for '{}'", path);
-      else
-        witness_injected = write_witness_tmp(content);
+      correctness_injected = inject_correctness_witness(
+        intrinsics, actual_path, path, new_compiler_args, invariants);
+      if (!correctness_injected)
+        return true;
     }
   }
   else if (config.options.get_bool_option("validate-violation-witness"))
@@ -385,25 +668,7 @@ bool clang_c_languaget::parse(const std::string &path)
     const std::string witness_path = config.options.get_option("witness");
     auto &waypoints = yaml_parser::get_waypoints(witness_path);
     yaml_parser::fill_columns(actual_path, waypoints);
-    clang_c_lexert lexer;
-    for (auto &wp : waypoints)
-    {
-      if (wp.format != "ext_c_expression" && wp.format != "acsl_expression")
-        continue;
-      expr2tc e = lexer.parse_expr(wp.value);
-      if (e)
-      {
-        wp.parsed_cond.expr = e;
-        wp.parsed_cond.valid = true;
-      }
-      else
-      {
-        log_error(
-          "witness: could not parse constraint '{}'; witness is invalid",
-          wp.value);
-        abort();
-      }
-    }
+    parse_witness_constraints(waypoints);
     std::string content =
       yaml_parser::build_violation_witness_source(actual_path, path, waypoints);
     if (!content.empty())
@@ -412,9 +677,7 @@ bool clang_c_languaget::parse(const std::string &path)
   const std::string &compile_path =
     witness_injected ? witness_injected->path() : actual_path;
 
-  // Get compiler arguments and add the file path
-  std::vector<std::string> new_compiler_args = compiler_args("clang-tool");
-  new_compiler_args.push_back(compile_path);
+  new_compiler_args.back() = compile_path;
 
   if (FILE *f = messaget::state.target("clang", VerbosityLevel::Debug))
   {
@@ -423,9 +686,6 @@ bool clang_c_languaget::parse(const std::string &path)
       fprintf(f, " '%s'", s.c_str());
     fprintf(f, "\n");
   }
-
-  // Get intrinsics
-  std::string intrinsics = internal_additions();
 
   // Generate ASTUnit and add to our vector
   auto newAST = buildASTs(intrinsics, new_compiler_args);
@@ -438,6 +698,7 @@ bool clang_c_languaget::parse(const std::string &path)
   else
     mergeASTs(newAST, AST);
 
+  adopt_target_layout(AST->getASTContext().getTargetInfo());
   return false;
 }
 
@@ -544,11 +805,13 @@ std::string clang_c_languaget::internal_additions()
 # 1 "esbmc_intrinsics.h" 1
 void __ESBMC_assume(_Bool);
 void __ESBMC_assert(_Bool, const char *);
+void __ESBMC_witness_assert(_Bool, const char *);
 void __ESBMC_cover(_Bool);
 _Bool __ESBMC_same_object(const void *, const void *);
 void __ESBMC_yield();
 void __ESBMC_atomic_begin();
 void __ESBMC_atomic_end();
+void __ESBMC_ltl_sample();
 
 // Explicitly initialize a new object
 void __ESBMC_init_object(void*);
@@ -569,6 +832,9 @@ extern __SIZE_TYPE__ __ESBMC_alloc_size[1];
 
 // Get object size
 __SIZE_TYPE__ __ESBMC_get_object_size(const void *);
+
+// alloca whose storage outlives the calling function, for the models
+void *__ESBMC_alloca(__SIZE_TYPE__);
 
 /* CBMC memory primitives (esbmc/esbmc#2457). Without these declarations the
  * names are implicitly declared as int-returning functions and havoc'd, so a
@@ -725,18 +991,6 @@ void __ESBMC_loop_assigns_impl(const void *, ...);
 #define __ESBMC_loop_assigns_N(_0,_1,_2,_3,_4,_5,N,...) __ESBMC_loop_assigns_##N
 #define __ESBMC_loop_assigns(...) __ESBMC_loop_assigns_N(~,##__VA_ARGS__,5,4,3,2,1,0)(__VA_ARGS__)
 
-/* offsetof has to be an integer constant expression (C23 7.21p3,
- * [support.types.layout]/1) and this expansion is not, so under it no constexpr
- * or non-type template argument may be spelt with offsetof. clang's
- * OffsetOfExpr is lowered in clang_c_convert.cpp and agrees with the expansion
- * on every layout in regression/esbmc-cpp/cpp/offsetof_layout_parity. C keeps
- * the expansion because dropping it there exposes #7127, a void*-arithmetic
- * dereference defect that regression/esbmc/github_2512_* stands on. */
-#ifndef __cplusplus
-#define __builtin_offsetof(type, member) \
-    ((size_t)__ESBMC_POINTER_OFFSET(&((type*)0)->member))
-#endif
-
 #define __builtin_object_size(ptr, type) \
     __ESBMC_builtin_object_size(ptr, type)
 
@@ -752,6 +1006,19 @@ void __ESBMC_unroll(int);
 void __ESBMC_requires(_Bool);
 void __ESBMC_ensures(_Bool);
 int __ESBMC_return_value;
+/* Cumulative stack bits charged to contract-replaced (summarised) callees.
+ * When a contract clause constrains it, each --replace-call-with-contract site
+ * adds the callee's real frame size, the same per-local bit count ESBMC charges
+ * natively at DECL (framet::grow_stack_frame). Usable in __ESBMC_requires /
+ * __ESBMC_ensures like any ghost; __ESBMC_old() over it works unchanged.
+ * Zero-initialised. */
+__UINT64_TYPE__ __ESBMC_stack_used;
+/* The current contract function's frame size in bits, substituted by the
+ * contract engine with the exact amount charged to __ESBMC_stack_used on entry.
+ * Lets a contract scale a depth bound by the real per-frame size with no
+ * hand-written byte literal. Only meaningful inside __ESBMC_requires /
+ * __ESBMC_ensures of an enforced or replaced function. */
+__UINT64_TYPE__ __ESBMC_frame_size;
 void* __ESBMC_old_raw(void*);
 #define __ESBMC_old(x) (*(__typeof__(x)*)__ESBMC_old_raw((void*)(&(x))))
 #define __ESBMC_and(a, b) ((a) & (b))
@@ -764,8 +1031,9 @@ void __ESBMC_assigns_impl(const void *, ...);
 #define __ESBMC_assigns_3(a,b,c) __ESBMC_assigns_impl(&(a),&(b),&(c))
 #define __ESBMC_assigns_4(a,b,c,d) __ESBMC_assigns_impl(&(a),&(b),&(c),&(d))
 #define __ESBMC_assigns_5(a,b,c,d,e) __ESBMC_assigns_impl(&(a),&(b),&(c),&(d),&(e))
-#define __ESBMC_assigns_N(_0,_1,_2,_3,_4,_5,N,...) __ESBMC_assigns_##N
-#define __ESBMC_assigns(...) __ESBMC_assigns_N(~,##__VA_ARGS__,5,4,3,2,1,0)(__VA_ARGS__)
+#define __ESBMC_assigns_6(a,b,c,d,e,f) __ESBMC_assigns_impl(&(a),&(b),&(c),&(d),&(e),&(f))
+#define __ESBMC_assigns_N(_0,_1,_2,_3,_4,_5,_6,N,...) __ESBMC_assigns_##N
+#define __ESBMC_assigns(...) __ESBMC_assigns_N(~,##__VA_ARGS__,6,5,4,3,2,1,0)(__VA_ARGS__)
     )";
 
   if (config.ansi_c.cheri)

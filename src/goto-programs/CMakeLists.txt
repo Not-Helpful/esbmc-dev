@@ -1,7 +1,7 @@
-add_library(gotoprograms goto_convert.cpp goto_function.cpp goto_main.cpp
+add_library(gotoprograms goto_convert.cpp goto_function.cpp goto_functions.cpp goto_main.cpp
   goto_sideeffects.cpp goto_program.cpp goto_check.cpp goto_inline.cpp
   remove_no_op.cpp goto_convert_functions.cpp remove_unreachable.cpp
-  remove_library_assertions.cpp exception_typeid.cpp exception_globals.cpp remove_exceptions.cpp lower_longjmp.cpp
+  remove_library_assertions.cpp exception_typeid.cpp exception_globals.cpp remove_exceptions.cpp python_exception_reachability.cpp lower_longjmp.cpp
   builtin_functions.cpp show_claims.cpp property_verdict.cpp destructor.cpp set_claims.cpp
   add_race_assertions.cpp add_restrict_assertions.cpp rw_set.cpp goto_binary_reader.cpp static_analysis.cpp
   goto_program_serialization.cpp goto_function_serialization.cpp
@@ -26,5 +26,5 @@ target_link_libraries(gotoalgorithms PUBLIC gotoprograms PRIVATE abstract-interp
 if(ENABLE_GOTO_CONTRACTOR)
     target_link_libraries(gotocontractor PRIVATE abstract-interpretation)
 endif()
-target_link_libraries(gotoprograms PUBLIC esbmc_common pointeranalysis PRIVATE bigint usr_utils langapi)
+target_link_libraries(gotoprograms PUBLIC esbmc_common pointeranalysis PRIVATE bigint usr_utils langapi nlohmann_json::nlohmann_json)
 target_link_libraries(gotoalgorithms PUBLIC esbmc_common)

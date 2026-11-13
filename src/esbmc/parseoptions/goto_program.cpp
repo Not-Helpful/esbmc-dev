@@ -75,6 +75,7 @@ void link_python_model_bodies([[maybe_unused]] goto_functionst &goto_functions)
 #include <goto-programs/mark_decl_as_non_det.h>
 #include <goto-programs/assign_params_as_non_det.h>
 #include <goto2c/goto2c.h>
+#include <goto2lean/goto2lean.h>
 #include <util/irep/irep.h>
 #include <langapi/languages.h>
 #include <langapi/mode.h>
@@ -164,6 +165,9 @@ bool esbmc_parseoptionst::get_goto_program(
     malloc_trim(0);
 #endif
 
+    if (options.get_bool_option("sv-comp"))
+      configure_sv_comp_threads(options, goto_functions);
+
     fine_timet process_start = current_time();
     if (process_goto_program(options, goto_functions))
       return true;
@@ -194,6 +198,63 @@ bool esbmc_parseoptionst::get_goto_program(
   }
 
   return false;
+}
+
+/// SV-COMP runs every task with the same command line, so the configuration
+/// for concurrent programs is chosen here, from the program: only one that can
+/// start a thread from main gets it. The wrapper used to match pthread_create
+/// in the source, which also caught programs that never call it (#10189).
+void esbmc_parseoptionst::configure_sv_comp_threads(
+  optionst &options,
+  const goto_functionst &goto_functions)
+{
+  // Termination has its own strategy and no schedule bound.
+  if (options.get_bool_option("termination") || !spawns_threads(goto_functions))
+    return;
+
+  log_status("The program can start a thread: verifying its schedules");
+
+  // Interval analysis and loop unrolling assume one thread.
+  for (const char *flag : {"interval-analysis", "goto-unwind"})
+    cmdline.vm.erase(flag);
+  std::erase_if(goto_preprocess_algorithms, [](const auto &algorithm) {
+    return dynamic_cast<const bounded_loop_unroller *>(algorithm.get());
+  });
+
+  // The inductive step stops at the first thread, so search for violations
+  // with incremental BMC instead. Correctness-witness validation needs
+  // k-induction to check the invariants.
+  if (!cmdline.isset("validate-correctness-witness"))
+  {
+    cmdline.vm.erase("k-induction");
+    options.set_option("k-induction", false);
+    options.set_option("incremental-bmc", true);
+  }
+
+  // No --context-bound default: a truncated schedule space would still report
+  // SUCCESSFUL, so only the falsification rounds below are bounded.
+  options.set_option("cswitch-skip-readonly-globals", true);
+  // Bounded rounds first can only report a violation (#6831, #6947); they
+  // cannot run with --multi-property. A boost default makes cmdline.isset
+  // true, so test the option itself (#8220).
+  if (
+    options.get_option("falsify-context-bound").empty() &&
+    !options.get_bool_option("multi-property"))
+    options.set_option("falsify-context-bound", "3");
+
+  // --smt-symex-guard makes sibling schedules share a solver context (#6831,
+  // #7043). A data-race run keeps a race claim open on every schedule and
+  // runs out of memory with it (#9692).
+  if (!cmdline.isset("data-races-check-only"))
+  {
+    options.set_option("smt-symex-guard", true);
+    options.set_option("smt-during-symex", true);
+  }
+  // A solver flag still takes precedence over the default.
+  if (!cmdline.isset("default-solver") && solver_built_in("bitwuzla"))
+    options.set_option("default-solver", "bitwuzla");
+
+  config.options = options;
 }
 
 // Retarget the synthesised __ESBMC_main wrapper so its boilerplate call to
@@ -232,6 +293,9 @@ static bool retarget_esbmc_main(
       to_symbol2t(call.function).thename == "c:@F@main")
     {
       call.function = symbol2tc(get_empty_type(), target);
+      // main's argc/argv must not bind the target's parameters, which symex
+      // leaves nondet when the call supplies no argument.
+      call.operands.clear();
       entry->second.body.destructive_insert(it, init);
     }
   }
@@ -271,6 +335,14 @@ static exprt cbmc_static_init_value(const symbolt &sym, const namespacet &ns)
   return migrate_expr_back(gen_zero(type, true));
 }
 
+static bool is_cbmc_constructor(const symbolt &sym)
+{
+  if (!sym.get_type().is_code())
+    return false;
+  const code_typet &type = to_code_type(sym.get_type());
+  return type.return_type().id() == "constructor" && type.arguments().empty();
+}
+
 // CBMC builds __CPROVER_initialize when it picks the entry point, so a goto
 // binary keeps its globals' initial values in the symbol table only.
 // __CPROVER__start runs that function; a --function harness skips it, so these
@@ -282,9 +354,12 @@ static goto_programt cbmc_static_init(
 {
   const namespacet ns(context);
   code_blockt block;
+  std::set<std::string> constructors;
   context.foreach_operand_in_order([&](const symbolt &sym) {
     if (preexisting.count(sym.id))
       return;
+    if (is_cbmc_constructor(sym))
+      constructors.insert(sym.id.as_string());
     const exprt value = cbmc_static_init_value(sym, ns);
     if (value.is_nil())
       return;
@@ -292,6 +367,16 @@ static goto_programt cbmc_static_init(
     assign.location() = sym.location;
     block.move_to_operands(assign);
   });
+
+  // CBMC then calls each parameterless constructor, in symbol-name order.
+  for (const std::string &id : constructors)
+  {
+    const symbolt &sym = *ns.lookup(id);
+    code_function_callt call;
+    call.function() = symbol_expr(sym);
+    call.location() = sym.location;
+    block.move_to_operands(call);
+  }
 
   // A value can carry a side effect -- Kani builds each vtable with a statement
   // expression -- so it is goto-converted, as __CPROVER_initialize is in CBMC.
@@ -319,8 +404,19 @@ static bool bridge_binary_entry_point(
     goto_programt init;
     if (cbmc_additions)
       init = cbmc_static_init(context, options, preexisting);
-    return retarget_esbmc_main(
-      goto_functions, cmdline.getval("function"), init);
+    irep_idt target = cmdline.getval("function");
+    if (!cbmc_additions)
+    {
+      // ESBMC names a C function by its clang USR, a CBMC binary plainly.
+      const irep_idt usr = "c:@F@" + id2string(target);
+      if (
+        !goto_functions.function_map.count(target) &&
+        goto_functions.function_map.count(usr))
+        target = usr;
+      if (target == "c:@F@main")
+        return false;
+    }
+    return retarget_esbmc_main(goto_functions, target, init);
   }
 
   if (cbmc_additions && goto_functions.function_map.count("__CPROVER__start"))
@@ -842,6 +938,51 @@ bool esbmc_parseoptionst::parse_goto_program(
   return false;
 }
 
+// With --goto2lean, writes the Lean translation and exits.
+static void translate_to_lean_if_requested(
+  const cmdlinet &cmdline,
+  const optionst &options,
+  const namespacet &ns,
+  const goto_functionst &goto_functions)
+{
+  if (!cmdline.isset("goto2lean"))
+    return;
+  const std::string entry = cmdline.isset("function")
+                              ? cmdline.getval("function")
+                              : std::string("main");
+  // driver.cpp removed any earlier --output file before the front end ran.
+  const std::string &filename = options.get_option("output");
+  std::string res;
+  try
+  {
+    res = goto2leant(
+            ns,
+            goto_functions,
+            entry,
+            options.get_bool_option("int-encoding"),
+            !options.get_bool_option("no-div-by-zero-check"))
+            .translate();
+  }
+  catch (const goto2lean_unsupported &e)
+  {
+    log_error("{}", e.what());
+    std::exit(1);
+  }
+  if (!filename.empty())
+  {
+    std::ofstream out(filename);
+    out << res;
+    if (!out)
+    {
+      log_error("goto2lean: cannot write {}", filename);
+      std::exit(1);
+    }
+  }
+  else
+    std::cout << res;
+  std::exit(0); // its own status: failures exit 1, front-end errors 6
+}
+
 // This method provides different output methods for the given GOTO program.
 // Depending on the provided options this method can:
 //
@@ -992,6 +1133,8 @@ bool esbmc_parseoptionst::output_goto_program(
         std::cout << res;
       return true;
     }
+
+    translate_to_lean_if_requested(cmdline, options, ns, goto_functions);
   }
 
   catch (const char *e)

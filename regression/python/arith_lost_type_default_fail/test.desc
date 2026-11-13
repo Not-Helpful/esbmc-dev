@@ -1,0 +1,5 @@
+CORE
+main.py
+
+^VERIFICATION FAILED$
+^\s*FAILED\s+\[.*TypeError: unsupported operand type\(s\) for \+

@@ -37,6 +37,11 @@ public:
   void push_ctx() override;
   void pop_ctx() override;
   smt_resultt dec_solve() override;
+  smt_resultt dec_solve_assuming(const ast_vec &assumptions) override;
+  bool supports_assumptions() const override
+  {
+    return true;
+  }
 
   tvt get_bool(smt_astt a) override;
   BigInt get_bv(smt_astt a, bool is_signed) override;
@@ -97,6 +102,7 @@ public:
   smt_astt mk_real2int(smt_astt a) override;
   smt_astt mk_int2real(smt_astt a) override;
   smt_astt mk_isint(smt_astt a) override;
+  smt_astt overflow_arith(const expr2tc &expr) override;
 
   smt_sortt mk_bool_sort() override;
   smt_sortt mk_real_sort() override;
@@ -196,7 +202,7 @@ public:
   smt_astt
   convert_array_of(smt_astt init_val, unsigned long domain_width) override;
 
-  void assert_ast(smt_astt a) override;
+  void assert_ast_in_solver(smt_astt a) override;
 
   const std::string solver_text() override
   {
