@@ -1,3 +1,5 @@
+set -euo pipefail
+
 use.hs llvm 24
 cd build/latest/
 ninja -v src/esbmc/esbmc

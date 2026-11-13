@@ -24,33 +24,36 @@ clang_c_adjust::clang_c_adjust(contextt &_context)
 {
 }
 
-// NEW
-void clang_c_adjust::adjust_incompletes(typet &type)
-{
-  if (type.incomplete())
-  {
-    symbolt *testsym_tag = context.find_symbol(type.identifier());
-    if (testsym_tag && !testsym_tag->get_type().incomplete())
-    {
-      if (!(testsym_tag->get_type().identifier() == type.identifier())) {
-        DBM_PRINT("TESTSYMDUMP");
-        DBM_PRINT("id: " << testsym_tag->get_type().identifier());
-        testsym_tag->get_type().dump();
-        DBM_PRINT("TYPEDUMP");
-        DBM_PRINT("id: " << type.identifier());
-        type.dump();
-      }
-      type = testsym_tag->get_type();
-    }
-    if (type.is_struct() || type.is_union()) {
-      struct_union_typet::componentst &new_comp =
-        to_struct_union_type(type).components();
-      for (struct_union_typet::componentt &c : new_comp) {
-        adjust_incompletes(c.type());
-    }
-    }
-  }
-}
+// // NEW
+// void clang_c_adjust::adjust_incompletes(typet &type)
+// {
+//   if (type.incomplete())
+//   {
+//     symbolt *testsym_tag = context.find_symbol_by_base(type.tag());
+//     if (testsym_tag && !testsym_tag->get_type().incomplete())
+//     {
+//       if ((testsym_tag->get_type().identifier() == type.identifier()))
+//       {
+//         DBM_PRINT("TESTSYMDUMP");
+//         DBM_PRINT("id: " << testsym_tag->get_type().identifier());
+//         testsym_tag->get_type().dump();
+//         DBM_PRINT("TYPEDUMP");
+//         DBM_PRINT("id: " << type.identifier());
+//         type.dump();
+//       }
+//       type = testsym_tag->get_type();
+//     }
+//     if (type.is_struct() || type.is_union())
+//     {
+//       struct_union_typet::componentst &new_comp =
+//         to_struct_union_type(type).components();
+//       for (struct_union_typet::componentt &c : new_comp)
+//       {
+//         adjust_incompletes(c.type());
+//       }
+//     }
+//   }
+// }
 
 bool clang_c_adjust::adjust()
 {
@@ -76,16 +79,16 @@ bool clang_c_adjust::adjust()
   context.Foreach_operand_in_order(
     [&symbol_list](symbolt &s) { symbol_list.push_back(&s); });
 
-  Forall_symbol_list(it, symbol_list)
-  {
-    symbolt &symbol = **it;
-    if (symbol.is_type)
-    {
-      typet t = symbol.get_type();
-      adjust_incompletes(t);
-      symbol.set_type(std::move(t));
-    }
-  }
+  // Forall_symbol_list(it, symbol_list)
+  // {
+  //   symbolt &symbol = **it;
+  //   if (symbol.is_type)
+  //   {
+  //     typet t = symbol.get_type();
+  //     adjust_incompletes(t);
+  //     symbol.set_type(std::move(t));
+  //   }
+  // }
 
   // Adjust types first, so that symbolic-type resolution always receives
   // fixed up types.
