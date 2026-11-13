@@ -1201,6 +1201,17 @@ bool clang_c_convertert::get_type(const clang::Type &the_type, typet &new_type)
 
     break;
   }
+  // Needs PR
+  case clang::Type::UnaryTransform:
+  {
+    const clang::UnaryTransformType &ut =
+      static_cast<const clang::UnaryTransformType &>(the_type);
+
+    if (get_type(ut.getBaseType(), new_type))
+      return true;
+
+    break;
+  }
 
   // Types using parenthesis, e.g. int (a);
   case clang::Type::Paren:
@@ -1457,9 +1468,8 @@ bool clang_c_convertert::get_type(const clang::Type &the_type, typet &new_type)
 #if CLANG_VERSION_MAJOR >= 22
   case clang::Type::PredefinedSugar:
   {
-    if (
-      get_type(
-        *the_type.getLocallyUnqualifiedSingleStepDesugaredType(), new_type))
+    if (get_type(
+          *the_type.getLocallyUnqualifiedSingleStepDesugaredType(), new_type))
       return true;
     break;
   }
@@ -2730,9 +2740,8 @@ bool clang_c_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
     clang::QualType qtype = function_call.getCallReturnType(*ASTContext);
     // Sema types a custom-typechecked builtin's call itself: on an unsigned
     // char, __sync_fetch_and_add calls the char-returning _1 variant.
-    if (
-      const unsigned id = function_call.getBuiltinCallee();
-      id && ASTContext->BuiltinInfo.hasCustomTypechecking(id))
+    if (const unsigned id = function_call.getBuiltinCallee();
+        id && ASTContext->BuiltinInfo.hasCustomTypechecking(id))
       qtype = function_call.getType();
     if (get_type(qtype, type))
       return true;
@@ -5325,7 +5334,7 @@ getFullyQualifiedName(const clang::QualType &t, const clang::ASTContext &c)
 {
   clang::PrintingPolicy Policy(c.getPrintingPolicy());
   Policy.SuppressScope = false;
-  //Policy.AnonymousTagLocations = true;
+  // Policy.AnonymousTagLocations = true;
   Policy.PolishForDeclaration = true;
   Policy.SuppressUnwrittenScope = true;
   return clang::TypeName::getFullyQualifiedName(t, c, Policy);
@@ -5955,9 +5964,8 @@ bool clang_c_convertert::process_record_layout_attributes(
     }
 
     case clang::attr::Aligned:
-      if (
-        process_aligned_attribute(
-          static_cast<const clang::AlignedAttr &>(*attr), t))
+      if (process_aligned_attribute(
+            static_cast<const clang::AlignedAttr &>(*attr), t))
         return true;
       break;
 
@@ -6102,25 +6110,42 @@ bool clang_c_convertert::get_APValue_expr(
   {
   case clang::APValue::LValue:
   {
-    // This is probably a string constant
     clang::APValue::LValueBase base = value.getLValueBase();
-    assert(base.is<const clang::Expr *>());
-    const clang::Expr *expr = base.get<const clang::Expr *>();
-    if (get_expr(*expr, new_expr))
-      return true;
-    break;
+
+    if (const auto *e = base.dyn_cast<const clang::Expr *>())
+    {
+      if (get_expr(*e, new_expr))
+      {
+        return true;
+      }
+      break;
+    }
+
+    clang::QualType bt = base.getType();
+    // NEW
+    if (const auto *VD = base.dyn_cast<const clang::ValueDecl *>())
+    {
+      if (
+        const auto *ugcd = llvm::dyn_cast<clang::UnnamedGlobalConstantDecl>(VD))
+        return get_APValue_expr(ugcd->getValue(), new_expr, &bt);
+      return true; // other decls unsupported for now
+    }
+    else if (base.is<clang::TypeInfoLValue>())
+      DBM_PRINT("TypeInfoLValue");
+    else if (base.is<clang::DynamicAllocLValue>())
+      DBM_PRINT("DynamicAllocLValue");
+
+    return true;
   }
 
   case clang::APValue::Int:
   {
     const llvm::APSInt &Int = value.getInt();
-    const unsigned width = Int.getBitWidth();
-    llvm::SmallString<40> digits;
-    Int.toString(digits, 10);
-    const BigInt v = string2integer(std::string(digits));
-    const typet t = Int.isUnsigned() ? typet(unsignedbv_typet(width))
-                                     : typet(signedbv_typet(width));
-    new_expr = constant_exprt(integer2binary(v, width), integer2string(v), t);
+    int width = Int.getBitWidth();
+    assert(width <= 64);
+    int64_t v = Int.getSExtValue();
+    new_expr = constant_exprt(
+      integer2binary(v, width), integer2string(v), signedbv_typet(width));
     break;
   }
 
@@ -6130,13 +6155,19 @@ bool clang_c_convertert::get_APValue_expr(
     // to a struct exprt. Bases come first, then fields, mirroring how
     // ESBMC flattens base sub-objects into the struct components.
     if (type.isNull())
+    {
       return true;
+    }
     typet t;
     if (get_type(type, t))
+    {
       return true;
+    }
     t = get_complete_type(t, ns);
     if (!t.is_struct())
+    {
       return true;
+    }
     new_expr = gen_zero(t);
 
     const auto *cxxrd = type->getAsCXXRecordDecl();
@@ -6153,7 +6184,9 @@ bool clang_c_convertert::get_APValue_expr(
         exprt sub;
         clang::QualType bt = base.getType();
         if (get_APValue_expr(value.getStructBase(base_idx), sub, &bt))
+        {
           return true;
+        }
         if (op_idx < new_expr.operands().size())
           new_expr.operands().at(op_idx) = sub;
         ++base_idx;
@@ -6171,7 +6204,9 @@ bool clang_c_convertert::get_APValue_expr(
         exprt sub;
         clang::QualType ft = fd->getType();
         if (get_APValue_expr(value.getStructField(field_idx), sub, &ft))
+        {
           return true;
+        }
         if (op_idx < new_expr.operands().size())
           new_expr.operands().at(op_idx) = sub;
         ++field_idx;

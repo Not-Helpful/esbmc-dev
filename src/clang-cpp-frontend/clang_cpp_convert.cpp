@@ -55,6 +55,23 @@ bool clang_cpp_convertert::get_decl(const clang::Decl &decl, exprt &new_expr)
 
   switch (decl.getKind())
   {
+  // NEW
+  case clang::Decl::ExplicitInstantiation:
+  {
+    const clang::ExplicitInstantiationDecl &ei =
+      static_cast<const clang::ExplicitInstantiationDecl &>(decl);
+
+    if (get_decl(*ei.getSpecialization(), new_expr))
+      return true;
+    break;
+  }
+  // NEW - TODO: Complete
+  case clang::Decl::FileScopeAsm:
+  {
+    DBM_PRINT("ASM ENCOUNTERED");
+    break;
+  }
+
   case clang::Decl::LinkageSpec:
   {
     const clang::LinkageSpecDecl &lsd =
@@ -324,9 +341,8 @@ void clang_cpp_convertert::get_decl_name(
      * instantiation share an id and the last body converted wins (#7499); the
      * closure's own id is already unique (#6976). Constructors take the case
      * above and need none -- their USR spells the class "(lambda at f:l:c)". */
-    if (
-      const auto *md = llvm::dyn_cast<clang::CXXMethodDecl>(&nd);
-      md && md->getParent()->isLambda())
+    if (const auto *md = llvm::dyn_cast<clang::CXXMethodDecl>(&nd);
+        md && md->getParent()->isLambda())
     {
       std::string closure_name, closure_id;
       get_decl_name(*md->getParent(), closure_name, closure_id);
@@ -1114,9 +1130,8 @@ bool clang_cpp_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
     auto args = operator_call.arguments();
     auto begin = args.begin();
     const auto *direct = operator_call.getDirectCallee();
-    if (
-      const auto *md = llvm::dyn_cast_or_null<clang::CXXMethodDecl>(direct);
-      md && md->isStatic())
+    if (const auto *md = llvm::dyn_cast_or_null<clang::CXXMethodDecl>(direct);
+        md && md->isStatic())
     {
       assert(begin != args.end());
       ++begin;
@@ -2213,9 +2228,8 @@ bool clang_cpp_convertert::member_destructor(
       return true;
     }
     for (BigInt i = count - 1; i >= 0; --i)
-      if (
-        destroy(
-          index_exprt(obj, from_integer(i, index_type()), arr_type.subtype())))
+      if (destroy(index_exprt(
+            obj, from_integer(i, index_type()), arr_type.subtype())))
         return true;
     return false;
   };
@@ -3092,9 +3106,8 @@ bool clang_cpp_convertert::get_function_body(
       }
     }
 
-    if (
-      insert_constructor_initializers(
-        cxxcd, initializers, starts, array_init_sym, body))
+    if (insert_constructor_initializers(
+          cxxcd, initializers, starts, array_init_sym, body))
       return true;
   }
 
@@ -3102,9 +3115,8 @@ bool clang_cpp_convertert::get_function_body(
   // and base-subobject destructor calls.
   else if (fd.getKind() == clang::Decl::CXXDestructor)
   {
-    if (
-      build_destructor_chain(
-        static_cast<const clang::CXXDestructorDecl &>(fd), body))
+    if (build_destructor_chain(
+          static_cast<const clang::CXXDestructorDecl &>(fd), body))
       return true;
   }
 
@@ -3446,10 +3458,9 @@ bool clang_cpp_convertert::get_decl_ref(
     // Replace decl in the lambda operator with FieldDecl
     // x = 1 convert into this->_x = 1;
     if (auto it = cap_map.find(address); it != cap_map.end())
-      if (
-        auto it1 =
-          it->second.first.find(llvm::dyn_cast<CAPTURE_VARIABLE_TYPE>(&decl));
-        it1 != it->second.first.end())
+      if (auto it1 =
+            it->second.first.find(llvm::dyn_cast<CAPTURE_VARIABLE_TYPE>(&decl));
+          it1 != it->second.first.end())
       {
         typet t;
         if (get_type(it1->first->getType(), t))
@@ -4257,11 +4268,10 @@ bool clang_cpp_convertert::get_dealloc_function(
   if (is_aligned_deallocation(*op_del))
   {
     exprt align;
-    if (
-      get_align_val(
-        ASTContext->getBaseElementType(de.getDestroyedType()),
-        *op_del->getParamDecl(op_del->getNumParams() - 1),
-        align))
+    if (get_align_val(
+          ASTContext->getBaseElementType(de.getDestroyedType()),
+          *op_del->getParamDecl(op_del->getNumParams() - 1),
+          align))
       return true;
     new_expr.add("dealloc_alignment") = align;
   }
