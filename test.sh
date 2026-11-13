@@ -1,5 +1,6 @@
 set -euo pipefail
 
+export ESBMC_VERSION=latest
 use.hs llvm 24
 cd build/latest/
 ninja -v src/esbmc/esbmc
