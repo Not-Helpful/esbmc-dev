@@ -1,4 +1,4 @@
-VERSION=master-24
+VERSION=master-gcc
 use.hs llvm 24
 cd build/$VERSION/
 ninja -v src/esbmc/esbmc
