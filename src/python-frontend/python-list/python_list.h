@@ -5,6 +5,7 @@
 #include <python-frontend/type/element_type_registry.h>
 #include <util/irep/type.h>
 #include <util/irep/expr.h>
+#include <util/irep/std_code.h>
 #include <util/irep/std_expr.h>
 #include <util/symtab/symbol.h>
 #include <functional>
@@ -60,6 +61,42 @@ public:
 
   exprt get();
 
+  /// Typed lists (#10451): the lowering of the nodes the frontend's gate
+  /// (preprocessor/typed_lists.py) flags. Defined in typed_list.cpp.
+  static bool is_typed(const nlohmann::json &node);
+  exprt typed_literal();
+  exprt typed_nondet(const exprt &max_size);
+  exprt typed_element(const exprt &list, const exprt &index);
+  exprt typed_append(const exprt &list, const exprt &value);
+  exprt typed_extend(const exprt &list, const exprt &source);
+  /// `a == b`, or `a != b` when @p negate, of two typed lists.
+  exprt typed_compare(const exprt &lhs, const exprt &rhs, bool negate);
+  /// A list comparison, typed when the gate flagged it, else compare().
+  exprt typed_or_untyped_compare(
+    const exprt &lhs,
+    const exprt &rhs,
+    const std::string &op);
+  exprt typed_binop();
+  /// A call the gate flagged: a typed nondet_list builder, or sorted(x) of
+  /// a typed x, whose result is typed when the gate typed the call and is
+  /// otherwise the sorted ints in an untyped list.
+  static bool is_typed_call(const nlohmann::json &call);
+  exprt typed_call(const std::string &func_name);
+  /// A slice, list() or copy() of a typed list. The result is typed when the
+  /// gate flagged the node, else an untyped list of the same ints.
+  static bool reads_typed(const nlohmann::json &node);
+  /// An element access or a slice of a typed list.
+  static bool is_typed_subscript(const nlohmann::json &node);
+  exprt typed_subscript(const exprt &list, const nlohmann::json &slice);
+  exprt typed_slice(const exprt &list, const nlohmann::json &slice);
+  /// `x[a:b:c] = y` into a typed x from a typed y, a slice of one, or
+  /// reversed() of either: the slots are copied and x resized as in CPython.
+  void typed_slice_assign(
+    const exprt &list,
+    const nlohmann::json &slice,
+    const nlohmann::json &value);
+  exprt typed_copy(const exprt &list);
+
   /**
    * @brief Materialize a fresh list from already-evaluated element values.
    *
@@ -82,14 +119,18 @@ public:
    * @param elem_type  IRep2 type of @p fill_value, recorded in the registry.
    * @param index_base When non-null, each element is @p index_base plus the
    *        loop index rather than @p fill_value, which is what a range needs.
+   * @param index_step When non-null, the loop index is scaled by it first.
    */
   exprt build_symbolic_fill_list(
     const exprt &size,
     const exprt &fill_value,
     const typet &elem_type,
-    const exprt *index_base = nullptr);
+    const exprt *index_base = nullptr,
+    const exprt *index_step = nullptr);
 
   exprt index(const exprt &array, const nlohmann::json &slice_node);
+  exprt
+  numpy_string_slice_copy(const exprt &array, const nlohmann::json &slice_node);
 
   /**
    * @brief Lower boolean-mask indexing `a[mask]` to a runtime loop that
@@ -538,6 +579,13 @@ public:
     const std::vector<nlohmann::json> &indices,
     const nlohmann::json &element);
 
+  /// `x[a:b:c] = value`: typed_slice_assign for a typed x, else
+  /// handle_slice_assignment.
+  void assign_slice(
+    const exprt &list,
+    const nlohmann::json &slice,
+    const nlohmann::json &value);
+
   /**
    * @brief Lower a list slice assignment l[lower:upper:step] = value to a
    * __ESBMC_list_slice_assign model call. The step must be a constant literal
@@ -546,6 +594,7 @@ public:
    * @param slice_node The Slice AST node holding lower/upper/step
    * @param value_node The AST node of the assigned (right-hand side) value
    */
+  void forget_static_length(const exprt &list);
   void handle_slice_assignment(
     const exprt &list_expr,
     const nlohmann::json &slice_node,
@@ -555,10 +604,27 @@ public:
     const exprt &list_expr,
     const nlohmann::json &slice_node);
 
+  size_t
+  eq_float_type_id(const std::string &lhs_id, const std::string &rhs_id) const;
   exprt compare(const exprt &l1, const exprt &l2, const std::string &op);
 
   exprt contains(const exprt &item, const exprt &list);
+  bool holds_list_lookalike(
+    const std::string &list_id,
+    bool if_unrecorded,
+    int depth) const;
+  bool compares_as_lists(
+    const exprt &item,
+    const symbolt &item_copy,
+    const exprt &list) const;
+  exprt contains_list(const exprt &item, const exprt &list);
 
+  std::optional<exprt> repeat_variable_list(
+    const nlohmann::json &left_node,
+    const nlohmann::json &right_node,
+    const exprt &lhs,
+    const exprt &rhs);
+  exprt repeat_at_runtime(const exprt &source, const exprt &count);
   exprt list_repetition(
     const nlohmann::json &left_node,
     const nlohmann::json &right_node,
@@ -580,6 +646,9 @@ public:
 
   bool has_shared_payload(const typet &type) const;
 
+  /// Whether @p lhs is a list subscript target `*(T *)item->value`.
+  static bool is_element_store_target(const exprt &lhs);
+
   /// Allocates the instance a constructor stores to @p lhs and returns the
   /// pointer to pass as `self`.
   exprt allocate_constructed_object(const exprt &lhs);
@@ -597,6 +666,18 @@ public:
     exprt lhs_val,
     exprt rhs_val,
     const typet &lhs_type,
+    const typet &rhs_type) const;
+
+  /// Conjoins to @p sizes_ok that the slots @p lhs_at and @p rhs_at hold
+  /// @p lhs_type and @p rhs_type, for compare()'s nested fast path. Only a
+  /// top-level scalar slot is exempt: any other slot was typed through a
+  /// nested list the type map may name by a dead or rebound symbol (#8130).
+  void require_stored_types(
+    expr2tc &sizes_ok,
+    std::size_t depth,
+    const exprt &lhs_at,
+    const typet &lhs_type,
+    const exprt &rhs_at,
     const typet &rhs_type) const;
 
   exprt build_push_list_call(
@@ -735,28 +816,6 @@ public:
    */
   typet infer_literal_element_type(const nlohmann::json &list_literal);
 
-  /**
-   * @brief Build an inline min/max computation for a mixed int/float list.
-   * Accesses each element with its original type, promotes int elements to
-   * double for comparison, and returns the winning value as double.
-   *
-   * Note: Python's min/max returns the winning element in its *original* type
-   * (e.g., max([1, 2.5, 3]) returns int 3, not float 3.0). This implementation
-   * always returns double, which is correct for float comparisons and equality
-   * checks (via float promotion in handle_relational_type_mismatches), but will
-   * not work if the result is used as an array index or integer operand.
-   *
-   * @param list_arg  Expression for the list symbol
-   * @param list_id   Symbol identifier of the list
-   * @param func_name "min" or "max" (used in error messages)
-   * @param comparison_op  exprt::i_gt for max, exprt::i_lt for min
-   * @return Expression of type double_type() holding the min/max value
-   */
-  exprt build_min_max_for_mixed_numeric(
-    const exprt &list_arg,
-    const std::string &list_id,
-    const std::string &func_name,
-    irep_idt comparison_op);
 
   /**
    * @brief Create a list from a range() call
@@ -808,6 +867,9 @@ public:
   /// tuple(x) of a list: a shallow copy marked as a tuple (#8777).
   exprt
   build_tuple_copy_call(const exprt &src_list, const nlohmann::json &element);
+
+  /// Mark `list` as built by tuple(x) (#8777).
+  void build_mark_tuple_call(const exprt &list);
 
   /// Whether `list` was built by tuple(x) (#8777).
   exprt build_is_tuple_call(const exprt &list);
@@ -892,13 +954,6 @@ public:
    */
   BigInt uniform_elem_size(const exprt &list) const;
 
-  /// Whether the list stored at index @p i of @p list is the one @p elem holds
-  /// now. The type map names a nested element by the symbol it was appended
-  /// from, and a later assignment can rebind that symbol, or a store through
-  /// the outer list or an alias of it can replace the slot (#8130).
-  expr2tc
-  stored_element_is(const symbolt &list, std::size_t i, const symbolt &elem);
-
   /// The element type a subscript's base declares when the type map has no
   /// record of the list: a name's annotation, or a called function's return
   /// annotation. Empty when neither gives one.
@@ -927,6 +982,10 @@ public:
     bool constant_index,
     const nlohmann::json &list_node,
     const typet &fallback) const;
+
+  /// The type every element of @p array was pushed with when \p fallback is a
+  /// tuple struct, else \p fallback.
+  typet recorded_tuple_type_or(const exprt &array, const typet &fallback) const;
 
   struct shallow_push_call
   {
@@ -980,6 +1039,27 @@ public:
     codet &target_block);
 
 private:
+  // Helpers of the typed-list lowerings in typed_list.cpp.
+  typet typed_int_type() const;
+  exprt typed_int_type_id() const;
+  exprt typed_int_temp(const nlohmann::json &node, const exprt &value);
+  exprt typed_new_list(const char *create, const std::vector<exprt> &args);
+  exprt typed_sorted();
+  long long typed_slice_step(const nlohmann::json &slice);
+  std::vector<exprt> typed_slice_bounds(const nlohmann::json &slice);
+  code_function_callt
+  typed_push(const nlohmann::json &node, const exprt &list, const exprt &value);
+  exprt typed_copy_call(
+    const exprt &list,
+    const std::vector<exprt> &bounds,
+    long long step);
+
+  /// The type of one literal element; a name whose binding has no static type
+  /// (such as `x or None`) is read at its symbol's type, as the list stored it.
+  typet literal_or_bound_element_type(
+    const nlohmann::json &elem,
+    bool &unresolved_call) const;
+
   /// Emits `size = len(list_expr)` and a ValueError unless it fits @p fixed
   /// targets (at least @p fixed when @p starred); returns the size.
   exprt check_unpack_length(
@@ -1031,10 +1111,26 @@ private:
     const exprt &count,
     const std::vector<exprt> &list_elems);
 
+  /// Where a list keeps its elements: the model function that returns a
+  /// pointer to one after asserting the index is in range, the member that
+  /// points at the first, and the type of a pointer to one.
+  struct element_storage
+  {
+    const char *at_function;
+    const char *member;
+    typet pointer_type;
+  };
+  element_storage untyped_storage() const;
+
   exprt build_list_at_call(
     const exprt &list,
     const exprt &index,
     const nlohmann::json &element);
+  exprt build_list_at_call(
+    const exprt &list,
+    const exprt &index,
+    const nlohmann::json &element,
+    const element_storage &storage);
 
   exprt bind_list_element(const exprt &list_at_call);
 
@@ -1129,6 +1225,15 @@ private:
     const exprt &pos_expr,
     const nlohmann::json &slice_node);
 
+  bool is_bytes_param_pointer(
+    const exprt &array,
+    const typet &resolved_array_type) const;
+
+  exprt guard_bytes_param_index(
+    const exprt &array,
+    const typet &resolved_array_type,
+    const exprt &pos_expr);
+
   std::optional<exprt> try_build_column_pointer_view(
     const exprt &array,
     const nlohmann::json &col_index_node);
@@ -1147,6 +1252,14 @@ private:
   void emit_slice_zero_step_raise(
     const nlohmann::json &slice_node,
     bool literal_zero_step);
+
+  exprt str_slice_step(
+    const nlohmann::json &slice_node,
+    long long step_val,
+    bool literal_step);
+
+  void
+  refuse_nonconstant_step(const nlohmann::json &slice_node, bool constant_step);
 
   exprt normalize_and_scale_index(
     const exprt &index,
@@ -1196,6 +1309,7 @@ private:
 
   exprt
   handle_index_access(const exprt &array, const nlohmann::json &slice_node);
+  exprt index_value(const exprt &index, const nlohmann::json &slice_node);
 
   // True when `array` is a 2-D+ numpy array parameter's decayed pointer
   // symbol (register_function_argument's row-pointer decay), i.e. one whose

@@ -75,6 +75,7 @@
 #define PYTHON_DICT_HANDLER_H
 
 #include <python-frontend/symbol_id.h>
+#include <python-frontend/type/element_type_registry.h>
 
 #include <util/irep/std_types.h>
 #include <util/irep/std_code.h>
@@ -240,6 +241,19 @@ public:
     const typet &type,
     const locationt &location);
 
+  /// Stop a lookup with a key of unknown type, which would never match.
+  void refuse_untyped_key(const typet &key_type, const locationt &location);
+
+  /// Stop a read of unknown type that can see a value other than a scalar.
+  void refuse_untyped_aggregate_read(
+    const exprt &dict_expr,
+    const nlohmann::json &slice_node,
+    const typet &read_type,
+    const locationt &location);
+
+  /// Report @p message as unsupported where the read runs and end the path.
+  void refuse(const std::string &message, const locationt &location);
+
   /**
    * @brief Handles dictionary subscript assignment (e.g., `dict['key'] =
    * value`).
@@ -263,6 +277,14 @@ public:
     const locationt &location,
     const nlohmann::json &node,
     codet &target_block);
+
+  void store_comprehension_pair(
+    const exprt &dict,
+    const exprt &key,
+    const exprt &value,
+    const locationt &location,
+    const nlohmann::json &element,
+    code_blockt &pair_block);
 
   /**
    * @brief Handles dictionary membership testing (`in` / `not in` operators).
@@ -312,6 +334,11 @@ public:
    */
   bool is_dict_type(const typet &type) const;
 
+  /// True when a dict value of \p type holds a dict's list pointers, which a
+  /// byte copy into the values list does not preserve: a dict or an
+  /// Optional<dict> (#9081).
+  bool holds_dict_lists(const typet &type) const;
+
   /**
    * @brief Gets or creates the dictionary struct type.
    *
@@ -348,6 +375,8 @@ public:
     exprt &lhs,
     exprt &rhs);
 
+  bool is_retypable_subscript(const nlohmann::json &node);
+
   /**
    * @brief Extract value type from dict type annotation
    *
@@ -365,6 +394,11 @@ public:
    * @return struct_typet with element_0=key_type, element_1=value_type
    */
   typet get_popitem_tuple_type(const exprt &dict_expr);
+
+  /// @p key_type if known, else the type shared by the literal keys stored
+  /// into the empty dict, else str.
+  typet key_type_or_default(const typet &key_type, const exprt &dict_expr);
+  typet resolve_stored_key_type(const exprt &dict_expr);
 
   /**
    * @brief Handles dict.popitem() method calls.
@@ -389,6 +423,14 @@ public:
    */
   typet resolve_expected_type_for_dict_subscript(const exprt &dict_expr);
 
+  /**
+   * @brief Read a struct value of type @p type from a dict item's value
+   * pointer @p obj_value. A class instance is stored by reference, as a list
+   * stores it (#7685); any other struct is stored by value.
+   * @return The value, or nil when @p type is not a struct
+   */
+  exprt read_struct_value(const exprt &obj_value, const typet &type);
+
   /// The value type a dict literal not bound to an annotated name takes, such
   /// as one passed straight to an annotated parameter (#8016).
   typet literal_value_type_hint;
@@ -400,6 +442,16 @@ public:
    * @param dict_expr The dictionary expression (must be a symbol)
    */
   typet recorded_tuple_value_type(const exprt &dict_expr) const;
+  typet recorded_value_type(const exprt &dict_expr) const;
+
+  /// Whether a read of @p dict_expr yields the stored item as a tagged scalar.
+  bool reads_value_as_tagged(
+    const exprt &dict_expr,
+    const nlohmann::json &slice_node,
+    const element_type_registry::entries &entries,
+    const typet &read_type);
+
+  char annotated_value_kind(const exprt &dict_expr);
 
   /// The scalar or str value type shared by every dict literal recorded as an
   /// element of list @p list_id; empty when an element is not one, the types
@@ -730,6 +782,38 @@ private:
     const symbolt &values_list,
     const exprt &value_expr,
     const locationt &location);
+
+  /// Append to \p target_block a heap copy of the dict \p value; returns the
+  /// pointer to it.
+  const symbolt &heap_copy_dict(
+    const nlohmann::json &node,
+    const exprt &value,
+    const locationt &location,
+    codet &target_block);
+
+  constant_exprt nested_dict_type_hash(const typet &dict_type);
+
+  /**
+   * @brief Store the dict v of `d[k] = v` by pointer to a heap copy, as
+   * store_nested_dict_value stores a nested dict literal by pointer
+   * @param node AST node of the assignment
+   * @param value The dict being stored
+   * @param values_member The dict's values list
+   * @param index Index of the existing key, used by set_call
+   * @param location Source location
+   * @param target_block Block receiving the copy, ahead of both calls
+   * @param set_call Replaced by the store at an existing key
+   * @param push_call Replaced by the store at a new key
+   */
+  void store_dict_value_by_pointer(
+    const nlohmann::json &node,
+    const exprt &value,
+    const exprt &values_member,
+    const exprt &index,
+    const locationt &location,
+    codet &target_block,
+    code_function_callt &set_call,
+    code_function_callt &push_call);
 
   /**
    * @brief Retrieve a nested dictionary from the values list

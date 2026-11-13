@@ -6,6 +6,7 @@
 #include <goto-programs/abstract-interpretation/interval_domain.h>
 #include <goto-symex/state/goto_symex_state.h>
 #include <goto-symex/equation/symex_target.h>
+#include <functional>
 #include <map>
 #include <optional>
 #include <pointer-analysis/dereference.h>
@@ -171,9 +172,24 @@ public:
 
   /**
    *  Remember a guard generation's defining condition for
-   *  path_guard_decides, up to subsumption_map_capacity.
+   *  path_guard_decides.
    */
   void record_guard_definition(const expr2tc &guard_expr, const expr2tc &rhs);
+
+  /**
+   *  A path-guard conjunct rewritten onto the canonical basis
+   *  path_guard_decides compares on.
+   */
+  expr2tc rewrite_conjunct(const expr2tc &conjunct);
+
+  /** Rewritten conjunct -> position of the first conjunct rewriting to it. */
+  using conjunct_indext = persistent_map<expr2tc, size_t, irep2_hash>;
+
+  /**
+   *  The conjunct index of @p guard, which must not be true. Extends the
+   *  index of the longest prefix already in guard_prefix_index.
+   */
+  conjunct_indext prefix_index(const guard2tc &guard);
 
   /**
    *  Record a copy chain for chase_copies after an unconditional
@@ -280,6 +296,7 @@ protected:
   void
   symex_witness_function_return(expr2tc ret_val, const irep_idt &call_line);
   bool symex_witness_function_enter(const irep_idt &call_line);
+  void symex_witness_main_return();
   void symex_witness_branching(
     const expr2tc &old_guard,
     const expr2tc &new_guard,
@@ -287,7 +304,23 @@ protected:
     bool &new_guard_true,
     bool &new_guard_false,
     const goto_programt::instructiont &instruction);
-  void symex_witness_assert(expr2tc &new_expr, const std::string &msg);
+  void symex_witness_assert(
+    expr2tc &new_expr,
+    const std::string &msg,
+    bool user_assertion);
+  const std::vector<size_t> &
+  witness_segments_at(waypoint::Type type, const irep_idt &line) const;
+  expr2tc witness_segment_guard(size_t segment, const expr2tc &position);
+  expr2tc witness_position() const;
+  expr2tc witness_target_guard(
+    const locationt &loc,
+    const expr2tc &position,
+    bool return_statement = false);
+  expr2tc witness_assert_target_guard(
+    const std::string &msg,
+    bool application_assertion,
+    const expr2tc &position);
+  void advance_witness_position(size_t segment, const expr2tc &position);
 
   /**
    *  Interpret an OTHER instruction.
@@ -345,6 +378,14 @@ public:
   static std::string
   assertion_message(const namespacet &ns, const goto_programt::instructiont &i);
 
+  /// Free what only symex reads, once a formula is built: the guard prefix
+  /// index grows with every branching goto and would otherwise live through
+  /// solving.
+  void release_symex_caches()
+  {
+    guard_prefix_index.clear();
+  }
+
 protected:
   /**
    *  Perform incremental SMT solving for assert and assume statements.
@@ -363,7 +404,10 @@ protected:
    *  @param expr Expression that must always be true.
    *  @param msg Textual message explaining assertion.
    */
-  virtual void claim(const expr2tc &expr, const std::string &msg);
+  virtual void claim(
+    const expr2tc &expr,
+    const std::string &msg,
+    bool user_assertion = false);
 
   /**
    *  Record a verdict for the claim being symbolically executed.
@@ -565,6 +609,10 @@ protected:
    */
   virtual void symex_function_call_code(const expr2tc &call);
 
+  /** Assign a fresh nondet value to @p ret, the result of a call that symex
+   *  skips; a nil @p ret is left alone. */
+  void assign_nondet_call_result(const expr2tc &ret);
+
   /**
    *  Model a call to a "__ESBMC_uninterpreted_*" or "__CPROVER_uninterpreted_*"
    *  function as a genuine uninterpreted function: assign the return an
@@ -642,6 +690,16 @@ protected:
    */
   bool
   run_builtin(const code_function_call2t &call, const std::string &symname);
+
+  /** __builtin_bounded_<function>(a, b) of a binary bounded function. */
+  void symex_bounded_binary_math(
+    const code_function_call2t &call,
+    const std::string &function);
+  /** __builtin_bounded_<function>(x, exact): the bounded result of a
+   *  transcendental function, from util/arith/transcendental.h. */
+  void symex_bounded_math(
+    const code_function_call2t &call,
+    const std::string &function);
 
   /** Perform yield; forces a context switch point. */
   void intrinsic_yield(reachability_treet &arg);
@@ -839,12 +897,22 @@ protected:
     const code_function_call2t &func_call,
     reachability_treet &art);
 
+  /** The __builtin_object_size of `ptr` for one constant `type_value`, given
+   * `deref`, the INTERNAL dereference of `ptr` that filled
+   * internal_deref_items. */
+  expr2tc
+  object_size_of_type(const expr2tc &ptr, const expr2tc &deref, int type_value);
+
   /* Handles dereferencing between threads and is used only in data race checks.
    * **/
   void replace_races_check(expr2tc &expr);
 
   void simplify_python_builtins(expr2tc &expr);
   void reject_untyped_isinstance(const expr2tc &value);
+  expr2tc
+  isinstance_subject_of(const isinstance2t &obj, bool *beside_null = nullptr);
+  void guard_isinstance_beside_null(expr2tc &expr);
+  void split_isinstance_over_objects(expr2tc &expr);
 
   void volatile_check(expr2tc &expr);
 
@@ -1083,10 +1151,12 @@ protected:
    */
   void replace_dynamic_allocation(expr2tc &expr);
 
-  /// The object \p ptr addresses, resolved through the value set, or nil.
-  expr2tc value_set_object(const expr2tc &ptr);
-  /// The named object \p ptr addresses, resolved through the value set, or nil.
-  expr2tc value_set_named_object(const expr2tc &ptr);
+  std::vector<expr2tc> value_set_objects(const expr2tc &ptr, bool &complete);
+  expr2tc named_object(const expr2tc &base) const;
+  bool resolve_by_value_set(
+    expr2tc &expr,
+    const expr2tc &ptr,
+    const std::function<expr2tc(const expr2tc &)> &resolve);
   bool resolve_valid_object_by_value_set(expr2tc &expr, const expr2tc &obj_ref);
   bool resolve_dynamic_size_by_value_set(expr2tc &expr);
   void replace_valid_object(expr2tc &expr);
@@ -1334,6 +1404,58 @@ protected:
     const bool hidden);
 
   /**
+   *  Assign to an "if" whose arms write members of one struct \p base as a
+   *  single assignment to \p base, instead of one guarded whole-struct
+   *  assignment per arm (#9785). Arms that do not write a member of \p base
+   *  are assigned as usual.
+   */
+  void symex_assign_member_arms(
+    const expr2tc &lhs,
+    const expr2tc &base,
+    const expr2tc &full_lhs,
+    expr2tc &rhs,
+    expr2tc &full_rhs,
+    guard2tc &guard,
+    const bool hidden);
+
+  /** A store to a member of the struct symex_assign_member_arms is merging,
+   *  recorded by symex_assign_member instead of assigned. \p path names the
+   *  struct members leading from that struct to \p member. */
+  struct member_store
+  {
+    expr2tc member;
+    std::vector<irep_idt> path;
+    expr2tc guard;
+    expr2tc value;
+  };
+
+  struct member_store_collector
+  {
+    expr2tc base;
+    std::vector<member_store> stores;
+  };
+
+  /** Non-null while symex_assign_member_arms collects stores. */
+  member_store_collector *member_stores = nullptr;
+
+  /** Record the store of \p rhs to \p lhs under \p guard if \p lhs is reached
+   *  from the struct being merged through struct members only; otherwise
+   *  return false and record nothing. */
+  bool record_member_store(
+    const expr2tc &lhs,
+    const expr2tc &rhs,
+    const guard2tc &guard);
+
+  /** \p obj, a struct at \p path below the merged struct, rebuilt member by
+   *  member from \p stores. With \p guarded, each store applies under its
+   *  guard; otherwise \p stores belong to one arm and do not overlap. */
+  expr2tc merge_member_stores(
+    const expr2tc &obj,
+    const std::vector<irep_idt> &path,
+    const std::vector<member_store> &stores,
+    bool guarded) const;
+
+  /**
    *  Perform assignment to a byte extract.
    *  Results in a byte update of the relevant part of the lhs with the
    *  right hand side at the appropriate position. Currently a problem , as
@@ -1457,17 +1579,50 @@ protected:
     const type2tc &char_type,
     std::vector<expr2tc> &chars);
   /** The length of an unrenamed printf-family call's output whose constant
-   *  format holds only text and %d, %i, %u or %s conversions without flags,
-   *  width or precision, with its largest value in `max_len`; nil for any
-   *  other format. */
+   *  format holds only text and %s or integer conversions with at most the
+   *  '-' and '0' flags and a width, with its largest value in `max_len`; nil
+   *  for any other format. With `chars`, also the output's characters of
+   *  `char_type`, one per position up to `max_len`, when each is known. */
   expr2tc printf_output_length(
     const code_printf2t &call,
     size_t fmt_idx,
-    size_t &max_len);
+    size_t &max_len,
+    const type2tc &char_type = type2tc(),
+    std::vector<expr2tc> *chars = nullptr);
+  /** The length of the conversion in format `f` whose specification starts at
+   *  `i`, of the unrenamed `args[arg]`, advancing both past it and adding its
+   *  largest value to `max_len`; `chars` receives its characters when known.
+   *  Nil when it cannot be measured. */
+  expr2tc printf_field_length(
+    const std::string &f,
+    size_t &i,
+    const std::vector<expr2tc> &args,
+    size_t &arg,
+    size_t &max_len,
+    std::function<expr2tc(const expr2tc &)> &chars);
   /** The characters a %s conversion prints for the unrenamed char pointer
    *  `ptr`, adding its largest value to `max_len`; nil unless `ptr` resolves
-   *  to one byte array at a constant offset. */
-  expr2tc string_length(const expr2tc &ptr, size_t &max_len);
+   *  to one byte array at a constant offset. `chars`, when given, receives
+   *  the character at a position when `ptr` surely points there. */
+  expr2tc string_length(
+    const expr2tc &ptr,
+    size_t &max_len,
+    std::function<expr2tc(const expr2tc &)> *chars = nullptr);
+  /** Claim that the byte array the unrenamed char pointer `ptr` resolves to
+   *  holds a NUL at or after its offset; nothing unless it resolves to one
+   *  byte array at a constant offset. */
+  void claim_nul_terminated(const expr2tc &ptr);
+  /** Check the original operand `arg` of a %s or %p conversion: the read of
+   *  a %s string, plus the --printf-check claims; `reads_to_nul` is false
+   *  when a precision or length modifier changes what %s reads. */
+  void check_printf_pointer_arg(
+    printf_kindt kind,
+    char spec,
+    bool reads_to_nul,
+    const expr2tc &arg);
+  /** Check the read of a non-constant format string, the unrenamed operand
+   *  `fmt` (C11 7.21.6.1p2). */
+  void check_printf_format(const expr2tc &fmt);
   /** Store an unrenamed sprintf-family call's output and return the length
    *  that call returns: the stored length, or for printf, fprintf and dprintf
    *  with a used result, printf_output_length. Nil when unknown. */
@@ -1478,6 +1633,27 @@ protected:
   /** Assume a printf-family call's return value equals the length of its
    *  output, when both are known. */
   void assume_printf_length(const expr2tc &retval, const expr2tc &len);
+  /** Assume a printf-family call's return value lies in [lo, hi], or is -1
+   *  when `may_fail`. */
+  void assume_printf_range(
+    const expr2tc &retval,
+    const BigInt &lo,
+    const BigInt &hi,
+    bool may_fail);
+  /** Point an asprintf/vasprintf call's `strp` at a fresh heap buffer of
+   *  `retval` + 1 bytes, allocated only when `retval` is non-negative. When
+   *  the result is discarded (`retval` nil) the buffer is 1 byte. */
+  void symex_asprintf_buffer(const expr2tc &strp, const expr2tc &retval);
+  /** The arguments an unrenamed printf-family call formats: its operands
+   *  after the format, or for vsprintf and vsnprintf those
+   *  recover_va_list_args recovers, empty when it cannot. */
+  std::vector<expr2tc> printf_args(const code_printf2t &call, size_t fmt_idx);
+  /** Write through each %n operand `formatter` recorded the number of
+   *  characters output before it (C11 7.21.6.1p8). */
+  void assign_printf_percent_n(const printf_formattert &formatter);
+  /** Fold each char-array argument with a static initializer to a string
+   *  constant, which printf_formattert can measure. */
+  void fold_printf_char_arrays(std::list<expr2tc> &args);
   /** Run `formatter` over an unrenamed printf-family call; false when the
    *  format is not a constant. `constant_args` is set when every argument
    *  is a constant. */
@@ -1584,19 +1760,6 @@ protected:
    */
   irep_idt guard_identifier_s;
   /**
-   *  Cap on guard_definitions and copy_definitions. Both grow linearly
-   *  with symex length (one entry per branching goto, one per bare
-   *  copy: measured ~10k/~21k entries at 10k branch gotos) and are
-   *  copied whenever an execution state forks, so an interleaving-heavy
-   *  run would otherwise pay an unbounded per-fork cost. Past the cap,
-   *  recording stops: subsumption keeps matching against what was
-   *  recorded and never decides wrongly, it merely stops improving,
-   *  and the per-fork copy is bounded by the cap (~8 MB worst case).
-   *  Single-threaded runs never fork an execution state and only pay
-   *  the recording itself.
-   */
-  static constexpr size_t subsumption_map_capacity = 1 << 16;
-  /**
    *  Cap on one recorded copy definition's flattened node count:
    *  canonicalization doubles nested arithmetic chains per link, and
    *  an oversized definition costs more to match than it prunes.
@@ -1612,8 +1775,10 @@ protected:
    *  symbols that are already level2. Keyed by the L2-qualified symbol
    *  name (an interned irep_idt with a cached hash) rather than the
    *  expression, so a lookup never deep-compares expression trees.
+   *  Persistent, like the maps below: a forked execution state copies it in
+   *  O(1).
    */
-  std::unordered_map<irep_idt, expr2tc> guard_definitions;
+  persistent_map<irep_idt, expr2tc, irep_id_hash> guard_definitions;
   /**
    *  Copy chains between L2 symbol generations: lhs generation -> the
    *  stable value it was unconditionally assigned — a (possibly
@@ -1628,7 +1793,16 @@ protected:
    *  fed into constant propagation: substituting copies globally slices
    *  away the originals' assignments and degrades counterexamples.
    */
-  std::unordered_map<irep_idt, expr2tc> copy_definitions;
+  persistent_map<irep_idt, expr2tc, irep_id_hash> copy_definitions;
+  /**
+   *  prefix_index's result per and-chain node of a path guard. A node is
+   *  the cached base of one guard prefix, and a guard grows by appending
+   *  to that base, so a goto extends the index of its guard's longest
+   *  indexed prefix instead of rescanning every conjunct (#9150). Never
+   *  stale: conjuncts are L2, which renaming leaves alone, and the two maps
+   *  above bind each generation once.
+   */
+  persistent_map<expr2tc, conjunct_indext, irep2_hash> guard_prefix_index;
 
   struct deferred_assumptiont
   {
@@ -1721,7 +1895,8 @@ protected:
    *  the l1 renaming so the same object is recognised across frames (a
    *  va_list reached through a pointer dereferences to the owning
    *  activation's l1 name) and across recursion or loop re-declaration (each
-   *  DECL bumps the l1 number, so a fresh activation needs a fresh va_start).
+   *  DECL of a va_list bumps the l1 number, as va_start takes its address, so
+   *  a fresh activation needs a fresh va_start).
    *  Insertion ignores the path guard, over-approximating towards "started",
    *  so a conditional va_start can never yield a false positive. */
   std::unordered_map<
@@ -1785,6 +1960,7 @@ protected:
   /** Cached from --validate-violation-witness; checked on every
    * branch/intrinsic. */
   bool validate_witness;
+  expr2tc witness_cursor;
 
   /** Set of dereference state records; this field is used as a mailbox between
    *  the dereference code and the caller, who will inspect the contents after
@@ -1825,6 +2001,8 @@ protected:
 
   void
   get_value_set(const expr2tc &expr, value_setst::valuest &value_set) override;
+
+  void points_to(const expr2tc &expr, value_setst::valuest &value_set) override;
 
   bool has_failed_symbol(const expr2tc &expr, const symbolt *&symbol) override;
 

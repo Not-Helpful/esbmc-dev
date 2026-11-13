@@ -13,18 +13,28 @@
 #include <util/irep/std_code.h>
 #include <util/irep/std_expr.h>
 #include <util/lang/c_types.h>
+#include <util/lang/python_types.h>
+#include <algorithm>
+#include <functional>
+#include <optional>
+#include <cctype>
 
 using namespace python_expr;
 
 namespace
 {
+using dynamic_type_detail::assigned_value_at;
 using dynamic_type_detail::collect_if_node_literal_kinds;
+using dynamic_type_detail::count_bindings;
+using dynamic_type_detail::single_assigned_value;
 
 using param_kinds_t = std::unordered_map<std::string, std::string>;
 
 // Kinds of the parameters annotated (or inferred from call sites) as int,
-// bool or str, so `return x` counts like a literal of that kind (#8523).
-param_kinds_t collect_param_kinds(const nlohmann::json &function_node)
+// bool, float or str, so `return x` counts like a literal of that kind
+// (#8523). With @p optional, also those annotated `Optional` of one (#9285).
+param_kinds_t
+collect_param_kinds(const nlohmann::json &function_node, bool optional = false)
 {
   param_kinds_t kinds;
   if (!function_node.contains("args") || !function_node["args"].is_object())
@@ -32,13 +42,35 @@ param_kinds_t collect_param_kinds(const nlohmann::json &function_node)
   for (const auto &arg : function_node["args"].value("args", nlohmann::json()))
   {
     const auto &ann = arg.value("annotation", nlohmann::json());
-    const std::string type = ann.is_object() ? ann.value("id", "") : "";
+    std::string type = optional ? type_utils::optional_inner_name(ann) : "";
+    if (type.empty() && ann.is_object())
+      type = ann.value("id", "");
     if (type == "int" || type == "bool")
       kinds[arg["arg"].get<std::string>()] = "num";
-    else if (type == "str")
-      kinds[arg["arg"].get<std::string>()] = "str";
+    else if (type == "str" || type == "float")
+      kinds[arg["arg"].get<std::string>()] = type;
   }
   return kinds;
+}
+
+// The body of `function_node` behind one assignment per parameter of a known
+// kind, so that a name bound to the parameter classifies like it.
+nlohmann::json body_with_param_kinds(const nlohmann::json &function_node)
+{
+  nlohmann::json body = nlohmann::json::array();
+  for (const auto &[name, kind] : collect_param_kinds(function_node))
+    body.push_back(
+      {{"_type", "Assign"},
+       {"targets", {{{"_type", "Name"}, {"id", name}}}},
+       {"value",
+        {{"_type", "Constant"},
+         {"value",
+          kind == "str"     ? nlohmann::json("")
+          : kind == "float" ? nlohmann::json(0.0)
+                            : nlohmann::json(0)}}}});
+  for (const auto &stmt : function_node["body"])
+    body.push_back(stmt);
+  return body;
 }
 
 // "str" for `nondet_str()`, "num" for `nondet_int()` or `nondet_bool()`.
@@ -52,11 +84,36 @@ std::string nondet_call_kind(const nlohmann::json &call)
   return callee == "nondet_int" || callee == "nondet_bool" ? "num" : "";
 }
 
+// The kind of arithmetic on operands of kind `operand_kind`, e.g. `n + 1`
+// (#9812), `-n` or `abs(n)`; none when `value` is no such arithmetic.
+std::optional<std::string> arithmetic_kind(
+  const nlohmann::json &value,
+  const std::function<std::string(const nlohmann::json &)> &operand_kind)
+{
+  const std::string type = value.value("_type", "");
+  if (type == "BinOp")
+    return dynamic_type_detail::binop_kind(
+      value["op"].value("_type", ""),
+      operand_kind(value["left"]),
+      operand_kind(value["right"]));
+  if (type == "UnaryOp")
+    return dynamic_type_detail::unary_kind(
+      value["op"].value("_type", ""), operand_kind(value["operand"]));
+  if (
+    type == "Call" && value["func"].value("id", "") == "abs" &&
+    value["args"].size() == 1 &&
+    value.value("keywords", nlohmann::json::array()).empty())
+    return dynamic_type_detail::unary_kind(
+      "UAdd", operand_kind(value["args"][0]));
+  return std::nullopt;
+}
+
 // Classifies a single `return <literal>` or `return <param>` statement:
 // "num", "str", or "" if neither applies.
 std::string classify_return_literal_kind(
   const nlohmann::json &ret_stmt,
-  const param_kinds_t &param_kinds)
+  const param_kinds_t &param_kinds,
+  const nlohmann::json &module_body)
 {
   if (!ret_stmt.is_object() || ret_stmt.value("_type", "") != "Return")
     return "";
@@ -69,17 +126,20 @@ std::string classify_return_literal_kind(
     auto it = param_kinds.find(value.value("id", ""));
     return it == param_kinds.end() ? "" : it->second;
   }
+  const auto arithmetic = arithmetic_kind(value, [&](const nlohmann::json &op) {
+    return classify_return_literal_kind(
+      {{"_type", "Return"}, {"value", op}}, param_kinds, module_body);
+  });
+  if (arithmetic)
+    return *arithmetic;
   if (value.value("_type", "") == "Call")
-    return nondet_call_kind(value);
-  if (value.value("_type", "") != "Constant" || !value.contains("value"))
-    return "";
-
-  const auto &lit = value["value"];
-  if (lit.is_string())
-    return "str";
-  if (lit.is_number_integer() || lit.is_boolean())
-    return "num";
-  return "";
+  {
+    const std::string kind = nondet_call_kind(value);
+    return kind.empty() ? dynamic_type_detail::classify_literal_value_kind(
+                            value, module_body)
+                        : kind;
+  }
+  return dynamic_type_detail::classify_literal_value_kind(value);
 }
 
 // Collects every literal return kind reachable from the tail of `block`,
@@ -88,6 +148,7 @@ std::string classify_return_literal_kind(
 void collect_branch_return_kinds(
   const nlohmann::json &block,
   const param_kinds_t &param_kinds,
+  const nlohmann::json &module_body,
   std::unordered_set<std::string> &kinds)
 {
   if (!block.is_array() || block.empty())
@@ -97,20 +158,24 @@ void collect_branch_return_kinds(
   if (last.is_object() && last.value("_type", "") == "If")
   {
     if (last.contains("body"))
-      collect_branch_return_kinds(last["body"], param_kinds, kinds);
+      collect_branch_return_kinds(
+        last["body"], param_kinds, module_body, kinds);
     if (last.contains("orelse"))
-      collect_branch_return_kinds(last["orelse"], param_kinds, kinds);
+      collect_branch_return_kinds(
+        last["orelse"], param_kinds, module_body, kinds);
     return;
   }
 
-  const std::string kind = classify_return_literal_kind(last, param_kinds);
+  const std::string kind =
+    classify_return_literal_kind(last, param_kinds, module_body);
   if (!kind.empty())
     kinds.insert(kind);
 }
 
 bool has_divergent_literal_returns(
   const nlohmann::json &function_node,
-  const param_kinds_t &param_kinds)
+  const param_kinds_t &param_kinds,
+  const nlohmann::json &module_body)
 {
   const nlohmann::json &function_body = function_node["body"];
   if (!function_body.is_array())
@@ -125,25 +190,62 @@ bool has_divergent_literal_returns(
       continue;
 
     std::unordered_set<std::string> kinds;
-    collect_branch_return_kinds(stmt["body"], param_kinds, kinds);
+    collect_branch_return_kinds(stmt["body"], param_kinds, module_body, kinds);
 
     if (stmt.contains("orelse") && !stmt["orelse"].empty())
-      collect_branch_return_kinds(stmt["orelse"], param_kinds, kinds);
+      collect_branch_return_kinds(
+        stmt["orelse"], param_kinds, module_body, kinds);
     else if (i + 1 < function_body.size())
     {
       // No else: an idiomatic early return falls through to the next
       // statement at this level.
-      const std::string next_kind =
-        classify_return_literal_kind(function_body[i + 1], param_kinds);
+      const std::string next_kind = classify_return_literal_kind(
+        function_body[i + 1], param_kinds, module_body);
       if (!next_kind.empty())
         kinds.insert(next_kind);
     }
 
-    if (kinds.size() > 1)
+    if (dynamic_type_detail::kinds_diverge(kinds))
       return true;
   }
 
   return false;
+}
+
+// A top-level `return a if t else b` whose arms are of different literal kinds.
+bool has_divergent_ifexp_return(
+  const nlohmann::json &function_node,
+  const param_kinds_t &param_kinds,
+  const nlohmann::json &module_body)
+{
+  for (const auto &stmt : function_node["body"])
+  {
+    if (stmt.value("_type", "") != "Return" || !stmt["value"].is_object())
+      continue;
+    const nlohmann::json &value = stmt["value"];
+    if (value.value("_type", "") != "IfExp")
+      continue;
+    std::unordered_set<std::string> kinds;
+    for (const char *arm : {"body", "orelse"})
+      kinds.insert(classify_return_literal_kind(
+        {{"_type", "Return"}, {"value", value[arm]}},
+        param_kinds,
+        module_body));
+    kinds.erase("");
+    if (dynamic_type_detail::kinds_diverge(kinds))
+      return true;
+  }
+  return false;
+}
+
+bool has_divergent_returns(
+  const nlohmann::json &function_node,
+  const param_kinds_t &param_kinds,
+  const nlohmann::json &module_body)
+{
+  return has_divergent_literal_returns(
+           function_node, param_kinds, module_body) ||
+         has_divergent_ifexp_return(function_node, param_kinds, module_body);
 }
 
 bool returns_dynamic_value(
@@ -159,19 +261,34 @@ bool is_param(const nlohmann::json &function_node, const std::string &name)
   return false;
 }
 
-// True when a return in `block` (if/else arms included) yields a Name that
-// is not one of `function_node`'s own parameters.
+// True when `value` reads a Name that is not one of `function_node`'s own
+// parameters.
+bool reads_free_name(
+  const nlohmann::json &value,
+  const nlohmann::json &function_node)
+{
+  if (
+    value.is_object() && value.value("_type", "") == "Name" &&
+    !is_param(function_node, value.value("id", "")))
+    return true;
+  if (value.is_structured())
+    for (const auto &child : value)
+      if (reads_free_name(child, function_node))
+        return true;
+  return false;
+}
+
+// True when a return in `block` (if/else arms included) yields a value that
+// reads a Name that is not one of `function_node`'s own parameters.
 bool returns_free_name(
   const nlohmann::json &block,
   const nlohmann::json &function_node)
 {
   for (const auto &stmt : block)
   {
-    const nlohmann::json &value = stmt.value("value", nlohmann::json());
     if (
-      stmt.value("_type", "") == "Return" && value.is_object() &&
-      value.value("_type", "") == "Name" &&
-      !is_param(function_node, value.value("id", "")))
+      stmt.value("_type", "") == "Return" &&
+      reads_free_name(stmt.value("value", nlohmann::json()), function_node))
       return true;
     for (const char *arm : {"body", "orelse"})
       if (
@@ -203,11 +320,11 @@ param_kinds_t return_param_kinds(
   const nlohmann::json &function_node,
   const nlohmann::json &module_body)
 {
-  param_kinds_t kinds = collect_param_kinds(function_node);
+  param_kinds_t kinds = collect_param_kinds(function_node, true);
   if (!returns_free_name(function_node["body"], function_node))
     return kinds;
   if (const nlohmann::json *outer = enclosing_def(module_body, function_node))
-    kinds.merge(collect_param_kinds(*outer));
+    kinds.merge(collect_param_kinds(*outer, true));
   return kinds;
 }
 
@@ -226,6 +343,104 @@ const nlohmann::json *find_callee_def(
   return nullptr;
 }
 
+struct argument_kinds
+{
+  size_t tagged = 0;
+  size_t other = 0;
+};
+
+// Counts the leaves of `arg` that name a def returning a dynamic value and
+// those that are anything else.
+void classify_argument(
+  const nlohmann::json &arg,
+  const nlohmann::json &module_body,
+  unsigned depth,
+  argument_kinds &kinds)
+{
+  if (arg.value("_type", "") == "IfExp")
+  {
+    classify_argument(arg["body"], module_body, depth, kinds);
+    classify_argument(arg["orelse"], module_body, depth, kinds);
+    return;
+  }
+  const nlohmann::json *def =
+    arg.value("_type", "") == "Name"
+      ? find_callee_def(nlohmann::json::array(), module_body, arg["id"])
+      : nullptr;
+  if (
+    const nlohmann::json *bound =
+      !def && depth < 8 && arg.value("_type", "") == "Name"
+        ? single_assigned_value(module_body, arg["id"])
+        : nullptr)
+    classify_argument(*bound, module_body, depth + 1, kinds);
+  else if (
+    def && count_bindings(module_body, arg["id"]) == 1 &&
+    returns_dynamic_value(*def, module_body, depth + 1))
+    ++kinds.tagged;
+  else
+    ++kinds.other;
+}
+
+// Classifies what every call of `function_node` passes for parameter `index`.
+void collect_argument_kinds(
+  const nlohmann::json &node,
+  const nlohmann::json &function_node,
+  size_t index,
+  const nlohmann::json &module_body,
+  unsigned depth,
+  argument_kinds &kinds)
+{
+  if (!node.is_structured())
+    return;
+  if (
+    node.is_object() && node.value("_type", "") == "Call" &&
+    node["func"].value("_type", "") == "Name" &&
+    node["func"].value("id", "") == function_node.value("name", ""))
+  {
+    const std::string param =
+      function_node["args"]["args"][index].value("arg", "");
+    bool by_keyword = false;
+    for (const auto &kw : node["keywords"])
+      by_keyword = by_keyword || kw.value("arg", "") == param;
+    if (by_keyword || node["args"].size() <= index)
+      ++kinds.other;
+    else
+      classify_argument(node["args"][index], module_body, depth, kinds);
+  }
+  for (const auto &child : node)
+    collect_argument_kinds(
+      child, function_node, index, module_body, depth, kinds);
+}
+
+// What `function_node`'s callers pass for the parameter `call` calls through.
+argument_kinds parameter_argument_kinds(
+  const nlohmann::json &call,
+  const nlohmann::json &function_node,
+  const nlohmann::json &module_body,
+  unsigned depth)
+{
+  argument_kinds kinds;
+  const std::string name = call["func"].value("id", "");
+  const auto &params = function_node["args"]["args"];
+  for (size_t i = 0; i < params.size(); ++i)
+    if (params[i].value("arg", "") == name)
+      collect_argument_kinds(
+        module_body, function_node, i, module_body, depth, kinds);
+  return kinds;
+}
+
+// A call through a parameter of `function_node` may reach a def that returns
+// a dynamic value (#9030).
+bool calls_dynamic_parameter(
+  const nlohmann::json &call,
+  const nlohmann::json &function_node,
+  const nlohmann::json &module_body,
+  unsigned depth)
+{
+  return parameter_argument_kinds(call, function_node, module_body, depth)
+           .tagged > 0;
+}
+
 // `value` is a call to a function that itself returns a dynamic value.
 bool calls_dynamic_function(
   const nlohmann::json &value,
@@ -239,8 +454,77 @@ bool calls_dynamic_function(
     return false;
   const nlohmann::json *callee = find_callee_def(
     function_node["body"], module_body, value["func"].value("id", ""));
-  return callee && callee != &function_node &&
+  if (!callee)
+    return calls_dynamic_parameter(value, function_node, module_body, depth);
+  return callee != &function_node &&
          returns_dynamic_value(*callee, module_body, depth + 1);
+}
+
+// `node` or a node under it binds `name`: as a parameter, a def, class, import
+// or except alias, or a Name stored or deleted.
+bool subtree_binds_name(const nlohmann::json &node, const std::string &name)
+{
+  if (!node.is_structured())
+    return false;
+  if (node.is_object())
+  {
+    const std::string type = node.value("_type", "");
+    if (type == "Name")
+      return node.value("id", "") == name &&
+             node.value("ctx", nlohmann::json::object()).value("_type", "") !=
+               "Load";
+    const char *key =
+      type == "arg" ? "arg"
+      : type == "alias" && node.value("asname", nlohmann::json()).is_string()
+        ? "asname"
+        : "name";
+    const nlohmann::json bound = node.value(key, nlohmann::json());
+    if (bound.is_string() && bound == name)
+      return true;
+  }
+  for (const auto &child : node)
+    if (subtree_binds_name(child, name))
+      return true;
+  return false;
+}
+
+// `function_node` sits directly in the module body or in the body of a
+// module-level class, so a name it never binds is the module-level one.
+bool is_module_level_def(
+  const nlohmann::json &function_node,
+  const nlohmann::json &module_body)
+{
+  for (const auto &stmt : module_body)
+  {
+    if (&stmt == &function_node)
+      return true;
+    if (stmt.value("_type", "") == "ClassDef")
+      for (const auto &member : stmt["body"])
+        if (&member == &function_node)
+          return true;
+  }
+  return false;
+}
+
+// `name`, returned by `function_node`, is bound to divergent kinds by the
+// function itself (`scope_body`, its body behind its parameters) or, when the
+// function is module-level and never binds it, by the module body (#9156).
+bool returns_divergent_name(
+  const std::string &name,
+  const nlohmann::json &function_node,
+  const nlohmann::json &scope_body,
+  const nlohmann::json &module_body)
+{
+  if (
+    dynamic_type_detail::scope_assigns_divergent_literal_types(
+      name, scope_body, module_body))
+    return true;
+  return !name.empty() &&
+         dynamic_type_detail::scope_assigns_divergent_literal_types(
+           name, module_body, module_body) &&
+         is_module_level_def(function_node, module_body) &&
+         !subtree_binds_name(function_node["args"], name) &&
+         !subtree_binds_name(function_node["body"], name);
 }
 
 // True when `function_node` returns divergent literal kinds, or forwards the
@@ -251,21 +535,26 @@ bool returns_dynamic_value(
   unsigned depth)
 {
   if (
-    has_divergent_literal_returns(
-      function_node, return_param_kinds(function_node, module_body)))
+    has_divergent_returns(
+      function_node,
+      return_param_kinds(function_node, module_body),
+      module_body))
     return true;
   if (depth > 8)
     return false;
   std::unordered_set<std::string> forwarded;
+  const nlohmann::json scope_body = body_with_param_kinds(function_node);
   for (const auto &stmt : function_node["body"])
   {
     const std::string type = stmt.value("_type", "");
     if (type != "Return" && type != "Assign" && type != "AnnAssign")
       continue;
     const nlohmann::json &value = stmt["value"];
+    const std::string returned = value.is_object() ? value.value("id", "") : "";
     if (
-      type == "Return" && value.is_object() &&
-      forwarded.count(value.value("id", "")))
+      type == "Return" && (forwarded.count(returned) ||
+                           returns_divergent_name(
+                             returned, function_node, scope_body, module_body)))
       return true;
     if (!calls_dynamic_function(value, function_node, module_body, depth))
       continue;
@@ -277,6 +566,49 @@ bool returns_dynamic_value(
       forwarded.insert(stmt["targets"][0].value("id", ""));
   }
   return false;
+}
+// The literal kind a value of `type` has, as classify_literal_value_kind
+// names it: "num" for an int or bool, "str" for a str, else "".
+std::string scalar_kind(const typet &type)
+{
+  if (type_utils::is_integer_type(type) || type.is_bool())
+    return "num";
+  if (type.is_floatbv())
+    return "float";
+  return type_utils::is_string_type(type) ? "str" : "";
+}
+
+// The text of `node` when it is a str literal that CPython interns, i.e. one
+// spelled as an identifier: every occurrence of it is one object. Decided on
+// the source, since the converter folds computed strings into the same
+// constant a literal gives.
+std::optional<std::string> interned_str_text(const nlohmann::json &node)
+{
+  if (
+    node.value("_type", "") != "Constant" || !node["value"].is_string() ||
+    node.contains("encoded_bytes"))
+    return std::nullopt;
+  const std::string text = node["value"];
+
+  auto is_word = [](unsigned char c) { return std::isalnum(c) || c == '_'; };
+  if (
+    text.empty() || std::isdigit(static_cast<unsigned char>(text[0])) ||
+    !std::all_of(text.begin(), text.end(), is_word))
+    return std::nullopt;
+  return text;
+}
+
+// `name` has one binding in the whole module, a top-level assignment, so it
+// names one object for the whole run.
+bool bound_once_at_top_level(
+  const nlohmann::json &module_body,
+  const std::string &name)
+{
+  return count_bindings(module_body, name) == 1 &&
+         std::any_of(
+           module_body.begin(), module_body.end(), [&](const auto &stmt) {
+             return assigned_value_at(stmt, name) != nullptr;
+           });
 }
 } // namespace
 
@@ -299,13 +631,17 @@ std::unordered_set<std::string> dynamic_type_handler::detect_dynamic_type_names(
   // Module scope by default, or the current function's body.
   const nlohmann::json &module_body = converter_.ast()["body"];
   nlohmann::json func_def;
+  nlohmann::json scoped_body;
   const nlohmann::json *scope_body = &module_body;
   if (!converter_.current_function_name().empty())
   {
     func_def = json_utils::try_find_function(
       module_body, converter_.current_function_name());
     if (!func_def.empty() && func_def.contains("body"))
-      scope_body = &func_def["body"];
+    {
+      scoped_body = body_with_param_kinds(func_def);
+      scope_body = &scoped_body;
+    }
   }
 
   if (!collect_if_node_literal_kinds(
@@ -314,37 +650,118 @@ std::unordered_set<std::string> dynamic_type_handler::detect_dynamic_type_names(
         leaf_count,
         leaf_total,
         *scope_body,
-        converter_.callable_function_stubs()))
+        converter_.kind_module_body()))
     return dynamic_type_names;
 
-  for (const auto &[name, kind_set] : kinds)
+  // A path through a leaf that assigns nothing keeps the name's value, or
+  // leaves it unbound, so that a read there raises.
+  for (auto &[name, kind_set] : kinds)
   {
-    if (leaf_count[name] != leaf_total || kind_set.size() < 2)
-      continue;
-
-    symbol_id sid = converter_.create_symbol_id();
-    sid.set_object(name);
     const symbolt *existing =
-      converter_.symbol_table().find_symbol(sid.to_string());
+      converter_.symbol_table().find_symbol(bound_symbol_id(name).to_string());
     if (
-      existing && !type_handler_.is_numeric_scalar_type(existing->get_type()) &&
-      !type_handler_.is_string_type(existing->get_type()))
-      continue;
-
-    dynamic_type_names.insert(name);
+      joins_divergent_kinds(
+        name, existing, kind_set, existing && leaf_count[name] < leaf_total))
+      dynamic_type_names.insert(name);
   }
 
   return dynamic_type_names;
 }
 
+bool dynamic_type_handler::joins_divergent_kinds(
+  const std::string &name,
+  const symbolt *existing,
+  std::unordered_set<std::string> &kinds,
+  bool keeps_value) const
+{
+  const bool declared_any = existing && existing->get_type() == any_type();
+  if (
+    existing && !declared_any &&
+    !type_handler_.is_numeric_scalar_type(existing->get_type()) &&
+    !type_handler_.is_string_type(existing->get_type()))
+    return false;
+  // `C.v` is tagged only at module level, where its store is a global one.
+  if (
+    name.find('.') != std::string::npos &&
+    (!existing || !converter_.current_function_name().empty()))
+    return false;
+
+  // The value bound before the `if` is the one a path that skips every
+  // assignment keeps. An already tagged name keeps its slot, and a retyped
+  // one holds its value in a symbol other than `existing`.
+  if (
+    existing && !declared_any && !is_tagged(name) &&
+    !converter_.is_retyped(existing->id))
+    kinds.insert(scalar_kind(existing->get_type()));
+  else if (keeps_value)
+    return false;
+  kinds.erase("");
+  return dynamic_type_detail::kinds_diverge(kinds);
+}
+
+std::unordered_set<std::string>
+dynamic_type_handler::detect_dynamic_type_attributes(
+  const std::string &class_name) const
+{
+  std::unordered_set<std::string> result;
+  const nlohmann::json &module_body = converter_.ast()["body"];
+
+  const nlohmann::json *class_node = nullptr;
+  for (const auto &stmt : module_body)
+  {
+    if (
+      stmt.is_object() && stmt.value("_type", "") == "ClassDef" &&
+      stmt.value("name", "") == class_name)
+    {
+      class_node = &stmt;
+      break;
+    }
+  }
+  if (!class_node || !class_node->contains("body"))
+    return result;
+
+  // Attribute names this class assigns via self.<attr>.
+  std::unordered_set<std::string> self_attrs;
+  for (const auto &member : (*class_node)["body"])
+  {
+    if (member.value("_type", "") != "FunctionDef" || !member.contains("body"))
+      continue;
+    for (const auto &stmt : member["body"])
+    {
+      auto [target, value] = dynamic_type_detail::assign_target_value(stmt);
+      (void)value;
+      if (
+        target && target->value("_type", "") == "Attribute" &&
+        target->contains("value") && (*target)["value"].is_object() &&
+        (*target)["value"].value("_type", "") == "Name" &&
+        (*target)["value"].value("id", "") == "self")
+        self_attrs.insert(target->value("attr", ""));
+    }
+  }
+
+  for (const auto &attr : self_attrs)
+  {
+    if (
+      dynamic_type_detail::classes_declaring_attribute(module_body, attr)
+        .size() > 1)
+      continue;
+    if (
+      dynamic_type_detail::kinds_diverge(
+        dynamic_type_detail::collect_attribute_literal_kinds(
+          module_body, attr)))
+      result.insert(attr);
+  }
+  return result;
+}
+
 void dynamic_type_handler::declare_dynamic_type_names(
   const std::unordered_set<std::string> &dynamic_type_names,
-  const nlohmann::json &ast_node)
+  const nlohmann::json &ast_node,
+  bool copy_existing)
 {
   for (const auto &name : dynamic_type_names)
   {
-    symbol_id tag_sid = converter_.create_symbol_id();
-    tag_sid.set_object(name);
+    const symbol_id tag_sid = bound_symbol_id(name);
 
     // A pre-existing variable already has GOTO instructions carrying its old
     // (non-struct) type; retyping that symbol in place would leave those
@@ -391,9 +808,12 @@ void dynamic_type_handler::declare_dynamic_type_names(
 
       // Initialize from the pre-existing value, in case something reads the
       // alias before a branch's assign() runs.
+      // A name declared Any holds no scalar to copy, and both arms assign it.
+      if (!copy_existing || existing_symbol->get_type() == any_type())
+        continue;
       exprt existing_value = build_symbol(*existing_symbol);
       for (const codet &instr : build_tag_field_assigns(
-             *alias_symbol_ptr, existing_value, alias_location))
+             build_symbol(*alias_symbol_ptr), existing_value, alias_location))
         converter_.add_instruction(instr);
       continue;
     }
@@ -424,14 +844,27 @@ void dynamic_type_handler::declare_dynamic_type_names(
   }
 }
 
+symbol_id dynamic_type_handler::bound_symbol_id(const std::string &name) const
+{
+  symbol_id sid = converter_.create_symbol_id();
+  const std::size_t dot = name.find('.');
+  if (dot == std::string::npos)
+  {
+    sid.set_object(name);
+    return sid;
+  }
+  sid.set_function("");
+  sid.set_class(name.substr(0, dot));
+  sid.set_object(name.substr(dot + 1));
+  return sid;
+}
+
 bool dynamic_type_handler::is_tagged(const std::string &name) const
 {
   if (tagged_names_.count(name) > 0)
     return true;
 
-  symbol_id sid = converter_.create_symbol_id();
-  sid.set_object(name);
-  const std::string tag_id = sid.to_string();
+  const std::string tag_id = bound_symbol_id(name).to_string();
   if (aliases_.count(tag_id) > 0)
     return true;
 
@@ -442,9 +875,7 @@ bool dynamic_type_handler::is_tagged(const std::string &name) const
 std::string
 dynamic_type_handler::tagged_symbol_id(const std::string &name) const
 {
-  symbol_id sid = converter_.create_symbol_id();
-  sid.set_object(name);
-  const std::string tag_id = sid.to_string();
+  const std::string tag_id = bound_symbol_id(name).to_string();
   auto alias = aliases_.find(tag_id);
   return alias != aliases_.end() ? alias->second : tag_id;
 }
@@ -455,13 +886,90 @@ bool dynamic_type_handler::tagged_binop_result_may_be_tagged(
   return op == "Add";
 }
 
-std::vector<codet> dynamic_type_handler::build_tag_field_assigns(
-  symbolt &tag_symbol,
+exprt dynamic_type_handler::interned_str_payload(
+  const std::string &text,
   const exprt &rhs,
-  const locationt &location)
+  exprt &elem_size)
 {
-  std::vector<codet> instructions;
+  elem_size = from_integer(text.size() + 1, size_type());
+  const std::string id = "py:@interned_str@" + text;
+  if (!converter_.symbol_table().find_symbol(id))
+  {
+    symbolt sym;
+    sym.id = id;
+    sym.name = "interned_str$" + text;
+    sym.set_type(migrate_type(rhs.type()));
+    sym.set_value(migrate_expr(rhs));
+    sym.static_lifetime = true;
+    sym.is_extern = false;
+    converter_.symbol_table().add(sym);
+  }
+  const symbolt *sym = converter_.symbol_table().find_symbol(id);
+  return build_typecast(
+    converter_.get_string_handler().get_array_base_address(build_symbol(*sym)),
+    pointer_typet(empty_typet()));
+}
 
+exprt dynamic_type_handler::module_name_payload(
+  const exprt &rhs,
+  const locationt &location,
+  std::vector<codet> &instructions,
+  exprt &elem_size)
+{
+  if (
+    !rhs.is_symbol() ||
+    (!type_utils::is_integer_type(rhs.type()) && !rhs.type().is_floatbv()))
+    return nil_exprt();
+  const symbolt *source =
+    converter_.symbol_table().find_symbol(to_symbol_expr(rhs).get_identifier());
+  if (!source)
+    return nil_exprt();
+  const std::string name = source->name.as_string();
+  symbol_id sid = converter_.create_symbol_id();
+  sid.set_object(name);
+  if (
+    sid.global_to_string() != source->id.as_string() ||
+    !bound_once_at_top_level(converter_.ast()["body"], name))
+    return nil_exprt();
+
+  const std::string object_id = source->id.as_string() + "$object";
+  if (!converter_.symbol_table().find_symbol(object_id))
+  {
+    symbolt object;
+    object.id = object_id;
+    object.name = name + "$object";
+    object.set_type(migrate_type(rhs.type()));
+    object.lvalue = true;
+    object.static_lifetime = true;
+    object.is_extern = false;
+    converter_.symbol_table().add(object);
+  }
+  const symbolt *object = converter_.symbol_table().find_symbol(object_id);
+
+  // The name is never rebound, so every store writes the same value.
+  code_assignt store(build_symbol(*object), rhs);
+  store.location() = location;
+  instructions.push_back(store);
+
+  elem_size = type_handler_.tagged_scalar_byte_size(rhs);
+  return build_typecast(
+    build_address_of(build_symbol(*object)), pointer_typet(empty_typet()));
+}
+
+exprt dynamic_type_handler::int_payload(const exprt &value) const
+{
+  const symbolt *copy_func =
+    converter_.symbol_table().find_symbol("c:@F@__python_scalar_int_copy");
+  assert(copy_func && "__python_scalar_int_copy not found in symbol table");
+  return build_call_expr(*copy_func, pointer_typet(empty_typet()), {value});
+}
+
+exprt dynamic_type_handler::build_scalar_payload(
+  const exprt &rhs,
+  const locationt &location,
+  std::vector<codet> &instructions,
+  exprt &elem_size)
+{
   exprt value_to_store = rhs;
   if (rhs.type() == bool_type())
     value_to_store =
@@ -476,7 +984,6 @@ std::vector<codet> dynamic_type_handler::build_tag_field_assigns(
 
   // A runtime string has no statically known length -- measure it with
   // the bounded-length helper, +1 for the trailing NUL.
-  exprt elem_size;
   if (
     value_to_store.type().is_pointer() &&
     value_to_store.type().subtype() == char_type())
@@ -497,29 +1004,49 @@ std::vector<codet> dynamic_type_handler::build_tag_field_assigns(
   // A pointer `backing` already refers to non-expiring storage, so use it
   // as `.value` directly. Anything else lives in `backing`'s own stack
   // storage, which goes DEAD at branch exit, so it needs an explicit copy.
-  exprt tag_value;
   if (value_to_store.type().is_pointer())
-    tag_value =
-      build_typecast(build_symbol(backing), pointer_typet(empty_typet()));
+    return build_typecast(build_symbol(backing), pointer_typet(empty_typet()));
+
+  if (value_to_store.type() == long_long_int_type())
+    return int_payload(build_symbol(backing));
+
+  const symbolt *copy_func =
+    converter_.symbol_table().find_symbol("c:@F@__python_scalar_tag_copy");
+  assert(copy_func && "__python_scalar_tag_copy not found in symbol table");
+  exprt backing_addr = build_typecast(
+    build_address_of(build_symbol(backing)), pointer_typet(empty_typet()));
+  return build_call_expr(
+    *copy_func, pointer_typet(empty_typet()), {backing_addr, elem_size});
+}
+
+std::vector<codet> dynamic_type_handler::build_tag_field_assigns(
+  const exprt &tag_expr,
+  const exprt &rhs,
+  const locationt &location,
+  const std::optional<std::string> &interned_text)
+{
+  std::vector<codet> instructions;
+
+  // Tags built from one object share it as their payload, so `is` between
+  // them holds (#9348).
+  exprt elem_size;
+  exprt tag_value;
+  if (
+    interned_text && rhs.type().is_array() &&
+    rhs.type().subtype() == char_type())
+    tag_value = interned_str_payload(*interned_text, rhs, elem_size);
   else
-  {
-    const symbolt *copy_func =
-      converter_.symbol_table().find_symbol("c:@F@__python_scalar_tag_copy");
-    assert(copy_func && "__python_scalar_tag_copy not found in symbol table");
-    exprt backing_addr = build_typecast(
-      build_address_of(build_symbol(backing)), pointer_typet(empty_typet()));
-    tag_value = build_call_expr(
-      *copy_func, pointer_typet(empty_typet()), {backing_addr, elem_size});
-  }
+    tag_value = module_name_payload(rhs, location, instructions, elem_size);
+  if (tag_value.is_nil())
+    tag_value = build_scalar_payload(rhs, location, instructions, elem_size);
 
   // Normalise to the canonical str type before hashing, so type_id
-  // doesn't vary with length or array-vs-pointer shape.
-  typet type_id_source = value_to_store.type();
+  // doesn't vary with length or array-vs-pointer shape. A bool keeps its
+  // own tag although its payload was widened to an int above.
+  typet type_id_source = rhs.type();
   if (type_handler_.is_string_type(type_id_source))
     type_id_source = pointer_typet(char_type());
   exprt type_id_value = type_handler_.tagged_scalar_type_id(type_id_source);
-
-  exprt tag_expr = build_symbol(tag_symbol);
 
   code_assignt value_assign(
     build_member(tag_expr, "value", pointer_typet(empty_typet())), tag_value);
@@ -560,11 +1087,27 @@ void dynamic_type_handler::assign(
   const exprt &rhs,
   const locationt &location,
   const std::string &name,
-  codet &target_block)
+  codet &target_block,
+  const nlohmann::json &value_node)
 {
   symbolt *tag_symbol = find_tag_symbol(name);
 
-  for (const codet &instr : build_tag_field_assigns(*tag_symbol, rhs, location))
+  for (const codet &instr : build_tag_field_assigns(
+         build_symbol(*tag_symbol),
+         rhs,
+         location,
+         interned_str_text(value_node)))
+    target_block.copy_to_operands(instr);
+}
+
+void dynamic_type_handler::assign_to_lvalue(
+  const exprt &rhs,
+  const locationt &location,
+  const exprt &tagged_lvalue,
+  codet &target_block)
+{
+  for (const codet &instr :
+       build_tag_field_assigns(tagged_lvalue, rhs, location))
     target_block.copy_to_operands(instr);
 }
 
@@ -639,6 +1182,7 @@ exprt dynamic_type_handler::handle_comparison(
   const bool lhs_tagged = type_handler_.is_tagged_scalar_type(lhs.type());
   const bool rhs_tagged = type_handler_.is_tagged_scalar_type(rhs.type());
   const bool ordered = type_utils::is_ordered_comparison(op);
+  refuse_float_tag_operation(lhs, rhs);
 
   if (lhs_tagged && rhs_tagged)
   {
@@ -805,7 +1349,88 @@ exprt dynamic_type_handler::build_sub_literal(
      from_integer(BigInt(tagged_is_left ? 1 : 0), int_type())});
 }
 
+/// The scalar.c function and result type of `/`, `//` (#10555), `*` or `%`
+/// on numbers, with @p suffix ("" for a literal operand, "_dyn" for two tags).
+static std::pair<std::string, typet>
+division_function(const std::string &op, const std::string &suffix)
+{
+  static const std::unordered_map<std::string, std::string> names = {
+    {"FloorDiv", "floordiv"}, {"Mult", "mul"}, {"Mod", "mod"}};
+  const auto name = names.find(op);
+  if (name == names.end())
+    return {"c:@F@__python_scalar_div_num" + suffix, double_type()};
+  return {
+    "c:@F@__python_scalar_" + name->second + "_num" + suffix,
+    signedbv_typet(config.ansi_c.long_long_int_width)};
+}
+
+bool dynamic_type_handler::is_tagged_arithmetic(const std::string &op)
+{
+  static const std::unordered_set<std::string> ops = {
+    "Add", "Sub", "Div", "FloorDiv", "Mult", "Mod"};
+  return ops.count(op) != 0;
+}
+
+/// Where `*` or `%` on @p lhs and @p rhs is valid in CPython but not on
+/// numbers: a str repeated by an int, or a str formatted by `%`. Neither is
+/// modelled here. False for any other operator.
+exprt dynamic_type_handler::unmodelled_str_operand(
+  const std::string &op,
+  const exprt &lhs,
+  const exprt &rhs) const
+{
+  if (op != "Mult" && op != "Mod")
+    return false_exprt();
+  const exprt str_id =
+    type_handler_.tagged_scalar_type_id(pointer_typet(char_type()));
+  // Whether @p operand holds a str, or else an int or a bool.
+  auto kind = [&](const exprt &operand, bool str) -> exprt {
+    const typet &type = operand.type();
+    if (!type_handler_.is_tagged_scalar_type(type))
+    {
+      const bool integral =
+        type.is_signedbv() || type.is_unsignedbv() || type.is_bool();
+      return gen_boolean(!str && integral);
+    }
+    const exprt type_id = build_member(operand, "type_id", size_type());
+    if (str)
+      return build_equal(type_id, str_id);
+    return type_handler_.tagged_scalar_type_matches(
+      type_id, long_long_int_type());
+  };
+  if (op == "Mod")
+    return kind(lhs, true);
+  return build_or(
+    build_and(kind(lhs, true), kind(rhs, false)),
+    build_and(kind(lhs, false), kind(rhs, true)));
+}
+
+/// Claims, as unsupported, that @p lhs `op` @p rhs is not a str repeated or
+/// formatted, then assumes it.
+void dynamic_type_handler::claim_numeric_operands(
+  const std::string &op,
+  const exprt &lhs,
+  const exprt &rhs,
+  const locationt &location)
+{
+  const exprt unmodelled = unmodelled_str_operand(op, lhs, rhs);
+  if (unmodelled.is_false())
+    return;
+  if (!converter_.can_emit_runtime_guard())
+    throw std::runtime_error(
+      "operator '" + op + "' on a dynamically-typed str is not yet supported");
+  code_assertt check(build_not(unmodelled));
+  check.location() = location;
+  check.location().user_provided(true);
+  check.location().comment(
+    op == "Mod" ? "Unsupported: % formatting of a dynamically-typed str"
+                : "Unsupported: repeating a dynamically-typed str");
+  converter_.add_instruction(check);
+  converter_.add_instruction(code_assumet(build_not(unmodelled)));
+}
+
 exprt dynamic_type_handler::build_div_literal(
+  const std::string &op,
   const exprt &tagged,
   const exprt &literal,
   bool tagged_is_left,
@@ -815,12 +1440,13 @@ exprt dynamic_type_handler::build_div_literal(
     !literal.type().is_bool() && !literal.type().is_signedbv() &&
     !literal.type().is_unsignedbv())
     throw std::runtime_error(
-      "dividing a dynamically-typed variable by this literal type is not "
+      "operator '" + op +
+      "' between a dynamically-typed variable and this literal type is not "
       "yet supported");
 
-  const symbolt *div_func =
-    converter_.symbol_table().find_symbol("c:@F@__python_scalar_div_num");
-  assert(div_func && "__python_scalar_div_num not found in symbol table");
+  const auto [div_name, div_type] = division_function(op, "");
+  const symbolt *div_func = converter_.symbol_table().find_symbol(div_name);
+  assert(div_func && "scalar division function not found in symbol table");
 
   exprt tagged_addr = build_address_of(tagged);
   exprt lit_value =
@@ -837,11 +1463,12 @@ exprt dynamic_type_handler::build_div_literal(
       pointer_typet(signedbv_typet(config.ansi_c.long_long_int_width))),
     signedbv_typet(config.ansi_c.long_long_int_width));
   exprt divisor = tagged_is_left ? lit_value : tagged_numeric_value;
-  guard_zero_division(divisor, type_matches, location);
+  if (op != "Mult")
+    guard_zero_division(divisor, type_matches, location);
 
   return build_call_expr(
     *div_func,
-    double_type(),
+    div_type,
     {tagged_addr,
      build_typecast(type_matches, int_type()),
      lit_value,
@@ -856,6 +1483,8 @@ exprt dynamic_type_handler::handle_arithmetic(
 {
   const bool lhs_tagged = type_handler_.is_tagged_scalar_type(lhs.type());
   const bool rhs_tagged = type_handler_.is_tagged_scalar_type(rhs.type());
+  refuse_float_tag_operation(lhs, rhs);
+  claim_numeric_operands(op, lhs, rhs, location);
 
   // Equality can settle a type_id mismatch without knowing either type;
   // arithmetic cannot, since it needs the concrete type to pick an operation.
@@ -865,8 +1494,7 @@ exprt dynamic_type_handler::handle_arithmetic(
       return build_add_tagged(lhs, rhs);
     if (op == "Sub")
       return build_sub_tagged(lhs, rhs);
-    assert(op == "Div" && "unexpected operator routed to handle_arithmetic");
-    return build_div_tagged(lhs, rhs, location);
+    return build_div_tagged(op, lhs, rhs, location);
   }
 
   if (op == "Add")
@@ -877,9 +1505,8 @@ exprt dynamic_type_handler::handle_arithmetic(
     return lhs_tagged ? build_sub_literal(lhs, rhs, /*tagged_is_left=*/true)
                       : build_sub_literal(rhs, lhs, /*tagged_is_left=*/false);
 
-  assert(op == "Div" && "unexpected operator routed to handle_arithmetic");
-  return lhs_tagged ? build_div_literal(lhs, rhs, true, location)
-                    : build_div_literal(rhs, lhs, false, location);
+  return lhs_tagged ? build_div_literal(op, lhs, rhs, true, location)
+                    : build_div_literal(op, rhs, lhs, false, location);
 }
 
 exprt dynamic_type_handler::build_neg_tagged(
@@ -887,6 +1514,7 @@ exprt dynamic_type_handler::build_neg_tagged(
   const locationt &location)
 {
   exprt zero = from_integer(0, signedbv_typet(config.ansi_c.int_width));
+  refuse_float_tag_operation(zero, tagged);
   guard_type_error("Sub", zero, tagged, location);
   return build_sub_literal(tagged, zero, /*tagged_is_left=*/false);
 }
@@ -947,13 +1575,14 @@ exprt dynamic_type_handler::build_sub_tagged(const exprt &lhs, const exprt &rhs)
 }
 
 exprt dynamic_type_handler::build_div_tagged(
+  const std::string &op,
   const exprt &lhs,
   const exprt &rhs,
   const locationt &location)
 {
-  const symbolt *div_func =
-    converter_.symbol_table().find_symbol("c:@F@__python_scalar_div_num_dyn");
-  assert(div_func && "__python_scalar_div_num_dyn not found in symbol table");
+  const auto [div_name, div_type] = division_function(op, "_dyn");
+  const symbolt *div_func = converter_.symbol_table().find_symbol(div_name);
+  assert(div_func && "scalar division function not found in symbol table");
 
   exprt lhs_type_id = build_member(lhs, "type_id", size_type());
   exprt rhs_type_id = build_member(rhs, "type_id", size_type());
@@ -967,12 +1596,13 @@ exprt dynamic_type_handler::build_div_tagged(
       build_member(rhs, "value", pointer_typet(empty_typet())),
       pointer_typet(signedbv_typet(config.ansi_c.long_long_int_width))),
     signedbv_typet(config.ansi_c.long_long_int_width));
-  guard_zero_division(
-    rhs_numeric_value, build_and(lhs_is_num, rhs_is_num), location);
+  if (op != "Mult")
+    guard_zero_division(
+      rhs_numeric_value, build_and(lhs_is_num, rhs_is_num), location);
 
   return build_call_expr(
     *div_func,
-    double_type(),
+    div_type,
     {build_address_of(lhs),
      build_typecast(lhs_is_num, int_type()),
      build_address_of(rhs),
@@ -990,8 +1620,10 @@ exprt dynamic_type_handler::operands_type_ok(
   {
     const exprt &tagged = lhs_tagged ? lhs : rhs;
     const exprt &literal = lhs_tagged ? rhs : lhs;
-    return type_handler_.tagged_scalar_type_matches(
-      build_member(tagged, "type_id", size_type()), literal.type());
+    return build_or(
+      type_handler_.tagged_scalar_type_matches(
+        build_member(tagged, "type_id", size_type()), literal.type()),
+      unmodelled_str_operand(op, lhs, rhs));
   }
 
   exprt lhs_type_id = build_member(lhs, "type_id", size_type());
@@ -1001,8 +1633,8 @@ exprt dynamic_type_handler::operands_type_ok(
   exprt rhs_is_num =
     type_handler_.tagged_scalar_type_matches(rhs_type_id, long_long_int_type());
   exprt both_num = build_and(lhs_is_num, rhs_is_num);
-  if (op == "Sub" || op == "Div")
-    return both_num;
+  if (op != "Add" && is_tagged_arithmetic(op))
+    return build_or(both_num, unmodelled_str_operand(op, lhs, rhs));
   if (op == "Add")
   {
     exprt str_type_id =
@@ -1028,7 +1660,12 @@ void dynamic_type_handler::guard_type_error(
     return;
 
   static const std::unordered_map<std::string, std::string> symbols = {
-    {"Add", "+"}, {"Sub", "-"}, {"Div", "/"}};
+    {"Add", "+"},
+    {"Sub", "-"},
+    {"Div", "/"},
+    {"FloorDiv", "//"},
+    {"Mult", "*"},
+    {"Mod", "%"}};
   auto symbol = symbols.find(op);
   const std::string message =
     symbol == symbols.end()
@@ -1068,9 +1705,13 @@ exprt dynamic_type_handler::build_isinstance_check(
     return build_equal(
       tagged_type_id, type_handler_.tagged_scalar_type_id(bool_type()));
 
+  // len() results are stored with size_t's type_id.
   if (type_name == "int")
-    return type_handler_.tagged_scalar_type_matches(
-      tagged_type_id, long_long_int_type());
+    return build_or(
+      type_handler_.tagged_scalar_type_matches(
+        tagged_type_id, long_long_int_type()),
+      build_equal(
+        tagged_type_id, type_handler_.tagged_scalar_type_id(size_type())));
 
   if (type_name == "float")
     return build_equal(
@@ -1107,6 +1748,60 @@ exprt dynamic_type_handler::build_isinstance_check(
     "dynamically-typed variable");
 }
 
+exprt dynamic_type_handler::build_len(
+  const exprt &tagged,
+  const locationt &location)
+{
+  if (!converter_.in_type_probe())
+  {
+    if (!converter_.can_emit_operand_statement())
+      throw std::runtime_error(
+        "len() of a dynamically-typed variable here is not yet supported");
+    exprt is_str = build_equal(
+      build_member(tagged, "type_id", size_type()),
+      type_handler_.tagged_scalar_type_id(pointer_typet(char_type())));
+    converter_.emit_guarded_raise(
+      build_not(is_str), "TypeError", "object has no len()", location);
+  }
+
+  const symbolt *strlen_func = converter_.symbol_table().find_symbol(
+    "c:@F@__python_scalar_strlen_bounded");
+  assert(
+    strlen_func && "__python_scalar_strlen_bounded not found in symbol table");
+  exprt chars = build_typecast(
+    build_member(tagged, "value", pointer_typet(empty_typet())),
+    pointer_typet(char_type()));
+  return build_typecast(
+    build_call_expr(*strlen_func, size_type(), {chars}), long_long_int_type());
+}
+
+exprt dynamic_type_handler::build_truthiness(const exprt &tagged)
+{
+  const symbolt *func =
+    converter_.symbol_table().find_symbol("c:@F@__python_scalar_truthy");
+  assert(func && "__python_scalar_truthy not found in symbol table");
+  exprt call = build_call_expr(
+    *func,
+    int_type(),
+    {build_address_of(tagged),
+     type_handler_.tagged_scalar_type_id(pointer_typet(char_type())),
+     type_handler_.tagged_scalar_type_id(double_type())});
+  return build_not(build_equal(call, from_integer(0, int_type())));
+}
+
+bool dynamic_type_handler::parameter_call_returns_tagged(
+  const nlohmann::json &call) const
+{
+  const nlohmann::json &module_body = converter_.ast()["body"];
+  const nlohmann::json function_node = json_utils::try_find_function(
+    module_body, converter_.current_function_name());
+  if (function_node.empty() || !function_node.contains("args"))
+    return false;
+  const argument_kinds kinds =
+    parameter_argument_kinds(call, function_node, module_body, 0);
+  return kinds.tagged > 0 && kinds.other == 0;
+}
+
 bool dynamic_type_handler::detect_dynamic_return_type(
   const nlohmann::json &function_node) const
 {
@@ -1138,10 +1833,149 @@ exprt dynamic_type_handler::build_tagged_value(
   target_block.copy_to_operands(tag_decl);
 
   for (const codet &instr :
-       build_tag_field_assigns(tag_symbol, value, location))
+       build_tag_field_assigns(build_symbol(tag_symbol), value, location))
     target_block.copy_to_operands(instr);
 
   return build_symbol(tag_symbol);
+}
+
+exprt dynamic_type_handler::build_numeric_conversion(
+  const exprt &tagged,
+  const typet &result_type,
+  const locationt &location)
+{
+  const bool to_float = result_type.is_floatbv();
+  const typet int_t = signedbv_typet(config.ansi_c.long_long_int_width);
+
+  // Built as a statement expression, so the operand, the ValueError and the
+  // parse run where Python evaluates the call: once, and only when reached
+  // (an and/or tail, a while test, a lambda body).
+  code_blockt block;
+  auto declare = [&](const std::string &name, const typet &type) {
+    symbolt &sym = converter_.create_tmp_symbol(location, name, type, exprt());
+    code_declt decl(build_symbol(sym));
+    decl.location() = location;
+    block.copy_to_operands(decl);
+    return build_symbol(sym);
+  };
+  auto assign = [&](const exprt &lhs, const exprt &rhs) {
+    code_assignt code(lhs, rhs);
+    code.location() = location;
+    return code;
+  };
+
+  exprt object = declare("$numeric_operand$", tagged.type());
+  block.copy_to_operands(assign(object, tagged));
+  exprt result = declare("$numeric_conversion$", result_type);
+
+  exprt type_id = build_member(object, "type_id", size_type());
+  exprt value = build_member(object, "value", pointer_typet(empty_typet()));
+
+  // The parse runs only on the str path: the models read a NUL-terminated
+  // string, which the bytes of an int or a float are not.
+  const symbolt *is_valid = converter_.symbol_table().find_symbol(
+    to_float ? "c:@F@__python_str_is_float" : "c:@F@__python_str_is_int");
+  const symbolt *parse = converter_.symbol_table().find_symbol(
+    to_float ? "c:@F@__python_str_to_float" : "c:@F@__python_int");
+  if (!is_valid || !parse)
+    throw std::runtime_error("str conversion models not in symbol table");
+
+  std::vector<exprt> parse_args{
+    build_typecast(value, pointer_typet(char_type()))};
+  if (!to_float)
+    parse_args.push_back(from_integer(10, int_type()));
+
+  auto raise_if = [&](
+                    code_blockt &target,
+                    const exprt &cond,
+                    const std::string &exception,
+                    const std::string &message) {
+    code_ifthenelset guard;
+    guard.cond() = cond;
+    guard.then_case() =
+      code_expressiont(converter_.get_exception_handler().gen_exception_raise(
+        exception, message));
+    guard.location() = location;
+    guard.location().property("skipped");
+    target.copy_to_operands(guard);
+  };
+
+  code_blockt from_str;
+  raise_if(
+    from_str,
+    build_not(build_call_expr(*is_valid, bool_type(), parse_args)),
+    "ValueError",
+    to_float ? "could not convert string to float"
+             : "invalid literal for int()");
+  from_str.copy_to_operands(
+    assign(result, build_call_expr(*parse, result_type, parse_args)));
+
+  // A bool is stored as an int (build_tag_field_assigns).
+  exprt is_float =
+    build_equal(type_id, type_handler_.tagged_scalar_type_id(double_type()));
+  // A float payload is read through its bits: a double-typed read of a
+  // pointer that may also target a str payload's bytes trips the solvers.
+  exprt as_int =
+    build_dereference(build_typecast(value, pointer_typet(int_t)), int_t);
+  expr2tc int2;
+  migrate_expr(as_int, int2);
+  exprt as_float =
+    migrate_expr_back(bitcast2tc(migrate_type(double_type()), int2));
+
+  code_blockt from_number;
+  if (to_float)
+    from_number.copy_to_operands(assign(
+      result,
+      build_if(is_float, as_float, build_typecast(as_int, result_type))));
+  else
+  {
+    expr2tc float2;
+    migrate_expr(as_float, float2);
+    raise_if(
+      from_number,
+      build_and(is_float, migrate_expr_back(isinf2tc(float2))),
+      "OverflowError",
+      "cannot convert float infinity to integer");
+    raise_if(
+      from_number,
+      build_and(is_float, migrate_expr_back(isnan2tc(float2))),
+      "ValueError",
+      "cannot convert float NaN to integer");
+    from_number.copy_to_operands(assign(
+      result,
+      build_if(is_float, build_typecast(as_float, result_type), as_int)));
+  }
+
+  code_ifthenelset dispatch;
+  dispatch.cond() = build_equal(
+    type_id, type_handler_.tagged_scalar_type_id(pointer_typet(char_type())));
+  dispatch.then_case() = from_str;
+  dispatch.else_case() = from_number;
+  dispatch.location() = location;
+  block.copy_to_operands(dispatch);
+
+  code_expressiont value_of(result);
+  value_of.location() = location;
+  block.copy_to_operands(value_of);
+
+  side_effect_exprt conversion("statement_expression", result_type);
+  conversion.copy_to_operands(block);
+  conversion.location() = location;
+  return conversion;
+}
+
+void dynamic_type_handler::refuse_float_tag_operation(
+  const exprt &lhs,
+  const exprt &rhs) const
+{
+  if (
+    !dynamic_type_detail::float_tags_possible() ||
+    type_handler_.is_string_type(lhs.type()) ||
+    type_handler_.is_string_type(rhs.type()))
+    return;
+  throw std::runtime_error(
+    "arithmetic or comparison on a dynamically-typed variable that may hold "
+    "a float is not yet supported");
 }
 
 void dynamic_type_handler::refuse_tagged_argument() const

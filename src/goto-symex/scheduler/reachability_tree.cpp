@@ -147,6 +147,11 @@ static void collect_address_taken(
 
   if (is_address_of2t(e))
     collect_object_root(to_address_of2t(e).ptr_obj, ns, globals, locals);
+  // symex takes the operand's address when it runs __ESBMC_old.
+  else if (
+    is_sideeffect2t(e) &&
+    to_sideeffect2t(e).kind == sideeffect2t::allockind::old_snapshot)
+    collect_object_root(to_sideeffect2t(e).operand, ns, globals, locals);
 
   e->foreach_operand([&](const expr2tc &sub) {
     collect_address_taken(sub, ns, globals, locals);
@@ -542,7 +547,9 @@ void reachability_treet::create_next_state()
       {new_state, scheduler_framet{}, next_thread_id});
 
     /* Make it active, make it follow on from previous state... */
-    if (new_state->get_active_state_number() != next_thread_id)
+    // Leaving a thread that has ended is not a preemption.
+    const unsigned int from = new_state->get_active_state_number();
+    if (from != next_thread_id && !new_state->threads_state[from].thread_ended)
       new_state->increment_context_switch();
 
     new_state->switch_to_thread(next_thread_id);
@@ -902,6 +909,7 @@ goto_symext::symex_resultt reachability_treet::get_next_formula()
   has_complete_formula = false;
   ++reduction_stats.schedules_explored;
 
+  get_cur_state().release_symex_caches();
   return get_cur_state().get_symex_result();
 }
 

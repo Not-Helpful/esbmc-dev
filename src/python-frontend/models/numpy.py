@@ -9,6 +9,8 @@ import math
 
 pi: float = math.pi
 e: float = math.e
+inf: float = math.inf
+nan: float = math.nan
 
 
 # Stubs for type inference.
@@ -185,6 +187,70 @@ def sinh(x: float) -> float:
     return math.sinh(x)
 
 
+def isnan(x: float) -> bool:
+    return math.isnan(x)
+
+
+def isinf(x: float) -> bool:
+    return math.isinf(x)
+
+
+def isfinite(x: float) -> bool:
+    return math.isfinite(x)
+
+
+def expm1(x: float) -> float:
+    return math.expm1(x)
+
+
+def log1p(x: float) -> float:
+    return math.log1p(x)
+
+
+def exp2(x: float) -> float:
+    return math.exp2(x)
+
+
+def arcsinh(x: float) -> float:
+    return math.asinh(x)
+
+
+def arccosh(x: float) -> float:
+    return math.acosh(x)
+
+
+def arctanh(x: float) -> float:
+    return math.atanh(x)
+
+
+def asinh(x: float) -> float:
+    return math.asinh(x)
+
+
+def acosh(x: float) -> float:
+    return math.acosh(x)
+
+
+def atanh(x: float) -> float:
+    return math.atanh(x)
+
+
+def cbrt(x: float) -> float:
+    return math.cbrt(x)
+
+
+def hypot(x: float, y: float) -> float:
+    return math.hypot(x, y)
+
+
+def arctan2(y: float, x: float) -> float:
+    return math.atan2(y, x)
+
+
+def atan2(y: float, x: float) -> float:
+    return math.atan2(y, x)
+
+
 def cosh(x: float) -> float:
     return math.cosh(x)
 
@@ -198,6 +264,9 @@ def rint(x: float) -> float:
 
 
 def remainder(x: float, y: float) -> float:
+    # NumPy's remainder by zero is NaN (with a warning), not an exception.
+    if y == 0.0:
+        return math.nan
     return x - (math.floor(x / y) * y)
 
 
@@ -236,10 +305,24 @@ def frexp(x: float) -> tuple[float, int]:
 def isclose(
     a: float,
     b: float,
-    rel_tol: float = 1e-09,
-    abs_tol: float = 0.0,
+    rtol: float = 1e-05,
+    atol: float = 1e-08,
+    equal_nan: bool = False,
 ) -> bool:
-    return math.isclose(a, b, rel_tol=rel_tol, abs_tol=abs_tol)
+    # NumPy's test is asymmetric in b, unlike math.isclose.
+    if a == b:
+        return True
+    if math.isnan(a) or math.isnan(b):
+        return equal_nan and math.isnan(a) and math.isnan(b)
+    if math.isinf(a) or math.isinf(b):
+        return False
+    diff: float = a - b
+    if diff < 0.0:
+        diff = -diff
+    scale: float = b
+    if scale < 0.0:
+        scale = -scale
+    return diff <= atol + rtol * scale
 
 
 def copysign(x: float, y: float) -> float:

@@ -39,16 +39,16 @@ void goto_convertt::finish_gotos(goto_programt &dest)
 
       auto goto_stack = it.second;
       const auto &label_stack = l_it->second.second;
-      auto unwind_to_size = label_stack.size();
-      if (unwind_to_size < goto_stack.size())
-      {
-        goto_programt destructor_code;
-        unwind_destructor_stack(
-          i.location, unwind_to_size, destructor_code, goto_stack);
-        dest.destructive_insert(it.first, destructor_code);
-        // This should leave iterators intact, as long as
-        // goto_programt::instructionst is std::list.
-      }
+      std::size_t common = 0;
+      while (common < goto_stack.size() && common < label_stack.size() &&
+             goto_stack[common] == label_stack[common])
+        ++common;
+
+      goto_programt edge_code;
+      unwind_destructor_stack(i.location, common, edge_code, goto_stack);
+      declare_skipped_locals(label_stack, common, i.location, edge_code);
+      // A jump to a label on the goto itself must run the edge code too
+      dest.insert_swap(it.first, edge_code);
     }
     else
     {
@@ -58,6 +58,49 @@ void goto_convertt::finish_gotos(goto_programt &dest)
   }
 
   targets.gotos.clear();
+}
+
+void goto_convertt::declare_skipped_locals(
+  const destructor_stackt &stack,
+  std::size_t from,
+  const locationt &location,
+  goto_programt &dest)
+{
+  // A jump into a block starts the lifetime of the locals whose declarations
+  // it skips, with indeterminate values (C11 6.2.4p6), so none may keep a
+  // previous lifetime's value.
+  for (std::size_t k = from; k < stack.size(); ++k)
+    if (stack[k].get_statement() == "dead")
+    {
+      code_declt decl(stack[k].op0());
+      decl.location() = location;
+      // mark_decl_as_non_det must give it a nondet value even when the
+      // symbol has an initializer: the jump bypasses that initializer.
+      decl.location().set("#skipped_init", true);
+      copy(decl, DECL, dest);
+    }
+}
+
+goto_programt::targett goto_convertt::case_entry(
+  goto_programt::targett target,
+  std::size_t switch_stack_size,
+  const locationt &location,
+  goto_programt &stubs)
+{
+  const auto it = targets.case_stacks.find(target);
+  if (it == targets.case_stacks.end() || it->second.size() <= switch_stack_size)
+    return target;
+
+  goto_programt stub;
+  declare_skipped_locals(it->second, switch_stack_size, location, stub);
+  if (stub.instructions.empty())
+    return target;
+  goto_programt::targett jump = stub.add_instruction();
+  jump->make_goto(target);
+  jump->location = location;
+  const goto_programt::targett entry = stub.instructions.begin();
+  stubs.destructive_append(stub);
+  return entry;
 }
 
 /// Rewrite "if(x) goto z; goto y; z:" into "if(!x) goto y;"
@@ -180,6 +223,7 @@ void goto_convertt::convert_switch_case(
     abort();
   }
 
+  const destructor_stackt stack = targets.destructor_stack;
   goto_programt tmp;
   convert(code.code(), tmp);
 
@@ -187,6 +231,7 @@ void goto_convertt::convert_switch_case(
   target->make_skip();
   target->location = code.code().location();
   dest.destructive_append(tmp);
+  targets.case_stacks[target] = stack;
 
   // default?
 
@@ -320,6 +365,31 @@ static void collect_whole_reads(const expr2tc &e, std::set<irep_idt> &sources)
     [&sources](const expr2tc &op) { collect_whole_reads(op, sources); });
 }
 
+static bool mentions_symbol(const exprt &e, const std::set<irep_idt> &ids)
+{
+  if (e.id() == "symbol" && ids.count(e.identifier()))
+    return true;
+  forall_operands (it, e)
+    if (mentions_symbol(*it, ids))
+      return true;
+  return false;
+}
+
+/// Whether \p e reads a local whose `dead` entry sits on \p stack above
+/// \p from, i.e. one that unwinding to \p from ends.
+static bool reads_unwound_local(
+  const exprt &e,
+  const std::vector<codet> &stack,
+  std::size_t from)
+{
+  std::set<irep_idt> dead;
+  for (std::size_t i = from; i < stack.size(); ++i)
+    if (stack[i].get_statement() == "dead")
+      dead.insert(destructor_entry_symbol(stack[i]));
+  dead.erase(irep_idt());
+  return !dead.empty() && mentions_symbol(e, dead);
+}
+
 /// The objects \p value is a bitwise copy of: the symbols it names and,
 /// transitively, those \p sideeffects assigns into them or into their parts
 /// (`H{C(1)}` lowers to `tmp$2 = { .c=tmp$1 }`).
@@ -451,13 +521,15 @@ void goto_convertt::convert_throw(const exprt &expr_in, goto_programt &dest)
   }
 
   // The exception object is initialised from the operand before any local is
-  // destroyed ([except.throw]p3), so `throw t.v` must not read t after ~T.
+  // destroyed ([except.throw]p3), so `throw t.v` must not read t after ~T,
+  // nor a Python `raise e` read `*e` after `DEAD e` (#9185).
   if (
     detached.empty() && !expr.operands().empty() &&
-    std::any_of(
-      stack.begin() + targets.throw_stack_size,
-      stack.end(),
-      is_destructor_entry))
+    (std::any_of(
+       stack.begin() + targets.throw_stack_size,
+       stack.end(),
+       is_destructor_entry) ||
+     reads_unwound_local(expr.op0(), stack, targets.throw_stack_size)))
   {
     const exprt operand = expr.op0();
     symbol_exprt value(new_tmp_symbol(operand.type()).id, operand.type());
@@ -1485,6 +1557,16 @@ void goto_convertt::convert_assign(
       abort();
     }
 
+    if (options.get_bool_option("validate-violation-witness"))
+    {
+      // Witness return waypoints are applied to the call's return temporary.
+      remove_function_call(rhs, dest, true);
+      code_assignt assignment(lhs, rhs);
+      assignment.location() = code.location();
+      convert_assign(assignment, dest);
+      return;
+    }
+
     Forall_operands (it, rhs)
       remove_sideeffects(*it, dest);
 
@@ -1815,10 +1897,12 @@ void goto_convertt::convert_for(const codet &code, goto_programt &dest)
   //-----------------------------
   //    A;
   // u: sideeffects in c
-  // v: if(!c) goto z;
+  // v: if(!c) goto z0;
+  //    DEADs of c's temporaries
   // w: P;
   // x: B;               <-- continue target
   // y: goto u;
+  // z0: DEADs of c's temporaries
   // z: ;                <-- break target
 
   // A;
@@ -1830,6 +1914,7 @@ void goto_convertt::convert_for(const codet &code, goto_programt &dest)
   exprt cond = tmp;
   goto_programt sideeffects;
 
+  const std::size_t stack_size = targets.destructor_stack.size();
   remove_condition_sideeffects(cond, sideeffects);
 
   // save break/continue targets
@@ -1846,6 +1931,10 @@ void goto_convertt::convert_for(const codet &code, goto_programt &dest)
   goto_programt tmp_z;
   goto_programt::targett z = tmp_z.add_instruction(SKIP);
   z->location = code.location();
+
+  // before B is converted, which pushes its own temporaries
+  v->make_goto(z);
+  kill_condition_temporaries(stack_size, code.location(), tmp_v, tmp_z);
 
   // do the x label
   goto_programt tmp_x;
@@ -1868,8 +1957,6 @@ void goto_convertt::convert_for(const codet &code, goto_programt &dest)
   targets.set_break(z);
   targets.set_continue(tmp_x.instructions.begin());
 
-  // v: if(!c) goto z;
-  v->make_goto(z);
   expr2tc tmp_cond;
   migrate_expr(cond, tmp_cond);
   tmp_cond = not2tc(tmp_cond);
@@ -1916,9 +2003,11 @@ void goto_convertt::convert_while(const codet &code, goto_programt &dest)
 
   //    while(c) P;
   //--------------------
-  // v: if(!c) goto z;
+  // v: if(!c) goto z0;
+  //    DEADs of c's temporaries
   // x: P;
   // y: goto v;          <-- continue target
+  // z0: DEADs of c's temporaries
   // z: ;                <-- break target
 
   // save break/continue targets
@@ -1931,7 +2020,10 @@ void goto_convertt::convert_while(const codet &code, goto_programt &dest)
   z->location = code.location();
 
   goto_programt tmp_branch;
-  generate_conditional_branch(gen_not(*cond), z, location, tmp_branch);
+  const std::size_t stack_size = targets.destructor_stack.size();
+  generate_conditional_branch(boolean_negate(*cond), z, location, tmp_branch);
+
+  kill_condition_temporaries(stack_size, location, tmp_branch, tmp_z);
 
   // do the v label
   goto_programt::targett v = tmp_branch.instructions.begin();
@@ -2127,11 +2219,13 @@ void goto_convertt::convert_switch(const codet &code, goto_programt &dest)
   targets.set_break(z);
   targets.set_default(z);
   targets.cases.clear();
+  targets.case_stacks.clear();
 
+  const std::size_t stack_size = targets.destructor_stack.size();
   goto_programt tmp;
   convert(to_code_switch(code).body(), tmp);
 
-  goto_programt tmp_cases;
+  goto_programt tmp_cases, stubs;
 
   for (auto &it : targets.cases)
   {
@@ -2143,7 +2237,7 @@ void goto_convertt::convert_switch(const codet &code, goto_programt &dest)
     case_guard(argument, case_ops, guard_expr);
 
     goto_programt::targett x = tmp_cases.add_instruction();
-    x->make_goto(it.first);
+    x->make_goto(case_entry(it.first, stack_size, code.location(), stubs));
     migrate_expr(guard_expr, x->guard);
     x->location = code.location();
     if (
@@ -2151,25 +2245,45 @@ void goto_convertt::convert_switch(const codet &code, goto_programt &dest)
       options.get_option("witness-output-yaml") != "")
       for (const auto &op : case_ops)
       {
+        // A GNU case range is named by its low bound.
         BigInt val;
-        if (!to_integer(op, val))
+        if (!to_integer(op.id() == "case_range" ? op.op0() : op, val))
           x->switch_case_ids.push_back(integer2string(val));
       }
   }
 
+  evaluate_unguarded_switch_value(argument, code.location(), tmp_cases);
+
   {
     goto_programt::targett d_jump = tmp_cases.add_instruction();
-    d_jump->make_goto(targets.default_target);
+    d_jump->make_goto(
+      case_entry(targets.default_target, stack_size, code.location(), stubs));
     d_jump->location = targets.default_target->location;
   }
 
   dest.destructive_append(sideeffects);
   dest.destructive_append(tmp_cases);
+  dest.destructive_append(stubs);
   dest.destructive_append(tmp);
   dest.destructive_append(tmp_z);
 
   // restore old targets
   old_targets.restore(targets);
+}
+
+// C11 6.8.4.2: the controlling expression is evaluated even when no case guard
+// reads it, so its checks (e.g. a NULL dereference) must still fire.
+void goto_convertt::evaluate_unguarded_switch_value(
+  const exprt &value,
+  const locationt &location,
+  goto_programt &dest)
+{
+  if (!targets.cases.empty())
+    return;
+
+  code_expressiont eval(value);
+  eval.location() = location;
+  copy(eval, OTHER, dest);
 }
 
 void goto_convertt::convert_break(const code_breakt &code, goto_programt &dest)
@@ -2523,7 +2637,7 @@ void goto_convertt::generate_ifthenelse(
   // v: if(!c) goto z/y;
   goto_programt tmp_v;
   generate_conditional_branch(
-    gen_not(guard), has_else ? y : z, location, tmp_v);
+    boolean_negate(guard), has_else ? y : z, location, tmp_v);
 
   // w: P;
   goto_programt tmp_w;
@@ -2584,19 +2698,12 @@ void goto_convertt::convert_ifthenelse(const codet &c, goto_programt &dest)
     return convert_ifthenelse(to_code(new_if0), dest);
   }
 
-  // convert 'then'-branch
-  goto_programt tmp_op1;
-  convert_controlled(to_code(code.op1()), tmp_op1);
-
-  goto_programt tmp_op2;
-
-  if (has_else)
-    convert_controlled(to_code(code.op2()), tmp_op2);
-
   exprt tmp_guard = code.op0();
 
   // for condition coverage
   // to keep the guard format
+  // The condition's temporaries go on the destructor stack before the
+  // branches convert, so a break or continue out of a branch ends them.
   if (
     !(options.get_bool_option("condition-coverage") ||
       options.get_bool_option("condition-coverage-claims") ||
@@ -2609,6 +2716,15 @@ void goto_convertt::convert_ifthenelse(const codet &c, goto_programt &dest)
     remove_condition_sideeffects(tmp_guard, dest);
     in_short_circuit = outer_short_circuit;
   }
+
+  // convert 'then'-branch
+  goto_programt tmp_op1;
+  convert_controlled(to_code(code.op1()), tmp_op1);
+
+  goto_programt tmp_op2;
+
+  if (has_else)
+    convert_controlled(to_code(code.op2()), tmp_op2);
 
   generate_ifthenelse(tmp_guard, tmp_op1, tmp_op2, location, dest);
 }
@@ -2668,10 +2784,11 @@ void goto_convertt::generate_conditional_branch(
   const locationt &location,
   goto_programt &dest)
 {
-  if (guard.id() == "not")
+  // Swap targets only for && or ||, which split below. Around any other
+  // condition, optimize_guarded_gotos refolds the swap into a goto marked
+  // flipped_guard, and witnesses then read its branch inverted (#9965).
+  if (guard.id() == "not" && (guard.op0().is_and() || guard.op0().is_or()))
   {
-    assert(guard.operands().size() == 1);
-    // swap targets
     generate_conditional_branch(
       guard.op0(), target_false, target_true, location, dest);
     return;
@@ -2711,7 +2828,8 @@ void goto_convertt::generate_conditional_branch(
     const bool outer_short_circuit = in_short_circuit;
     in_short_circuit = true;
     forall_expr_list (it, op)
-      generate_conditional_branch(gen_not(*it), target_false, location, dest);
+      generate_conditional_branch(
+        boolean_negate(*it), target_false, location, dest);
     in_short_circuit = outer_short_circuit;
 
     goto_programt::targett t_true = dest.add_instruction();
@@ -2779,6 +2897,33 @@ bool goto_convertt::destroy_full_expression_temporaries(
   unwind_destructor_stack(location, stack_size, dest);
   targets.destructor_stack.resize(stack_size);
   return true;
+}
+
+void goto_convertt::kill_condition_temporaries(
+  std::size_t stack_size,
+  const locationt &location,
+  goto_programt &branch,
+  goto_programt &exit)
+{
+  destructor_stackt &stack = targets.destructor_stack;
+  if (
+    stack.size() == stack_size ||
+    std::any_of(stack.begin() + stack_size, stack.end(), is_destructor_entry))
+    return;
+
+  goto_programt body_dead, exit_dead;
+  unwind_destructor_stack(location, stack_size, body_dead);
+  unwind_destructor_stack(location, stack_size, exit_dead);
+  stack.resize(stack_size);
+
+  // A user goto in the condition (a GNU statement expression) has no target
+  // until finish_gotos, and z lives in another list: compare instructions.
+  const goto_programt::instructiont *z = &exit.instructions.front();
+  for (auto &i : branch.instructions)
+    if (i.is_goto() && i.has_target() && &*i.targets.front() == z)
+      i.targets.front() = exit_dead.instructions.begin();
+  branch.destructive_append(body_dead);
+  exit.destructive_insert(exit.instructions.begin(), exit_dead);
 }
 
 void goto_convertt::unwind_destructor_stack(

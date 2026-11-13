@@ -13,7 +13,9 @@
 #include <pointer-analysis/value_set.h>
 #include <set>
 #include <stack>
+#include <unordered_map>
 #include <string>
+#include <utility>
 #include <irep2/irep2_guard.h>
 #include <util/base/i2string.h>
 #include <irep2/irep2.h>
@@ -109,6 +111,7 @@ public:
     variable_name_sett local_variables;
     // interval_domaint::interval_map; see snapshot_interval_domain
     std::shared_ptr<void> interval_snapshot;
+    BigInt stack_frame_total;
 
     explicit merge_statet(const goto_symex_statet &s)
       : num_instructions(s.num_instructions),
@@ -118,7 +121,8 @@ public:
         guard(s.guard),
         thread_id(s.source.thread_nr),
         level1_names(s.top().level1.current_names),
-        local_variables(s.top().local_variables)
+        local_variables(s.top().local_variables),
+        stack_frame_total(s.top().stack_frame_total)
     {
     }
 
@@ -131,7 +135,8 @@ public:
         thread_id(s.thread_id),
         level1_names(s.level1_names),
         local_variables(s.local_variables),
-        interval_snapshot(s.interval_snapshot)
+        interval_snapshot(s.interval_snapshot),
+        stack_frame_total(s.stack_frame_total)
     {
     }
 
@@ -208,8 +213,9 @@ public:
 
     /** Set of variables names that have been declared. Used to detect when we
      *  are in some kind of block that is entered then exited repeatedly -
-     *  whenever that happens, a new l1 name is required. This caches the
-     *  already seen names in a function for making that decision. */
+     *  whenever that happens, a new l1 name is required unless symex_decl
+     *  can reuse the dead one. This caches the already seen names in a
+     *  function for making that decision. */
     variable_name_sett declaration_history;
     /** Set of local variable l1 names. */
     variable_name_sett local_variables;
@@ -368,6 +374,8 @@ public:
   void rename(expr2tc &expr);
 
   void rename_type(expr2tc &expr);
+  /** rename_type for \p expr itself, not its operands. */
+  void rename_own_type(expr2tc &expr);
   void rename_array_sizes(type2tc &type);
 
   /**
@@ -523,19 +531,14 @@ public:
 
   /// witness_segs[seg]: all actionable waypoints per segment
   std::vector<std::vector<waypoint>> witness_segs;
-  size_t cur_seg;
-  /// Set to true the first time the target assertion is allowed through.
-  /// Subsequent assertions at the target line (from continuation calls after
-  /// the witness call chain returns) are filtered to avoid false positives.
-  bool witness_target_reached;
+  std::map<std::pair<waypoint::Type, irep_idt>, std::vector<size_t>>
+    witness_locations;
 
-  /// Pre-built O(1) lookup for branching(cycle) waypoints.
-  /// Maps line_id → direction_true (from wp.value == "true").
-  /// Populated at init time; queried on every forward-goto without touching
-  /// cur_seg (cycle branching is a persistent constraint, not a one-shot).
-  std::unordered_map<irep_idt, bool> cycle_branch_map;
-
-  void advance_witness_position();
+private:
+  /** Renamed shared subexpressions: original node -> (original, renamed). */
+  using renamed_exprst =
+    std::unordered_map<const expr2t *, std::pair<expr2tc, expr2tc>>;
+  void rename(expr2tc &expr, renamed_exprst &renamed);
 };
 
 #endif
