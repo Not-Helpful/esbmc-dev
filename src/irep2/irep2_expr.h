@@ -1668,9 +1668,19 @@ public:
       source->type->type_id != type2t::symbol_id &&
       source->type->type_id != type2t::pointer_id &&
       source->type->type_id != type2t::array_id)
+    {
+      if (!(
+        struct_union_get_component_number(source->type, memb).has_value() ==
+        (type->type_id != type2t::code_id)))
+      {
+        DBM_PRINT("HERE");
+        type->dump();
+        source->dump();
+      }
       assert(
         struct_union_get_component_number(source->type, memb).has_value() ==
         (type->type_id != type2t::code_id));
+    }
 #endif
   }
   member2t(const member2t &ref) = default;
