@@ -1664,8 +1664,6 @@ public:
        all is upstream, where a namespace is in hand --
        clang_cpp_adjust_irep2::adjust_cpp_member looks it up by name and asserts
        the symbol is code (docs/roadmap/frontends-to-irep2.md §76). */
-    //DBM_PRINT("LOOKHERE");
-    //DBM_PRINT(type->type_id << " == " << type2t::code_id);
     if (
       source->type->type_id != type2t::symbol_id &&
       source->type->type_id != type2t::pointer_id &&

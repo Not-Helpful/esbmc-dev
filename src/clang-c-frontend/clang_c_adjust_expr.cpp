@@ -1,3 +1,4 @@
+#include "debug_module.h"
 #include "irep/std_types.h"
 #include <clang-c-frontend/clang_c_adjust.h>
 #include <clang-c-frontend/clang_c_base_layout.h>
@@ -25,36 +26,34 @@ clang_c_adjust::clang_c_adjust(contextt &_context)
 {
 }
 
-// // NEW
-// void clang_c_adjust::adjust_incompletes(typet &type)
-// {
-//   if (type.incomplete())
-//   {
-//     symbolt *testsym_tag = context.find_symbol_by_base(type.tag());
-//     if (testsym_tag && !testsym_tag->get_type().incomplete())
-//     {
-//       if ((testsym_tag->get_type().identifier() == type.identifier()))
-//       {
-//         DBM_PRINT("TESTSYMDUMP");
-//         DBM_PRINT("id: " << testsym_tag->get_type().identifier());
-//         testsym_tag->get_type().dump();
-//         DBM_PRINT("TYPEDUMP");
-//         DBM_PRINT("id: " << type.identifier());
-//         type.dump();
-//       }
-//       type = testsym_tag->get_type();
-//     }
-//     if (type.is_struct() || type.is_union())
-//     {
-//       struct_union_typet::componentst &new_comp =
-//         to_struct_union_type(type).components();
-//       for (struct_union_typet::componentt &c : new_comp)
-//       {
-//         adjust_incompletes(c.type());
-//       }
-//     }
-//   }
-// }
+// Replace every embedded incomplete struct/union, wherever it sits in the
+// tree, with the complete definition from the context. Must run before any
+// adjust_type call, so every snapshot is of raw, unpadded clang output.
+void clang_c_adjust::fix_incompletes(irept &i)
+{
+  const bool inc_agg =
+    i.id() == "incomplete_struct" || i.id() == "incomplete_union" ||
+    ((i.id() == "struct" || i.id() == "union") && i.get_bool("#incomplete"));
+
+  if (inc_agg)
+  {
+    symbolt *s = context.find_symbol_by_base(i.get("tag"));
+    if (s && s->is_type && !s->get_type().incomplete())
+    {
+      log_debug("c++", "fix_incompletes: replacing {}", i.get("tag"));
+      i = s->get_type();
+      return;
+    }
+  }
+
+  // Unnamed children (operands of an expr)
+  for (irept &c : i.get_sub())
+    fix_incompletes(c);
+
+  // Named children: type, subtype, components, arguments, return_type, ...
+  for (auto &kv : i.get_named_sub())
+    fix_incompletes(kv.second);
+}
 
 bool clang_c_adjust::adjust()
 {
@@ -80,16 +79,47 @@ bool clang_c_adjust::adjust()
   context.Foreach_operand_in_order(
     [&symbol_list](symbolt &s) { symbol_list.push_back(&s); });
 
-  // Forall_symbol_list(it, symbol_list)
-  // {
-  //   symbolt &symbol = **it;
-  //   if (symbol.is_type)
-  //   {
-  //     typet t = symbol.get_type();
-  //     adjust_incompletes(t);
-  //     symbol.set_type(std::move(t));
-  //   }
-  // }
+  // 1. Type symbols first, so snapshots taken below are already fixed.
+  Forall_symbol_list(it, symbol_list)
+  {
+    symbolt &symbol = **it;
+    if (symbol.is_type)
+    {
+      typet t = symbol.get_type();
+      fix_incompletes(t);
+      symbol.set_type(std::move(t));
+    }
+  }
+
+  // 2. Types of everything else (variables, parameters, functions).
+  Forall_symbol_list(it, symbol_list)
+  {
+    symbolt &symbol = **it;
+    if (!symbol.is_type)
+    {
+      typet t = symbol.get_type();
+      fix_incompletes(t);
+      symbol.set_type(std::move(t));
+    }
+  }
+
+  // 3. Values (function bodies, initializers).
+  Forall_symbol_list(it, symbol_list)
+  {
+    symbolt &symbol = **it;
+    if (!symbol.get_value().is_nil())
+    {
+      exprt v = symbol.get_value();
+      fix_incompletes(v);
+      symbol.set_value(std::move(v));
+    }
+  }
+  Forall_symbol_list(it, symbol_list)
+  {
+    symbolt &s = **it;
+    if (s.id.as_string().find("@_Impl@F@_M_del#") != std::string::npos)
+      log_error("_M_del symbol: {} at {}", s.id, s.location);
+  }
 
   // Adjust types first, so that symbolic-type resolution always receives
   // fixed up types.
@@ -111,6 +141,13 @@ bool clang_c_adjust::adjust()
       continue;
 
     adjust_symbol(symbol);
+  }
+
+  Forall_symbol_list(it, symbol_list)
+  {
+    symbolt &s = **it;
+    if (s.id.as_string().find("@_Impl@F@_M_del#") != std::string::npos)
+      log_error("_M_del symbol: {} at {}", s.id, s.location);
   }
 
   return false;
@@ -271,6 +308,11 @@ void clang_c_adjust::adjust_struct(exprt &expr)
 {
   const typet &t = ns.follow(expr.type());
   /* can't be an initializer of an incomplete type, it's not allowed by C */
+  if (t.incomplete())
+  {
+    DBM_PRINT("HERE");
+    t.dump();
+  }
   assert(!t.incomplete());
 
   const struct_union_typet::componentst &new_comp =
@@ -1452,9 +1494,10 @@ void clang_c_adjust::adjust_side_effect_function_call(
   if (f_op.is_symbol())
   {
     const irep_idt &identifier = f_op.identifier();
-    if (exprt poly = declare_gcc_polymorphic_builtin(
-          to_symbol_expr(f_op), expr.arguments(), expr.location(), context);
-        poly.is_not_nil())
+    if (
+      exprt poly = declare_gcc_polymorphic_builtin(
+        to_symbol_expr(f_op), expr.arguments(), expr.location(), context);
+      poly.is_not_nil())
     {
       f_op = std::move(poly);
     }
