@@ -37,12 +37,11 @@ void clang_c_adjust::fix_incompletes(irept &i)
 
   if (inc_agg)
   {
-    symbolt *s = context.find_symbol_by_base(i.get("tag"));
+    const irep_idt id = "tag-" + id2string(i.get("tag"));
+    symbolt *s = context.find_symbol(id);
     if (s && s->is_type && !s->get_type().incomplete())
     {
-      log_debug("c++", "fix_incompletes: replacing {}", i.get("tag"));
       i = s->get_type();
-      return;
     }
   }
 
@@ -114,12 +113,6 @@ bool clang_c_adjust::adjust()
       symbol.set_value(std::move(v));
     }
   }
-  Forall_symbol_list(it, symbol_list)
-  {
-    symbolt &s = **it;
-    if (s.id.as_string().find("@_Impl@F@_M_del#") != std::string::npos)
-      log_error("_M_del symbol: {} at {}", s.id, s.location);
-  }
 
   // Adjust types first, so that symbolic-type resolution always receives
   // fixed up types.
@@ -147,7 +140,7 @@ bool clang_c_adjust::adjust()
   {
     symbolt &s = **it;
     if (s.id.as_string().find("@_Impl@F@_M_del#") != std::string::npos)
-      log_error("_M_del symbol: {} at {}", s.id, s.location);
+      s.dump();
   }
 
   return false;

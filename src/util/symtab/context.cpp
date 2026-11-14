@@ -58,6 +58,7 @@ symbolt *contextt::find_symbol_by_base(irep_idt base_name)
   for (const symbolt &s : symbols.get<by_id>())
     if (s.name == base_name)
       return const_cast<symbolt *>(&s);
+  return nullptr;
 }
 
 void contextt::check_duplicates() const
