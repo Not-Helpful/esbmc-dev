@@ -328,6 +328,7 @@ void clang_cpp_convertert::get_decl_name(
       }
     }
     clang_c_convertert::get_decl_name(nd, name, id);
+
     return;
   }
 
@@ -347,6 +348,10 @@ void clang_cpp_convertert::get_decl_name(
       std::string closure_name, closure_id;
       get_decl_name(*md->getParent(), closure_name, closure_id);
       id += "@" + closure_id;
+      if (id.find("@_Impl@F@_M_del#") != std::string::npos)
+      {
+        DBM_PRINT("FOUND1");
+      }
     }
     return;
   }
@@ -355,6 +360,10 @@ void clang_cpp_convertert::get_decl_name(
   if (!clang::index::generateUSRForDecl(&nd, DeclUSR))
   {
     id = DeclUSR.str().str() + usr_gap_suffix(nd, *ASTContext) + id_suffix;
+    if (id.find("@_Impl@F@_M_del#") != std::string::npos)
+    {
+      DBM_PRINT("FOUND2");
+    }
     return;
   }
 
@@ -618,7 +627,6 @@ bool clang_cpp_convertert::get_struct_union_class_methods_decls(
     llvm::dyn_cast<clang::CXXRecordDecl>(&recordd);
   if (cxxrd == nullptr)
     return false;
-  
 
   /*
    * Order of converting methods:
