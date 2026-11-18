@@ -29,10 +29,12 @@
 #include <goto-programs/goto_convert_functions.h>
 #include <goto-programs/goto_inline.h>
 #include <goto-programs/goto_k_induction.h>
+#include <goto-programs/scalarize_structs.h>
 #include <goto-programs/goto_termination.h>
 #include <esbmc/ranking_synthesis.h>
 #include <esbmc/non_termination.h>
 #include <goto-programs/goto_loop_simplify.h>
+#include <goto-programs/goto_array_loop_summary.h>
 #include <goto-programs/goto_invariant_synthesis.h>
 #include <goto-programs/goto_loop_invariant.h>
 #include <goto-programs/abstract-interpretation/interval_analysis.h>
@@ -357,6 +359,23 @@ should_check_after_violation(const optionst &options, bool is_coverage)
          options.get_bool_option("validate-violation-witness");
 }
 
+// Under --termination, goto_termination does its own havoc, so
+// goto_k_induction must not also run (#6031). Witness validation forces the
+// k-induction option, so under --incremental-bmc the strategy runs an
+// inductive step that needs the havoc too (#10640).
+static bool needs_k_induction_havoc(
+  const cmdlinet &cmdline,
+  const optionst &options,
+  bool ts_strategy)
+{
+  if (options.get_bool_option("termination"))
+    return false;
+  return cmdline.isset("inductive-step") || cmdline.isset("k-induction") ||
+         cmdline.isset("k-induction-parallel") || ts_strategy ||
+         (cmdline.isset("validate-correctness-witness") &&
+          options.get_bool_option("incremental-bmc"));
+}
+
 bool esbmc_parseoptionst::process_goto_program(
   optionst &options,
   goto_functionst &goto_functions)
@@ -475,6 +494,23 @@ bool esbmc_parseoptionst::process_goto_program(
       cmdline.isset("condition-coverage-claims-rm"))
       remove_unreachable(goto_functions, checks_past_violation);
 
+    // Before --goto-unwind unrolls the loops, interval analysis and
+    // k-induction see them, and goto_check instruments the iteration the
+    // summary keeps. The uninitialised-variable check would read the lambda's
+    // unwritten elements, C has no lambda for --goto2c to print, and coverage
+    // and loop invariants are about the loop the summary removes.
+    if (
+      !cmdline.isset("no-summarize-array-loops") &&
+      !cmdline.isset("uninitialised-vars-check") && !cmdline.isset("goto2c") &&
+      !is_coverage && !cmdline.isset("loop-invariant") &&
+      !cmdline.isset("loop-invariant-check") &&
+      goto_array_loop_summary(
+        goto_functions,
+        context,
+        options,
+        cmdline.isset("summarize-array-loops")))
+      options.set_option("array-loops-summarised", true);
+
     // Apply all the initialized algorithms
     for (auto &algorithm : goto_preprocess_algorithms)
     {
@@ -508,6 +544,8 @@ bool esbmc_parseoptionst::process_goto_program(
       unreported_exceptions(options),
       python_checked_exceptions(options));
 
+    scalarize_structs(goto_functions, context, options);
+
     // do partial inlining
     if (!cmdline.isset("no-inlining"))
     {
@@ -520,12 +558,8 @@ bool esbmc_parseoptionst::process_goto_program(
     if (cmdline.isset("gcse"))
       apply_gcse(goto_functions, context, cmdline);
 
-    // Under --termination, goto_termination does its own havoc, so
-    // goto_k_induction must not also run (#6031).
     bool is_k_induction =
-      (cmdline.isset("inductive-step") || cmdline.isset("k-induction") ||
-       cmdline.isset("k-induction-parallel") || ts_strategy_requested()) &&
-      !options.get_bool_option("termination");
+      needs_k_induction_havoc(cmdline, options, ts_strategy_requested());
 
     // --termination reuses k-induction's havoc machinery via
     // goto_termination, so the post-havoc invariant injection applies

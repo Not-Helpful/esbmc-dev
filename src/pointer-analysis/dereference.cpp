@@ -1129,6 +1129,27 @@ expr2tc dereferencet::accessed_object(
   return get_base_object(object);
 }
 
+/* The offset of @p ptr in @p root, where same_object(ptr, &root) holds. For a
+ * pointer made from an integer that is the integer minus root's address, which
+ * spares the solver the int-to-pointer object search (#9785). Relies on
+ * smt_solver_baset::convert_typecast_to_ptr giving such a pointer the offset
+ * integer - start. */
+static expr2tc offset_within(const expr2tc &ptr, const expr2tc &root)
+{
+  const type2tc offset_type = get_int_type(config.ansi_c.address_width);
+  const expr2tc *e = &ptr;
+  while (is_typecast2t(*e) && is_pointer_type(to_typecast2t(*e).from))
+    e = &to_typecast2t(*e).from;
+  if (!is_typecast2t(*e) || !is_bv_type(to_typecast2t(*e).from))
+    return pointer_offset2tc(offset_type, ptr);
+
+  const expr2tc address = typecast2tc(ptraddr_type2(), to_typecast2t(*e).from);
+  const expr2tc root_address = typecast2tc(
+    ptraddr_type2(), address_of2tc(pointer_type2tc(root->type), root));
+  return typecast2tc(
+    offset_type, sub2tc(ptraddr_type2(), address, root_address));
+}
+
 expr2tc dereferencet::build_reference_to(
   const expr2tc &what,
   modet mode,
@@ -1231,8 +1252,7 @@ expr2tc dereferencet::build_reference_to(
       alignment = 1;
     }
 
-    final_offset =
-      pointer_offset2tc(get_int_type(config.ansi_c.address_width), deref_expr);
+    final_offset = offset_within(deref_expr, o.get_root_object());
     final_offset = sub2tc(
       final_offset->type,
       final_offset,
@@ -3366,12 +3386,8 @@ void dereferencet::valid_check(
   if (is_constant_string2t(symbol))
   {
     // always valid, but can't write
-
     if (is_write(mode))
-    {
-      dereference_failure(
-        "pointer dereference", "write access to string constant", guard);
-    }
+      read_only_write_check(object, guard);
   }
   else if (is_nil_expr(symbol))
   {
@@ -3432,19 +3448,36 @@ void dereferencet::valid_check(
         return;
       }
 
-      /* Writes to globals of const-qualified type are not allowed either. */
-      if (
-        is_write(mode) && sym.static_lifetime && sym.get_type().cmt_constant())
-      {
-        dereference_failure(
-          "pointer dereference",
-          "write access to const object `" +
-            get_pretty_name(sym.id.as_string()) + "'",
-          guard);
-        return;
-      }
+      if (is_write(mode))
+        read_only_write_check(object, guard);
     }
   }
+}
+
+bool dereferencet::is_read_only(const expr2tc &object, const namespacet &ns)
+{
+  const expr2tc &symbol = get_symbol(object);
+  if (is_constant_string2t(symbol))
+    return true;
+  const symbolt *sym =
+    is_symbol2t(symbol) ? ns.lookup(to_symbol2t(symbol).thename) : nullptr;
+  return sym != nullptr && is_const_static(*sym);
+}
+
+void dereferencet::read_only_write_check(
+  const expr2tc &object,
+  const guard2tc &guard)
+{
+  if (!is_read_only(object, ns))
+    return;
+  const expr2tc &symbol = get_symbol(object);
+  dereference_failure(
+    "pointer dereference",
+    is_constant_string2t(symbol)
+      ? "write access to string constant"
+      : "write access to const object `" +
+          get_pretty_name(to_symbol2t(symbol).thename.as_string()) + "'",
+    guard);
 }
 
 // True when `obj`'s base object is a heap allocation (malloc/calloc/realloc):
