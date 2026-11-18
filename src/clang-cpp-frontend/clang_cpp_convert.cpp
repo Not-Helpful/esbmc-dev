@@ -239,6 +239,43 @@ usr_gap_suffix(const clang::Decl &decl, const clang::ASTContext &ctx)
   return has_nullptr || args.find("::*") != std::string::npos ? "#" + args : "";
 }
 
+// NEW
+static bool
+has_lambda_template_arg(llvm::ArrayRef<clang::TemplateArgument> args)
+{
+  for (const clang::TemplateArgument &arg : args)
+  {
+    if (arg.getKind() == clang::TemplateArgument::Pack)
+    {
+      if (has_lambda_template_arg(arg.getPackAsArray()))
+        return true;
+    }
+    else if (arg.getKind() == clang::TemplateArgument::Type)
+    {
+      const auto *rd = arg.getAsType()->getAsCXXRecordDecl();
+      if (rd && rd->isLambda())
+        return true;
+    }
+  }
+  return false;
+}
+
+// NEW
+// Is `rd` a closure, or nested in a specialisation over one?
+static bool in_lambda_context(const clang::CXXRecordDecl &rd)
+{
+  if (rd.isLambda())
+    return true;
+  for (const clang::DeclContext *dc = rd.getDeclContext(); dc;
+       dc = dc->getParent())
+    if (
+      const auto *cs =
+        llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(dc))
+      if (has_lambda_template_arg(cs->getTemplateArgs().asArray()))
+        return true;
+  return false;
+}
+
 void clang_cpp_convertert::get_decl_name(
   const clang::NamedDecl &nd,
   std::string &name,
@@ -343,15 +380,11 @@ void clang_cpp_convertert::get_decl_name(
      * above and need none -- their USR spells the class "(lambda at f:l:c)". */
     if (
       const auto *md = llvm::dyn_cast<clang::CXXMethodDecl>(&nd);
-      md && md->getParent()->isLambda())
+      md && in_lambda_context(*md->getParent()))
     {
       std::string closure_name, closure_id;
       get_decl_name(*md->getParent(), closure_name, closure_id);
-      id += "@" + closure_id;
-      if (id.find("@_Impl@F@_M_del#") != std::string::npos)
-      {
-        DBM_PRINT("FOUND1");
-      }
+      id += "@" + closure_id + "@";
     }
     return;
   }
@@ -360,10 +393,6 @@ void clang_cpp_convertert::get_decl_name(
   if (!clang::index::generateUSRForDecl(&nd, DeclUSR))
   {
     id = DeclUSR.str().str() + usr_gap_suffix(nd, *ASTContext) + id_suffix;
-    if (id.find("@_Impl@F@_M_del#") != std::string::npos)
-    {
-      DBM_PRINT("FOUND2");
-    }
     return;
   }
 
@@ -380,6 +409,7 @@ void clang_cpp_convertert::get_decl_name(
   log_error("{}", oss.str());
   abort();
 }
+
 bool clang_cpp_convertert::get_type(
   const clang::QualType &q_type,
   typet &new_type)
