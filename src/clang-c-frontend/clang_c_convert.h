@@ -1,6 +1,8 @@
 #ifndef CLANG_C_FRONTEND_CLANG_C_CONVERT_H_
 #define CLANG_C_FRONTEND_CLANG_C_CONVERT_H_
 
+#include "clang/AST/TemplateBase.h"
+#include "llvm/ADT/ArrayRef.h"
 #define __STDC_LIMIT_MACROS
 #define __STDC_FORMAT_MACROS
 
@@ -128,7 +130,14 @@ protected:
   std::unordered_map<const clang::Expr *, exprt> vla_size_snapshots;
   bool snapshot_vla_sizes(const clang::Decl &decl, codet &dest);
   bool get_vla_size(const clang::Expr &size, exprt &new_expr);
+  void collect_local_decls(
+    llvm::ArrayRef<clang::TemplateArgument> args,
+    std::vector<const clang::NamedDecl *> &out);
+  void collect_local_decls(
+    clang::QualType t,
+    std::vector<const clang::NamedDecl *> &out);
 
+  std::string identifier_suffix(const std::string &text);
   clang::SourceManager *sm;
 
   const clang::FunctionDecl *current_functionDecl;

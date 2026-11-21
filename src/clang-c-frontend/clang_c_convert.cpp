@@ -453,14 +453,12 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
   sym = context.find_symbol(id);
   assert(sym && "symbol disappeared from context during field conversion");
 
-
   /* Recursive field conversion can re-enter this record and complete it.
    * The incomplete flag is removed only after all fields and methods have
    * been processed, so a complete type here means another invocation has
    * already completed this type. */
   if (!holds_incomplete_record(sym->get_type()))
     return false;
-
 
   sym->set_type(t);
   sym = context.reorder_symbol_to_back(id);
@@ -476,7 +474,6 @@ bool clang_c_convertert::get_struct_union_class(const clang::RecordDecl &rd)
     t.remove(irept::a_incomplete);
     sym->set_type(std::move(t));
   }
-
 
   return false;
 }
@@ -1466,8 +1463,9 @@ bool clang_c_convertert::get_type(const clang::Type &the_type, typet &new_type)
 #if CLANG_VERSION_MAJOR >= 22
   case clang::Type::PredefinedSugar:
   {
-    if (get_type(
-          *the_type.getLocallyUnqualifiedSingleStepDesugaredType(), new_type))
+    if (
+      get_type(
+        *the_type.getLocallyUnqualifiedSingleStepDesugaredType(), new_type))
       return true;
     break;
   }
@@ -2801,8 +2799,9 @@ bool clang_c_convertert::get_expr(const clang::Stmt &stmt, exprt &new_expr)
     clang::QualType qtype = function_call.getCallReturnType(*ASTContext);
     // Sema types a custom-typechecked builtin's call itself: on an unsigned
     // char, __sync_fetch_and_add calls the char-returning _1 variant.
-    if (const unsigned id = function_call.getBuiltinCallee();
-        id && ASTContext->BuiltinInfo.hasCustomTypechecking(id))
+    if (
+      const unsigned id = function_call.getBuiltinCallee();
+      id && ASTContext->BuiltinInfo.hasCustomTypechecking(id))
       qtype = function_call.getType();
     if (get_type(qtype, type))
       return true;
@@ -5489,11 +5488,7 @@ getFullyQualifiedName(const clang::QualType &t, const clang::ASTContext &c)
 // Function-local declarations reachable from template arguments. Their
 // printed names omit the enclosing function, so a specialisation over one
 // prints like a specialisation over any other of the same name.
-static void collect_local_decls(
-  llvm::ArrayRef<clang::TemplateArgument> args,
-  std::vector<const clang::NamedDecl *> &out);
-
-static void collect_local_decls(
+void clang_c_convertert::collect_local_decls(
   clang::QualType t,
   std::vector<const clang::NamedDecl *> &out)
 {
@@ -5533,7 +5528,7 @@ static void collect_local_decls(
     collect_local_decls(cs->getTemplateArgs().asArray(), out);
 }
 
-static void collect_local_decls(
+void clang_c_convertert::collect_local_decls(
   llvm::ArrayRef<clang::TemplateArgument> args,
   std::vector<const clang::NamedDecl *> &out)
 {
@@ -5557,7 +5552,7 @@ static void collect_local_decls(
 
 // Keeps a record name identifier-shaped: goto2c prints it as a C tag, and
 // reformat_class_name splits it on ':'.
-static std::string identifier_suffix(const std::string &text)
+std::string clang_c_convertert::identifier_suffix(const std::string &text)
 {
   std::string out;
   for (char c : text)
@@ -6124,8 +6119,9 @@ bool clang_c_convertert::process_record_layout_attributes(
     }
 
     case clang::attr::Aligned:
-      if (process_aligned_attribute(
-            static_cast<const clang::AlignedAttr &>(*attr), t))
+      if (
+        process_aligned_attribute(
+          static_cast<const clang::AlignedAttr &>(*attr), t))
         return true;
       break;
 

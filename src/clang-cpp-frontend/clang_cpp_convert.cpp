@@ -260,7 +260,6 @@ has_lambda_template_arg(llvm::ArrayRef<clang::TemplateArgument> args)
   return false;
 }
 
-// NEW
 // Is `rd` a closure, or nested in a specialisation over one?
 static bool in_lambda_context(const clang::CXXRecordDecl &rd)
 {
@@ -268,26 +267,11 @@ static bool in_lambda_context(const clang::CXXRecordDecl &rd)
     return true;
   for (const clang::DeclContext *dc = rd.getDeclContext(); dc;
        dc = dc->getParent())
-    if (
-      const auto *cs =
-        llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(dc))
+    if (const auto *cs =
+          llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(dc))
       if (has_lambda_template_arg(cs->getTemplateArgs().asArray()))
         return true;
   return false;
-}
-
-static clang::Decl in_lambda_context(const clang::CXXRecordDecl &rd)
-{
-  if (rd.isLambda())
-    return rd;
-  for (const clang::DeclContext *dc = rd.getDeclContext(); dc;
-       dc = dc->getParent())
-    if (
-      const auto *cs =
-        llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(dc))
-      if (has_lambda_template_arg(cs->getTemplateArgs().asArray()))
-        return dc;
-  return nullptr;
 }
 
 void clang_cpp_convertert::get_decl_name(
@@ -396,10 +380,20 @@ void clang_cpp_convertert::get_decl_name(
       const auto *md = llvm::dyn_cast<clang::CXXMethodDecl>(&nd);
       md && in_lambda_context(*md->getParent()))
     {
-      std::string closure_name, closure_id;
-      get_decl_name(
-        get_lambda_context(*md->getParent()), closure_name, closure_id);
-      id += "@" + closure_id;
+      std::vector<const clang::NamedDecl *> locals;
+      for (const clang::DeclContext *dc = md->getParent(); dc;
+           dc = dc->getParent())
+        if (
+          const auto *cs =
+            llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(dc))
+          clang_c_convertert::collect_local_decls(
+            cs->getTemplateArgs().asArray(), locals);
+      for (const clang::NamedDecl *local : locals)
+      {
+        std::string local_name, local_id;
+        get_decl_name(*local, local_name, local_id);
+        id += "_of_" + clang_c_convertert::identifier_suffix(local_id);
+      }
     }
     return;
   }
