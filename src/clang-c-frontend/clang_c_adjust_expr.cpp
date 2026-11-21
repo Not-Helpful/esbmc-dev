@@ -296,7 +296,7 @@ void clang_c_adjust::adjust_struct(exprt &expr)
   /* can't be an initializer of an incomplete type, it's not allowed by C */
   if (t.incomplete())
   {
-    DBM_PRINT("HERE");
+    //DBM_PRINT("HERE");
     t.dump();
   }
   assert(!t.incomplete());

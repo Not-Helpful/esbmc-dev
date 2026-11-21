@@ -276,6 +276,20 @@ static bool in_lambda_context(const clang::CXXRecordDecl &rd)
   return false;
 }
 
+static clang::Decl in_lambda_context(const clang::CXXRecordDecl &rd)
+{
+  if (rd.isLambda())
+    return rd;
+  for (const clang::DeclContext *dc = rd.getDeclContext(); dc;
+       dc = dc->getParent())
+    if (
+      const auto *cs =
+        llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(dc))
+      if (has_lambda_template_arg(cs->getTemplateArgs().asArray()))
+        return dc;
+  return nullptr;
+}
+
 void clang_cpp_convertert::get_decl_name(
   const clang::NamedDecl &nd,
   std::string &name,
@@ -383,8 +397,9 @@ void clang_cpp_convertert::get_decl_name(
       md && in_lambda_context(*md->getParent()))
     {
       std::string closure_name, closure_id;
-      get_decl_name(*md->getParent(), closure_name, closure_id);
-      id += "@" + closure_id + "@";
+      get_decl_name(
+        get_lambda_context(*md->getParent()), closure_name, closure_id);
+      id += "@" + closure_id;
     }
     return;
   }
