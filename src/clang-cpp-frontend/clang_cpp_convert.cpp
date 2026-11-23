@@ -267,8 +267,9 @@ static bool in_lambda_context(const clang::CXXRecordDecl &rd)
     return true;
   for (const clang::DeclContext *dc = rd.getDeclContext(); dc;
        dc = dc->getParent())
-    if (const auto *cs =
-          llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(dc))
+    if (
+      const auto *cs =
+        llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(dc))
       if (has_lambda_template_arg(cs->getTemplateArgs().asArray()))
         return true;
   return false;
@@ -371,6 +372,7 @@ void clang_cpp_convertert::get_decl_name(
     clang_c_convertert::get_decl_name(nd, name, id);
     if (id.rfind("c:", 0) == 0)
       id += usr_gap_suffix(nd, *ASTContext);
+
     /* A lambda's operator(), __invoke and conversion-operator USRs name the
      * enclosing specialisation but not the closure, so siblings in one
      * instantiation share an id and the last body converted wins (#7499); the
