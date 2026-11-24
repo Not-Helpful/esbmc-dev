@@ -5,15 +5,15 @@ cd build/latest/
 ninja -v src/esbmc/esbmc
 cd ./../../
 
-./build/latest/src/esbmc/esbmc ./suspects/lambdas.cpp \
-                                                    --no-library \
-                                                    --std=c++20
+# ./build/latest/src/esbmc/esbmc ./suspects/vptr_members.cpp \
+#                                                     --no-library \
+#                                                     --std=c++20
 
-# echo "HPX TEST"
-# cd $HOME/.repos/writing/hpx_memory_usage_bug/
-# # ./build.sh
+echo "HPX TEST"
+cd $HOME/.repos/writing/hpx_memory_usage_bug/
+# ./build.sh
 
-# ./test.sh
+./test.sh
 
 
 # cd build/latest/

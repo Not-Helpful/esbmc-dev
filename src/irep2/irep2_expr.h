@@ -1697,9 +1697,9 @@ public:
         struct_union_get_component_number(source->type, memb).has_value() ==
         (type->type_id != type2t::code_id)))
       {
-        // DBM_PRINT("HERE");
-        // type->dump();
-        // source->dump();
+        DBM_PRINT("HERE");
+        type->dump();
+        source->dump();
       }
       assert(
         struct_union_get_component_number(source->type, memb).has_value() ==
