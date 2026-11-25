@@ -1698,8 +1698,12 @@ public:
         (type->type_id != type2t::code_id)))
       {
         DBM_PRINT("HERE");
+        DBM_PRINT("TYPE");
         type->dump();
+        DBM_PRINT("SOURCE");
         source->dump();
+        DBM_PRINT("MEMB");
+        DBM_PRINT(memb);
       }
       assert(
         struct_union_get_component_number(source->type, memb).has_value() ==

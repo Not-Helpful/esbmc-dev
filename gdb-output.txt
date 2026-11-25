@@ -8330,3 +8330,13 @@ Temporary breakpoint 1.1, main (argc=3, argv=0x7fffffffd4b8)
 188	  std::fesetround(FE_TONEAREST);
 Breakpoint 2 at 0x555555f44704: get_decl_name. (3 locations)
 [Inferior 1 (process 5029) exited normally]
+warning: Currently logging to gdb-output.txt.  Turn the logging off and on to make the new setting effective.
+Temporary breakpoint 1 at 0x6f5e9: main. (2 locations)
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/libthread_db.so.1".
+
+Temporary breakpoint 1.1, main (argc=3, argv=0x7fffffffd4b8) at /home/helpful/.repos/esbmc-dev/src/esbmc/main.cpp:188
+188	  std::fesetround(FE_TONEAREST);
+Breakpoint 2 at 0x555555f44814: get_decl_name. (3 locations)
+Quit
+Quit
