@@ -54,6 +54,7 @@ void clang_c_adjust::fix_incompletes(irept &i)
     fix_incompletes(kv.second);
 }
 
+
 bool clang_c_adjust::adjust()
 {
   // migrate_expr and migrate_type resolve a symbol through this thread-local

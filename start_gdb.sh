@@ -16,6 +16,7 @@ cd ./../../
 
 gdb \
     -x debug.gdb \
+    -ex "quit" \
       --args $HOME/.repos/esbmc-dev/build/latest/src/esbmc/esbmc \
         ../writing/hpx_memory_usage_bug/bug.cpp \
         -I $INSTALLS/hpx/built-with-clang-24/include/ \

@@ -4401,6 +4401,7 @@ void clang_c_convertert::convert_derived_to_base(
     // yet; fall back to the plain typecast (handled below).
     if (spec->isVirtual() || !base_decl)
     {
+      // DBM_PRINT("[routed=false] virtual/nodecl");
       routed = false;
       break;
     }
@@ -4409,6 +4410,7 @@ void clang_c_convertert::convert_derived_to_base(
     const symbolt *base_sym = context.find_symbol(base_id);
     if (!base_sym)
     {
+      // DBM_PRINT("[routed=false] no symbol: " << base_id);
       routed = false;
       break;
     }
@@ -4419,13 +4421,36 @@ void clang_c_convertert::convert_derived_to_base(
     // legacy flattened layout, so fall back to the plain typecast there.
     const typet cur_struct =
       ns.follow(ptr_mode ? cur.type().subtype() : cur.type());
+    // if (
+    //   cur_struct.tag() ==
+    //   "struct "
+    //   "stdexec::__any::__interface_base<stdexec::__any::__iequality_"
+    //   "comparable,"
+    //   " stdexec::__any::__iroot, stdexec::__any::__extends<>, 24, 8>" &&
+    //   !cur_struct.incomplete()
+    // )
+    // {
+    //   // DBM_PRINT("TEST555");
+    // }
     if (
       !cur_struct.is_struct() ||
       !to_struct_type(cur_struct).has_component(comp))
     {
+      // if ("@base@tag-struct stdexec::__any::__iroot" == id2string(comp))
+      // {
+      //   DBM_PRINT(cur_struct.tag());
+      //   DBM_PRINT(
+      //     "[routed=false] want "
+      //     << comp << " | is_struct=" << cur_struct.is_struct()
+      //     << " | incomplete=" << cur_struct.incomplete());
+      //   if (cur_struct.is_struct())
+      //     for (const auto &c : to_struct_type(cur_struct).components())
+      //       DBM_PRINT("   comp: " << c.name());
+      // }
       routed = false;
       break;
     }
+
     if (ptr_mode)
     {
       // dereference_exprt(op, tp) types the node tp.subtype(): tp is the

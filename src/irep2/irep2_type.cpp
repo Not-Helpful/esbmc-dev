@@ -489,8 +489,8 @@ struct_union_get_component_number(const type2tc &t, const irep_idt &comp)
   unsigned int i = 0, count = 0, pos = 0;
   for (const irep_idt &it : names)
   {
-    DBM_PRINT("CHECKING");
-    DBM_PRINT(it << " == " << comp);
+    //DBM_PRINT("CHECKING");
+    //DBM_PRINT(it << " == " << comp);
     if (it == comp)
     {
       pos = i;
