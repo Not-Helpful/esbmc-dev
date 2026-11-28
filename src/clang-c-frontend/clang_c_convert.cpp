@@ -4769,6 +4769,9 @@ bool clang_c_convertert::get_cast_expr(
   }
 
   new_expr = expr;
+  DBM_PRINT(
+    "[gce] kind=" << (int)cast.getCastKind() << " out.id=" << expr.id()
+                  << " out.type=" << expr.type().id());
   return false;
 }
 
