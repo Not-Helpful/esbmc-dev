@@ -4382,6 +4382,9 @@ void clang_c_convertert::convert_derived_to_base(
   bool checked,
   bool operand_is_pure)
 {
+  DBM_PRINT(
+    "[d2b] enter path=" << (path_end - path_begin) << " checked=" << checked
+                        << " type=" << expr.type().pretty());
   // Route the derived->base conversion structurally through the nested
   // base-subobject components ("@base@<id>") added by
   // get_base_components_methods, rather than adjusting a byte offset. For a
@@ -4401,7 +4404,8 @@ void clang_c_convertert::convert_derived_to_base(
     // yet; fall back to the plain typecast (handled below).
     if (spec->isVirtual() || !base_decl)
     {
-      // DBM_PRINT("[routed=false] virtual/nodecl");
+      DBM_PRINT("[routed=false] virtual/nodecl");
+      DBM_PRINT("1");
       routed = false;
       break;
     }
@@ -4410,7 +4414,8 @@ void clang_c_convertert::convert_derived_to_base(
     const symbolt *base_sym = context.find_symbol(base_id);
     if (!base_sym)
     {
-      // DBM_PRINT("[routed=false] no symbol: " << base_id);
+      DBM_PRINT("[routed=false] no symbol: " << base_id);
+      DBM_PRINT("2");
       routed = false;
       break;
     }
@@ -4436,16 +4441,15 @@ void clang_c_convertert::convert_derived_to_base(
       !cur_struct.is_struct() ||
       !to_struct_type(cur_struct).has_component(comp))
     {
-      // if ("@base@tag-struct stdexec::__any::__iroot" == id2string(comp))
+      // if (cur_struct.is_struct())
       // {
-      //   DBM_PRINT(cur_struct.tag());
-      //   DBM_PRINT(
-      //     "[routed=false] want "
-      //     << comp << " | is_struct=" << cur_struct.is_struct()
-      //     << " | incomplete=" << cur_struct.incomplete());
-      //   if (cur_struct.is_struct())
-      //     for (const auto &c : to_struct_type(cur_struct).components())
-      //       DBM_PRINT("   comp: " << c.name());
+      //   DBM_PRINT("[nocomp] want=" << comp);
+      //   const struct_typet &st = to_struct_type(cur_struct);
+      //   DBM_PRINT("[nocomp] tag=" << st.tag());
+      //   DBM_PRINT("[nocomp] incomplete=" << st.incomplete());
+      //   DBM_PRINT("[nocomp] ncomponents=" << st.components().size());
+      //   for (const auto &c : st.components())
+      //     DBM_PRINT("[nocomp]   comp=" << c.name());
       // }
       routed = false;
       break;
